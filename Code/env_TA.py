@@ -77,7 +77,7 @@ def create_nodes_edges(node_filename, edge_filename):
 
 #Create a custom gymnasium environment for the RL agent
 class CustomEnv(gym.Env):
-    def __init__(self, nodes, edges, deterministic_agent=True, fixed_costs=True, curriculum_training=False, initial_budget = None, 
+    def __init__(self, nodes, edges, deterministic_agent=True, fixed_costs=True, initial_budget = None, 
                  max_training_budget = 50, min_training_budget = 3, multiple_interdiction_attempts=True, attacker_strategy="zero_sum"):
         super(CustomEnv, self).__init__()
         self.nodes = nodes
@@ -176,18 +176,7 @@ class CustomEnv(gym.Env):
         self.max_training_budget = max_training_budget
         self.min_training_budget = min_training_budget
 
-        # Add curriculum learning parameters
-        self.curriculum_training = curriculum_training
-        if self.curriculum_training == True:
-            self.zero_prob = 0.5  # Initial probability of setting edge capacity to 0
-            self.zero_prob_decay = 0.95  # Decay rate per episode
-            self.min_zero_prob = 0.1  # Minimum probability
-            self.initial_budget = 3
-        else:
-            self.zero_prob = 0  # Initial probability of setting edge capacity to 0
-            self.zero_prob_decay = 1  # Decay rate per episode
-            self.min_zero_prob = 0  # Minimum probability
-            self.initial_budget = initial_budget
+        self.initial_budget = initial_budget
 
     # Maskable Actions - Not Updated for Threat Adaptive
     def action_masks(self) -> np.ndarray:
@@ -201,20 +190,6 @@ class CustomEnv(gym.Env):
                 mask = (1-self.state['edge_interdicted']) * self.state['edge_capacity'] * self.state['edge_interdiction_probability'] * np.where(self.state['edge_costs'] > self.state['budget'][0],0,1)
                 mask = np.where(mask==0,0,1)
             return np.array(mask, dtype=np.bool_)
-    
-    # Begin Curriculum Learning Methods
-    def set_zero_prob(self, prob):
-        """External method to update zero probability"""
-        self.zero_prob = max(self.min_zero_prob, min(1.0, prob))
-
-    def decay_zero_prob(self):
-        """Decay the zero probability"""
-        self.zero_prob = max(self.min_zero_prob, self.zero_prob * self.zero_prob_decay)
-
-    def increase_budget(self, multiplier=1.2):
-        self.initial_budget = min(8, int(self.initial_budget * multiplier))
-    # End Curriculum Learning Methods
-
     
     def solve_max_flow(self):  
         """Solve the Max Flow network problem, output objective value and edge flows"""
@@ -583,12 +558,6 @@ class CustomEnv(gym.Env):
             #while max_flow_objective_value == 0:
             edge_capacities = self.edge_capacity_space.sample() #Sample arc capacities
             edge_capacities[self.num_interdictable_edges:self.max_num_edges] = 0 #mask extra edges
-
-            # Modify capacity sampling with curriculum
-            if self.curriculum_training == True:
-                # Apply zero probability mask
-                mask = self.rng.random(size=edge_capacities.shape) < self.zero_prob
-                edge_capacities[mask] = 0
             
             # Update edge capacities in the graph
             for edge_id, edge in enumerate(self.interdictable_edges):
