@@ -1,0 +1,15 @@
+node,x_pos,y_pos,type
+1,-1,1.0,source
+2,0,2.0,intermediate
+3,0,1.0,intermediate
+4,0,0.0,intermediate
+5,1,2.0,intermediate
+6,1,1.0,intermediate
+7,1,0.0,intermediate
+8,2,2.0,intermediate
+9,2,1.0,intermediate
+10,2,0.0,intermediate
+11,3,2.0,intermediate
+12,3,1.0,intermediate
+13,3,0.0,intermediate
+14,4,1.0,sink
