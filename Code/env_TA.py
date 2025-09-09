@@ -178,7 +178,7 @@ class CustomEnv(gym.Env):
 
         self.initial_budget = initial_budget
 
-    # Maskable Actions - Not Updated for Threat Adaptive
+    # Maskable Actions - Need to Update for Threat Adaptive
     def action_masks(self) -> np.ndarray:
         mask = []
         for edge in self.interdictable_edges:
@@ -629,73 +629,80 @@ class CustomEnv(gym.Env):
         objective_value = None
 
         self.remaining_budget = self.state['budget']
-                   
-        # Determine if action is valid (not interdicted or too expensive)
-        if self.multiple_interdiction_attempts: #IM CHANGE
-            if self.state['edge_interdicted'][action] ==10 or self.remaining_budget[0] - self.state['edge_costs'][action]<-0.1 or self.state['edge_capacity'][action]==0 or action>=self.num_interdictable_edges: 
-                valid_action = False
-            else:
-                valid_action = True
-        else:
-            if self.state['edge_interdicted'][action] ==1 or self.remaining_budget[0] - self.state['edge_costs'][action]<-0.1 or self.state['edge_capacity'][action]==0 or action>=self.num_interdictable_edges: 
-                valid_action = False
-            else:
-                valid_action = True
 
-        # Adjudicate the action's effect on the state space and the corresponding reward 
-        if valid_action == True and do_nothing == False: # If Valid Edge Removal
-            #Deduct edge cost from budget
-            self.remaining_budget = np.array([self.remaining_budget[0] - self.state['edge_costs'][action]])
-            #Annotate edge is targeted
-            self.state['edge_interdicted'][action]+=1 #IM CHANGE
-        else: # Invalid Action Attempted
-            penalty = -1#-10  #Must be greater than the max capacity * the cardinality of the min cut of arcs
-            self.remaining_budget[0] = max(0, self.remaining_budget[0] - 1)
-
-        # Compute the minimum resources needed to remove another valid edge
-        if self.multiple_interdiction_attempts: #IM CHANGE
-            least_resources = 3
-        else:
-            masked_costs = self.state['edge_costs']*(1-self.state['edge_interdicted'])
-            least_resources = min(masked_costs[masked_costs>0])
-        
-        ## Determine reward and if episode is complete
-        if self.deterministic_outcomes and valid_action:
-            objective_value, _ = self.solve_max_flow()
-            reward = (self.last_obj - objective_value)/self.reference_budget #Modified reward function for EX20
-            self.last_obj = objective_value
-        elif not self.deterministic_outcomes and valid_action:
-            if self.multiple_interdiction_attempts:
-                edges_interdicted = (self.state['edge_interdicted'] > 0).astype(int)
-                arr =((1-self.state['edge_interdiction_probability'])**self.state['edge_interdicted'])
-                arr = edges_interdicted*arr
-            else:
-                arr =(self.state['edge_interdicted']*self.state['edge_interdiction_probability'])
-            non_zero_elements = arr[arr!=0]
-            if non_zero_elements.size >0:
-                x = np.mean(non_zero_elements)
-                if x <= 0.5:
-                    # Linear interpolation from (0,1) to (0.5,20000)
-                    iterations = int(1 + (1000 - 1) * (x / 0.5))
-                else:
-                    # Linear interpolation from (0.5,20000) to (1,1)
-                    iterations =int(1000 - (1000 - 1) * ((x - 0.5) / 0.5))
-            else:
-                iterations = 1
-            interim_objective_value = np.empty(iterations)
-            for i in range(iterations):
-                interim_objective_value[i], _ = self.solve_max_flow()
-            objective_value = np.mean(interim_objective_value)
-            reward = max(self.last_obj - objective_value, 0)/self.reference_budget #Modified reward function for EX20
-            if reward > 0:
-                self.last_obj = objective_value
-        
-        # Remaining Budget is insufficient for future valid action or Network is Deterministic and Max Flow is Zero
-        if (self.remaining_budget[0] < least_resources or (self.deterministic_outcomes and objective_value == 0)):
+        # Determine if action was "do nothing"
+        if action == self.max_num_edges:
+            valid_action = True
+            do_nothing = True
             done = True
+            #reward = 0
+        else:
+            # Determine if action is valid (not interdicted or too expensive)
+            if self.multiple_interdiction_attempts: #IM CHANGE
+                if self.state['edge_interdicted'][action] ==10 or self.remaining_budget[0] - self.state['edge_costs'][action]<-0.1 or self.state['edge_capacity'][action]==0 or action>=self.num_interdictable_edges: #no more than 10 multiple attacks allowed
+                    valid_action = False
+                else:
+                    valid_action = True
+            else:
+                if self.state['edge_interdicted'][action] ==1 or self.remaining_budget[0] - self.state['edge_costs'][action]<-0.1 or self.state['edge_capacity'][action]==0 or action>=self.num_interdictable_edges: 
+                    valid_action = False
+                else:
+                    valid_action = True
+
+            # Adjudicate the action's effect on the state space and the corresponding reward
+            if valid_action == True: # If Valid Edge Removal and do_nothing is False
+                #Deduct edge cost from budget
+                self.remaining_budget = np.array([self.remaining_budget[0] - self.state['edge_costs'][action]])
+                #Annotate edge is targeted
+                self.state['edge_interdicted'][action]+=1 #IM CHANGE
+            else: # If valid action is false
+                penalty = -1#-10  #Must be greater than the max capacity * the cardinality of the min cut of arcs
+                self.remaining_budget[0] = max(0, self.remaining_budget[0] - 1)
+
+            # Compute the minimum resources needed to remove another valid edge
+            if self.multiple_interdiction_attempts: #IM CHANGE
+                least_resources = 3
+            else:
+                masked_costs = self.state['edge_costs']*(1-self.state['edge_interdicted'])
+                least_resources = min(masked_costs[masked_costs>0])
+        
+            ## Determine reward and if episode is complete
+            if self.deterministic_outcomes and valid_action:
+                objective_value, _ = self.solve_max_flow()
+                reward = (self.last_obj - objective_value)/self.reference_budget #Modified reward function for EX20
+                self.last_obj = objective_value
+            elif not self.deterministic_outcomes and valid_action:
+                if self.multiple_interdiction_attempts:
+                    edges_interdicted = (self.state['edge_interdicted'] > 0).astype(int)
+                    arr =((1-self.state['edge_interdiction_probability'])**self.state['edge_interdicted'])
+                    arr = edges_interdicted*arr
+                else:
+                    arr =(self.state['edge_interdicted']*self.state['edge_interdiction_probability'])
+                non_zero_elements = arr[arr!=0]
+                if non_zero_elements.size >0:
+                    x = np.mean(non_zero_elements)
+                    if x <= 0.5:
+                        # Linear interpolation from (0,1) to (0.5,20000)
+                        iterations = int(1 + (1000 - 1) * (x / 0.5))
+                    else:
+                        # Linear interpolation from (0.5,20000) to (1,1)
+                        iterations =int(1000 - (1000 - 1) * ((x - 0.5) / 0.5))
+                else:
+                    iterations = 1
+                interim_objective_value = np.empty(iterations)
+                for i in range(iterations):
+                    interim_objective_value[i], _ = self.solve_max_flow()
+                objective_value = np.mean(interim_objective_value)
+                reward = max(self.last_obj - objective_value, 0)/self.reference_budget #Modified reward function for EX20
+                if reward > 0:
+                    self.last_obj = objective_value
+        
+            # Remaining Budget is insufficient for future valid action or Network is Deterministic and Max Flow is Zero
+            if (self.remaining_budget[0] < least_resources or (self.deterministic_outcomes and objective_value == 0)):
+                done = True
                 
-        # Update state observation
-        self.state['budget']= self.remaining_budget
+            # Update state observation
+            self.state['budget']= self.remaining_budget
         
         reward = reward + penalty #Compute reward
         
