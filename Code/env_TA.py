@@ -167,7 +167,7 @@ class CustomEnv(gym.Env):
         if self.attacker_strategy == "zero_sum":
             self.action_space = spaces.Discrete(self.max_num_edges)
         else:
-            self.action_space = spaces.Discrete(self.max_num_edges + 1) #add do nothing action
+            self.action_space = spaces.Discrete(self.max_num_edges + 1) #add do nothing action            
 
         self.rng = np.random.default_rng()
         self.num_stochastic_scenarios = None
