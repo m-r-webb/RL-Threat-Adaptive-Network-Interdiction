@@ -78,7 +78,8 @@ def create_nodes_edges(node_filename, edge_filename):
 #Create a custom gymnasium environment for the RL agent
 class CustomEnv(gym.Env):
     def __init__(self, nodes, edges, deterministic_agent=True, fixed_costs=True, initial_budget = None, 
-                 max_training_budget = 50, min_training_budget = 3, multiple_interdiction_attempts=True, attacker_strategy="zero_sum"):
+                 max_training_budget = 50, min_training_budget = 3, multiple_interdiction_attempts=True, attacker_strategy="zero_sum",
+                max_source_flow = 150, max_sink_need = 50):
         super(CustomEnv, self).__init__()
         self.nodes = nodes
         self.edges_reset = edges
@@ -178,6 +179,9 @@ class CustomEnv(gym.Env):
 
         self.initial_budget = initial_budget
 
+        self.max_source_flow = max_source_flow
+        self.max_sink_need = max_sink_need
+
     # Maskable Actions - Need to Update for Threat Adaptive
     def action_masks(self) -> np.ndarray:
         mask = []
@@ -198,7 +202,7 @@ class CustomEnv(gym.Env):
             self.maxflow_model = grb.Model("Max Flow", env=self.e)
 
             self.mf_all_edges = self.all_edges
-            self.mf_all_edges.append((len(self.nodes),1))
+            self.mf_all_edges.append((len(self.nodes),1)) #Add a super sink to super source dummy edge
             
             self.flow_var = self.maxflow_model.addVars(
                 self.mf_all_edges,
@@ -212,6 +216,12 @@ class CustomEnv(gym.Env):
 
             self.maxflow_model.addConstr(self.flow_var[(len(self.nodes),1)]-grb.quicksum(self.flow_var[e] for e in self.edge_groups[1]['out'])==0)
             self.maxflow_model.addConstr(-self.flow_var[(len(self.nodes),1)]+grb.quicksum(self.flow_var[e] for e in self.edge_groups[self.max_num_nodes]['in'])==0)
+            
+            #Add for TA Issue #3
+            self.maxflow_model.addConstr(self.flow_var[(len(self.nodes),1)]<=self.max_source_flow) #Limit max flow from the source
+            self.maxflow_model.addConstrs((self.flow_var[e] <= self.max_sink_need for e in self.edge_groups[self.max_num_nodes]['in']),
+                                          name="sink node max capacities")
+
         
             self.maxflow_model.setObjective(self.flow_var[(len(self.nodes),1)], grb.GRB.MAXIMIZE) #Maximize Flow
 
