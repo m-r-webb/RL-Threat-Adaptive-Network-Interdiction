@@ -179,6 +179,7 @@ class CustomEnv(gym.Env):
 
         self.initial_budget = initial_budget
 
+        self.old_routing = "none"
         self.max_source_flow = max_source_flow
         self.max_sink_need = max_sink_need
 
@@ -195,7 +196,7 @@ class CustomEnv(gym.Env):
                 mask = np.where(mask==0,0,1)
             return np.array(mask, dtype=np.bool_)
     
-    def solve_max_flow(self):  
+    def solve_max_flow(self, routing_assumption = "gurobi_default"):  
         """Solve the Max Flow network problem, output objective value and edge flows"""
         if not hasattr(self, 'maxflow_model'):
             # Build model and store variables/constraints
@@ -203,45 +204,151 @@ class CustomEnv(gym.Env):
 
             self.mf_all_edges = self.all_edges
             self.mf_all_edges.append((len(self.nodes),1)) #Add a super sink to super source dummy edge
-            
+
+            #Flow variables
             self.flow_var = self.maxflow_model.addVars(
                 self.mf_all_edges,
                 vtype=grb.GRB.CONTINUOUS, lb=0, name="flow_var")
-                
+
+            # Binary variables to indicate if an edge is used
+            self.edge_used = self.maxflow_model.addVars(
+                self.mf_all_edges,
+                vtype=grb.GRB.BINARY, name="edge_used")
+
+            #Intermediate node flow conservation constraints
             self.maxflow_model.addConstrs(
                 (grb.quicksum(self.flow_var[e] for e in self.edge_groups[n]['out']) == grb.quicksum(self.flow_var[e] for e in self.edge_groups[n]['in'])
                  for n in self.intermediate_nodes),
                 name="flow_conservation"
             )
-
+            
+            #Source and sink flow conservation constraints
             self.maxflow_model.addConstr(self.flow_var[(len(self.nodes),1)]-grb.quicksum(self.flow_var[e] for e in self.edge_groups[1]['out'])==0)
             self.maxflow_model.addConstr(-self.flow_var[(len(self.nodes),1)]+grb.quicksum(self.flow_var[e] for e in self.edge_groups[self.max_num_nodes]['in'])==0)
+
+            #One way edge flow constraint
+            self.maxflow_model.addConstrs(
+                (self.edge_used[(u,v)]+self.edge_used[(v,u)] <= 1
+                 for u, v in self.edges_reset.keys() if u not in self.source_nodes and v not in self.sink_nodes),
+                name="one-way_flow"
+            )
+
+            #Min edge flow constraints
+            self.maxflow_model.addConstrs(
+                        (self.flow_var[e]  >= self.edge_used[e] for e in self.interdictable_edges),
+                        name=f"min_flow_capacity_1"
+            )
+            self.maxflow_model.addConstrs(
+                        (self.flow_var[(e[1], e[0])]  >= self.edge_used[(e[1], e[0])] for e in self.interdictable_edges),
+                        name=f"min_flow_capacity_2"
+            )
             
-            #Add for TA Issue #3
-            self.maxflow_model.addConstr(self.flow_var[(len(self.nodes),1)]<=self.max_source_flow) #Limit max flow from the source
+            #Capacity constraints on source and sink [TA Issue #3]
+            self.maxflow_model.addConstr(self.flow_var[(len(self.nodes),1)]<=self.max_source_flow) #Limit max flow from the super source
             self.maxflow_model.addConstrs((self.flow_var[e] <= self.max_sink_need for e in self.edge_groups[self.max_num_nodes]['in']),
-                                          name="sink node max capacities")
+                                          name="sink node max capacities") #Limit max flow to each sink
 
-        
-            self.maxflow_model.setObjective(self.flow_var[(len(self.nodes),1)], grb.GRB.MAXIMIZE) #Maximize Flow
-
-        # Update Capacity Bounds  #IM CHANGE
+        # Update Capacity Upper Bounds  [IM CHANGE]
         upper_bounds = np.random.binomial(1,
                                           (1 - self.state["edge_interdiction_probability"][:self.num_interdictable_edges]) ** 
                                           self.state["edge_interdicted"][:self.num_interdictable_edges]) * self.state["edge_capacity"][:self.num_interdictable_edges]
+        
+        self.mf_capacity_constraints = {}
 
-        if not hasattr(self, 'mf_capacity_constraints'):
-            self.mf_capacity_constraints = {}
-            for idx, e in enumerate(self.interdictable_edges):
-                con = self.maxflow_model.addConstr(
-                    self.flow_var[e] + self.flow_var[(e[1], e[0])] <= upper_bounds[idx],
-                    name=f"flow_capacity_{e[0]}_{e[1]}"
+        for idx, e in enumerate(self.interdictable_edges):
+            con = self.maxflow_model.addConstr(
+                self.flow_var[e] <= upper_bounds[idx]*self.edge_used[e],
+                name=f"flow_capacity_{e[0]}_{e[1]}"
+            )
+            self.mf_capacity_constraints[e] = con
+            con = self.maxflow_model.addConstr(
+                self.flow_var[(e[1], e[0])] <= upper_bounds[idx]*self.edge_used[(e[1], e[0])],
+                name=f"flow_capacity_{e[1]}_{e[0]}"
+            )
+            self.mf_capacity_constraints[e] = con
+        
+
+        if routing_assumption == "gurobi_default":
+            if self.old_routing != "gurobi_default":
+                # Reset to single-objective mode
+                self.maxflow_model.NumObj = 0
+                self.maxflow_model.update()
+                # Set single objective (maximize flow)
+                self.maxflow_model.setObjective(
+                    self.flow_var[(len(self.nodes),1)], 
+                    grb.GRB.MAXIMIZE
                 )
-                self.mf_capacity_constraints[e] = con
-        else:
-            for idx, e in enumerate(self.interdictable_edges):
-                self.mf_capacity_constraints[e].rhs = upper_bounds[idx]
+                self.old_routing = "gurobi_default"
+            
+        elif routing_assumption == "consolidated":
+            if self.old_routing != "consolidated":
+                # Set up hierarchical objectives
+                self.maxflow_model.ModelSense = grb.GRB.MAXIMIZE
 
+                # Clear any existing objectives first
+                self.maxflow_model.NumObj = 0
+                self.maxflow_model.update()
+
+                # Primary objective (priority 2): Maximize edges used
+                self.maxflow_model.setObjectiveN(
+                    self.flow_var[(len(self.nodes),1)], 
+                    index=0, priority=2, weight=1.0,
+                    abstol=0.0, reltol=0.0, name="max_flow"
+                )
+        
+                # Secondary objective (priority 1): Minimize number of edges used
+                self.maxflow_model.setObjectiveN(
+                    grb.quicksum(self.edge_used[e] for e in self.mf_all_edges), 
+                    index=1, priority=1, weight=-1.0,
+                    abstol=0.0, reltol=0.0, name="min_edges"
+                )
+
+        elif routing_assumption == "distributed":
+            if self.old_routing != "distributed":
+                # Set up hierarchical objectives
+                self.maxflow_model.ModelSense = grb.GRB.MAXIMIZE
+    
+                # Clear any existing objectives first
+                self.maxflow_model.NumObj = 0
+                self.maxflow_model.update()
+
+                # Primary objective (priority 2): Maximize flow
+                self.maxflow_model.setObjectiveN(
+                    self.flow_var[(len(self.nodes),1)], 
+                    index=0, priority=2, weight=1.0, 
+                    abstol=0.0, reltol=0.0, name="max_flow"
+                )
+        
+                # Secondary objective (priority 1): Maximize the number of edges used
+                self.maxflow_model.setObjectiveN(
+                    grb.quicksum(self.edge_used[e] for e in self.mf_all_edges), 
+                    index=1, priority=1, weight=1.0,
+                    abstol=0.0, reltol=0.0, name="max_edges"
+                )
+
+        elif routing_assumption == "least_vulnerable":
+            if self.old_routing != "least_vulnerable":
+                # Set up hierarchical objectives
+                self.maxflow_model.ModelSense = grb.GRB.MAXIMIZE
+    
+                # Clear any existing objectives first
+                self.maxflow_model.NumObj = 0
+                self.maxflow_model.update()
+
+                # Primary objective (priority 2): Maximize flow
+                self.maxflow_model.setObjectiveN(
+                    self.flow_var[(len(self.nodes),1)], 
+                    index=0, priority=2, weight=1.0, 
+                    abstol=0.0, reltol=0.0, name="max_flow"
+                )
+        
+                # Secondary objective (priority 1): Maximize the number of edges used
+                self.maxflow_model.setObjectiveN(
+                    grb.quicksum(self.state["edge_interdiction_probability"][ind]*(self.flow_var[e]+self.flow_var[(e[1],e[0])]) for ind, e in enumerate(self.interdictable_edges)), 
+                    index=1, priority=1, weight=-1.0,
+                    abstol=0.0, reltol=0.0, name="least_vulnerable"
+                )
+        
         self.maxflow_model.update()
 #        self.maxflow_model.write("maxflow_model.lp")
 
