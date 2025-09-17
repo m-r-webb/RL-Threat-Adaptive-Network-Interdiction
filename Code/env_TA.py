@@ -312,17 +312,24 @@ class CustomEnv(gym.Env):
                 self.maxflow_model.NumObj = 0
                 self.maxflow_model.update()
 
-                # Primary objective (priority 2): Maximize flow
+                # Primary objective (priority 3): Maximize flow
                 self.maxflow_model.setObjectiveN(
                     self.flow_var[(len(self.nodes),1)], 
-                    index=0, priority=2, weight=1.0, 
+                    index=0, priority=3, weight=1.0, 
                     abstol=0.0, reltol=0.0, name="max_flow"
                 )
         
-                # Secondary objective (priority 1): Maximize the number of edges used
+                # Secondary objective (priority 2): Maximize the number of edges used
                 self.maxflow_model.setObjectiveN(
                     grb.quicksum(self.edge_used[e] for e in self.mf_all_edges), 
-                    index=1, priority=1, weight=1.0,
+                    index=1, priority=2, weight=1.0,
+                    abstol=0.0, reltol=0.0, name="max_edges"
+                )
+
+                # Tertiary objective (priority 1): Maximize the number of edges used
+                self.maxflow_model.setObjectiveN(
+                    grb.quicksum(self.flow_var[e] for e in self.mf_all_edges), 
+                    index=1, priority=1, weight=-1.0,
                     abstol=0.0, reltol=0.0, name="max_edges"
                 )
 
@@ -356,9 +363,9 @@ class CustomEnv(gym.Env):
         self.maxflow_model.optimize()
 
         # Convert Result into Flows
-        flow_results = {e: var.X for e, var in self.flow_var.items()}
+        flow_results = {e: round(var.X) for e, var in self.flow_var.items()}
         
-        return self.maxflow_model.ObjVal, flow_results
+        return round(self.maxflow_model.ObjVal), flow_results
 
     def solve_optimal_interdiction(self):
         if self.deterministic_outcomes == True: #Solve Deterministic Case with Wood's Max/Min Formulation
