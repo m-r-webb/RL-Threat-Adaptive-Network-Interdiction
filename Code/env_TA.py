@@ -954,8 +954,9 @@ class CustomEnv(gym.Env):
             valid_action = True
             do_nothing = True
             done = True
+            self.state['budget'] = 0
             #reward = 0
-        else:
+        else:      
             # Determine if action is valid (not interdicted or too expensive)
             if self.multiple_interdiction_attempts: #IM CHANGE
                 if self.state['edge_interdicted'][action] ==10 or self.remaining_budget[0] - self.state['edge_costs'][action]<-0.1 or self.state['edge_capacity'][action]==0 or action>=self.num_interdictable_edges: #no more than 10 multiple attacks allowed
