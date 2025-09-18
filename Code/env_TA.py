@@ -147,20 +147,58 @@ class CustomEnv(gym.Env):
         self.edge_departure_node_space = spaces.Box(low=1, high=self.max_num_nodes, shape=(self.max_num_edges,), dtype=int)  #high=len(self.nodes)
         self.edge_arrival_node_space = spaces.Box(low=1, high=self.max_num_nodes, shape=(self.max_num_edges,), dtype=int) #high=len(self.nodes)
 
-        
         # Precompute edge-to-index mapping once
         self.edge_to_index = {edge: idx for idx, edge in enumerate(self.interdictable_edges)}
 
         # Combine all into a Dict space
-        self.observation_space = spaces.Dict({
-            'edge_capacity': self.edge_capacity_space,
-            'edge_interdicted': self.edge_interdicted_space,
-            'edge_costs': self.edge_costs_space,
-            'edge_interdiction_probability': self.edge_interdiction_probability_space,
-            'edge_departure_node': self.edge_departure_node_space,
-            'edge_arrival_node': self.edge_arrival_node_space,
-            'budget': self.budget_space
-        })
+        if self.attacker_strategy == "zero_sum":
+            self.observation_space = spaces.Dict({
+                'edge_capacity': self.edge_capacity_space,
+                'edge_interdicted': self.edge_interdicted_space,
+                'edge_costs': self.edge_costs_space,
+                'edge_interdiction_probability': self.edge_interdiction_probability_space,
+                'edge_departure_node': self.edge_departure_node_space,
+                'edge_arrival_node': self.edge_arrival_node_space,
+                'budget': self.budget_space
+            })
+        elif self.attacker_strategy == "canalize":
+            self.edge_objectives = spaces.MultiBinary(self.max_num_edges)
+            self.observation_space = spaces.Dict({
+                'edge_capacity': self.edge_capacity_space,
+                'edge_interdicted': self.edge_interdicted_space,
+                'edge_costs': self.edge_costs_space,
+                'edge_interdiction_probability': self.edge_interdiction_probability_space,
+                'edge_departure_node': self.edge_departure_node_space,
+                'edge_arrival_node': self.edge_arrival_node_space,
+                'budget': self.budget_space,
+                'canalize_objective': self.edge_objectives
+            })
+        elif self.attacker_strategy == "isolate":
+            self.node_objectives = spaces.MultiBinary(len(self.sink_edges))
+            self.observation_space = spaces.Dict({
+                'edge_capacity': self.edge_capacity_space,
+                'edge_interdicted': self.edge_interdicted_space,
+                'edge_costs': self.edge_costs_space,
+                'edge_interdiction_probability': self.edge_interdiction_probability_space,
+                'edge_departure_node': self.edge_departure_node_space,
+                'edge_arrival_node': self.edge_arrival_node_space,
+                'budget': self.budget_space,
+                'isolate_objective': self.node_objectives
+            })
+        elif self.attacker_strategy == "divert":
+            self.edge_objectives1 = spaces.MultiBinary(self.max_num_edges)
+            self.edge_objectives2 = spaces.MultiBinary(self.max_num_edges)
+            self.observation_space = spaces.Dict({
+                'edge_capacity': self.edge_capacity_space,
+                'edge_interdicted': self.edge_interdicted_space,
+                'edge_costs': self.edge_costs_space,
+                'edge_interdiction_probability': self.edge_interdiction_probability_space,
+                'edge_departure_node': self.edge_departure_node_space,
+                'edge_arrival_node': self.edge_arrival_node_space,
+                'budget': self.budget_space,
+                'divert_from_objective': self.edge_objectives1,
+                'divert_to_objective': self.edge_objectives2
+            })
 
         self.e = grb.Env(params={"OutputFlag": 0, "LogToConsole": 0, "Threads":2})
 
@@ -672,6 +710,8 @@ class CustomEnv(gym.Env):
             self.edge_costs_space.seed(seed)
             self.edge_interdiction_probability_space.seed(seed)
             self.budget_space.seed(seed)
+            self.node_objectives.seed(seed)
+            random.seed=seed
 
         # Sample a network instance
         indicator = False
@@ -730,19 +770,174 @@ class CustomEnv(gym.Env):
             else:
                 indicator = True
 
-        self.state = {
-            'edge_capacity': edge_capacities,
-            'edge_interdicted': edge_interdicted,
-            'edge_costs': edge_costs,
-            'edge_interdiction_probability': edge_interdiction_probabilities,
-            'edge_departure_node': departure_nodes, #np.array(self.edge_departures),
-            'edge_arrival_node': arrival_nodes, #np.array(self.edge_arrivals),
-            'budget': self.remaining_budget
-        }
-        self.reference_obj, _ = self.solve_max_flow()
-        self.last_obj = self.reference_obj 
-        self.reference_budget = self.remaining_budget[0]
+        if self.attacker_strategy == "zero_sum":
+            self.state = {
+                'edge_capacity': edge_capacities,
+                'edge_interdicted': edge_interdicted,
+                'edge_costs': edge_costs,
+                'edge_interdiction_probability': edge_interdiction_probabilities,
+                'edge_departure_node': departure_nodes, #np.array(self.edge_departures),
+                'edge_arrival_node': arrival_nodes, #np.array(self.edge_arrivals),
+                'budget': self.remaining_budget
+            }
+        elif self.attacker_strategy == "canalize":
+            node_path = [1]
+            edge_path = []
+            current_node = 1
+            visited = set(node_path)
+            sink = self.sink_nodes[0]
+
+            while True:
+                valid_edges = [e for e in self.edge_groups[current_node]['out'] if e[1] not in visited and e[1] >= current_node - 1]
+                
+                selected_edge = random.choice(valid_edges)
+                selected_node = selected_edge[1]
+                node_path.append(selected_node)
+                edge_path.append(selected_edge)
+                visited.add(selected_node)
+                current_node = selected_node
+                
+                if current_node == sink:
+                    break
+            self.canalize_objective = np.zeros(self.max_num_edges)
+
+            for e, edge in enumerate(self.interdictable_edges):
+                if edge in edge_path or (edge[1],edge[0]) in edge_path:
+                    self.canalize_objective[e]=1
+            
+            self.state = {
+                'edge_capacity': edge_capacities,
+                'edge_interdicted': edge_interdicted,
+                'edge_costs': edge_costs,
+                'edge_interdiction_probability': edge_interdiction_probabilities,
+                'edge_departure_node': departure_nodes, #np.array(self.edge_departures),
+                'edge_arrival_node': arrival_nodes, #np.array(self.edge_arrivals),
+                'budget': self.remaining_budget,
+                'canalize_objective': self.canalize_objective
+            }
         
+        elif self.attacker_strategy == "isolate":
+            num_in_edges = len(self.edge_groups[self.sink_nodes[0]]['in'])
+            while True:
+                self.isolate_objective = self.node_objectives.sample()
+                num_isolated_nodes = np.sum(self.isolate_objective)
+                if 1 <= num_isolated_nodes < num_in_edges:
+                    break
+            
+            self.state = {
+                'edge_capacity': edge_capacities,
+                'edge_interdicted': edge_interdicted,
+                'edge_costs': edge_costs,
+                'edge_interdiction_probability': edge_interdiction_probabilities,
+                'edge_departure_node': departure_nodes, #np.array(self.edge_departures),
+                'edge_arrival_node': arrival_nodes, #np.array(self.edge_arrivals),
+                'budget': self.remaining_budget,
+                'isolate_objective': self.isolate_objective
+            }
+        
+        elif self.attacker_strategy == "divert":
+            #First determine max flow route
+            ## Compute max flow
+            self.state = {
+                'edge_capacity': edge_capacities,
+                'edge_interdicted': edge_interdicted,
+                'edge_costs': edge_costs,
+                'edge_interdiction_probability': edge_interdiction_probabilities,
+                'edge_departure_node': departure_nodes, #np.array(self.edge_departures),
+                'edge_arrival_node': arrival_nodes, #np.array(self.edge_arrivals),
+                'budget': self.remaining_budget,
+                'divert_from_objective': self.edge_objectives1.sample(),
+                'divert_to_objective': self.edge_objectives2.sample()
+            }
+            _, flows = self.solve_max_flow()
+            
+            from_edge_path = set()
+            current_node = 1
+            sink = self.sink_nodes[0]
+
+            while current_node != sink:
+                #Find the outgoing edge with the largest flow
+                outgoing_edges = self.edge_groups[current_node]['out']
+                next_edge = max(outgoing_edges, key=lambda e: flows[e]) 
+                from_edge_path.add(next_edge)
+                current_node = next_edge[1]
+
+            print(from_edge_path) 
+            self.divert_from_objective = np.zeros(self.max_num_edges)
+
+            for e, edge in enumerate(self.interdictable_edges):
+                if edge in from_edge_path or (edge[1],edge[0]) in from_edge_path:
+                    self.divert_from_objective[e]=1
+
+            visited = set([1])
+            edge_path = set()
+            current_node = 1
+            
+            while current_node != sink:
+                selected_node = current_node
+                print(current_node)
+                valid_edges= []
+                for edge in self.edge_groups[current_node]['out']:
+                    target = edge[1]
+
+                    # Skip if already visited or violates constraints
+                    if (target in visited or target < current_node - 1 or edge in from_edge_path):
+                        continue
+
+                    # Check if target has valid future moves (unless it's the sink)
+                    if target != sink:
+                        future_actions = self.edge_groups[target]['out']
+                        has_valid_future = any(
+                            e not in from_edge_path and 
+                            (e[1], e[0]) not in from_edge_path and 
+                            e[1] != current_node and 
+                            e[1] >= e[0] - 1
+                            for e in future_actions
+                        )
+                        if not has_valid_future:
+                            continue
+                    valid_edges.append(edge)
+
+                print(f"Valid edges: {valid_edges}")
+    
+                if not valid_edges:
+                    print(f"No valid moves from node {current_node}. Restarting.")
+                    visited = set([1])
+                    edge_path = set()
+                    current_node = 1
+                    continue
+    
+                # Select random edge from valid options
+                selected_edge = random.choice(valid_edges)
+                selected_node = selected_edge[1]
+    
+                edge_path.add(selected_edge)
+                visited.add(selected_node)
+                current_node = selected_node
+
+            print(edge_path)
+            self.divert_to_objective = np.zeros(self.max_num_edges)
+
+            for e, edge in enumerate(self.interdictable_edges):
+                if edge in edge_path or (edge[1],edge[0]) in edge_path:
+                    self.divert_to_objective[e]=1
+            
+            self.state = {
+                'edge_capacity': edge_capacities,
+                'edge_interdicted': edge_interdicted,
+                'edge_costs': edge_costs,
+                'edge_interdiction_probability': edge_interdiction_probabilities,
+                'edge_departure_node': departure_nodes, #np.array(self.edge_departures),
+                'edge_arrival_node': arrival_nodes, #np.array(self.edge_arrivals),
+                'budget': self.remaining_budget,
+                'divert_from_objective': self.divert_from_objective,
+                'divert_to_objective': self.divert_to_objective
+            }
+        
+        self.reference_obj, flows = self.solve_max_flow()
+        self.last_obj = self.reference_obj 
+        self.reference_budget = self.remaining_budget[0]            
+
         return self.state, {}  # Return initial state and an empty info dict
 
     def step(self, action):  
