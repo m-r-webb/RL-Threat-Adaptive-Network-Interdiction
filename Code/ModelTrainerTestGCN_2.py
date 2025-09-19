@@ -14,7 +14,6 @@ agent = "DQN"
 
 # Deterministic or Stochastic Outcomes?
 deterministicOutcomes = False
-fixedCosts = False
 multiple_interdiction_attempts=False
 min_training_budget=3
 max_training_budget=15
@@ -26,7 +25,7 @@ else:
 
 #G5x5
 #version = "EX001" #Stochastic PPO, DQN
-version = "EX001A1" #Deterministic PPO Unlettered: 5x5, B: 50x50, C:normalized budget DQN A: 512,512,265 network B: 512,512,265,256 network, increased exploration to .9
+version = "EX002" #Deterministic PPO Unlettered: 5x5, B: 50x50, C:normalized budget DQN A: 512,512,265 network B: 512,512,265,256 network, increased exploration to .9
 
 # Model Name
 model_name = f"{graphName}_{deterministicLetter}_{agent}_{version}"
@@ -82,7 +81,7 @@ def linear_schedule(initial_value: float):
     return func
 
 def make_env():
-    env = ce.CustomEnv(nodes, edges, deterministic_agent=deterministicOutcomes, fixed_costs=fixedCosts, curriculum_training=False, min_training_budget=min_training_budget,
+    env = ce.CustomEnv(nodes, edges, deterministic_agent=deterministicOutcomes, min_training_budget=min_training_budget,
                        max_training_budget = max_training_budget, multiple_interdiction_attempts=multiple_interdiction_attempts)
     return env
     
