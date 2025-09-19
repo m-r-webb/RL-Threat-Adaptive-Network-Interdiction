@@ -86,6 +86,7 @@ class CustomEnv(gym.Env):
     MAX_SOURCE_FLOW = 150
     MAX_SINK_NEED = 50
     GUROBI_ENV = grb.Env(params={"OutputFlag": 0, "LogToConsole": 0, "Threads": 2})
+    PENALTY_VALUE = -1
     
     def __init__(self, nodes, edges, deterministic_agent=True, initial_budget = None, 
                  multiple_interdiction_attempts=True, attacker_strategy="zero_sum"):
@@ -612,95 +613,222 @@ class CustomEnv(gym.Env):
         return path_edges
 
     def step(self, action):  
+        """Execute one step in the environment based on the given action."""
+        # Initialize step variables
         done = False
         do_nothing = False
-        reward = 0
-        penalty = 0
-        objective_value = None
-
-        remaining_budget = self.state['budget']
+        remaining_budget = self.state['budget'].copy()
 
         # Determine if action was "do nothing"
         if action == self.max_num_edges:
-            valid_action = True
-            do_nothing = True
-            done = True
-            self.state['budget'] = 0
-            #reward = 0
-        else:      
+            self.state['budget'] = np.array([0])
+            reward = 0
+            return self.state, float(reward), True, False, {}
 
-            #start here
-            if self.attacker_strategy == "zero_sum":
-                # Determine if action is valid (not interdicted or too expensive)
-                if self.multiple_interdiction_attempts: #IM CHANGE
-                    if self.state['edge_interdicted'][action] ==self.MAX_INTERDICTION_ATTEMPTS or remaining_budget[0] - self.state['edge_costs'][action]<-0.1 or self.state['edge_capacity'][action]==0 or action>=self.num_interdictable_edges: #no more than 10 multiple attacks allowed
-                        valid_action = False
-                    else:
-                        valid_action = True
-                else:
-                    if self.state['edge_interdicted'][action] ==1 or remaining_budget[0] - self.state['edge_costs'][action]<-0.1 or self.state['edge_capacity'][action]==0 or action>=self.num_interdictable_edges: 
-                        valid_action = False
-                    else:
-                        valid_action = True
+        # Validate action
+        valid_action = self._validate_action(action, remaining_budget)
+        
+        # Apply action effects
+        if valid_action:
+            #Determine reward and decrement budget
+            remaining_budget = self._apply_valid_action(action, remaining_budget)
+            #Compute Rewards
+            strategy_calculators = {"zero_sum": self._calculate_zero_sum_reward,
+                                    "canalize": self._calculate_canalize_reward,
+                                    "isolate": self._calculate_isolate_reward,
+                                    "divert": self._calculate_divert_reward}
+            calculator = strategy_calculators.get(self.attacker_strategy)
+            reward = calculator(action)
+        else:
+            #Determine penalty and decrement budget
+            reward, remaining_budget = self._apply_invalid_action(action, remaining_budget)
 
-                # Adjudicate the action's effect on the state space and the corresponding reward
-                if valid_action == True: # If Valid Edge Removal and do_nothing is False
-                    #Deduct edge cost from budget
-                    remaining_budget = np.array([remaining_budget[0] - self.state['edge_costs'][action]])
-                    #Annotate edge is targeted
-                    self.state['edge_interdicted'][action]+=1 #IM CHANGE
-                else: # If valid action is false
-                    penalty = -1#-10  #Must be greater than the max capacity * the cardinality of the min cut of arcs
-                    remaining_budget[0] = max(0, remaining_budget[0] - 1)
+        # Check if episode is complete
+        done = self._is_episode_complete(remaining_budget)
+    
+        # Update state
+        self.state['budget'] = remaining_budget
+    
+        return self.state, float(reward), bool(done), False, {}
+        
+    def _validate_action(self, action, remaining_budget):
+        """Validate if the given action is legal."""
+        if action >= self.num_interdictable_edges:
+            return False
+    
+        # Check budget constraint
+        if remaining_budget[0] - self.state['edge_costs'][action] < -0.1:
+            return False
+    
+        # Check capacity constraint
+        if self.state['edge_capacity'][action] == 0:
+            return False
+    
+        # Check interdiction limit
+        max_interdictions = self.MAX_INTERDICTION_ATTEMPTS if self.multiple_interdiction_attempts else 1
+        if self.state['edge_interdicted'][action] >= max_interdictions:
+            return False
+    
+        return True
+        
+    def _apply_valid_action(self, action, remaining_budget):
+        """Apply the effects of a valid action."""
+        # Deduct cost from budget
+        remaining_budget[0] = remaining_budget[0] - self.state['edge_costs'][action]
+    
+        # Mark edge as interdicted
+        self.state['edge_interdicted'][action] += 1
+    
+        return remaining_budget
 
-                # Compute the minimum resources needed to remove another valid edge
-                if self.multiple_interdiction_attempts: #IM CHANGE
-                    least_resources = 3
-                else:
-                    masked_costs = self.state['edge_costs']*(1-self.state['edge_interdicted'])
-                    least_resources = min(masked_costs[masked_costs>0])
-            
-                ## Determine reward and if episode is complete
-                if self.deterministic_outcomes and valid_action:
-                    objective_value, _ = self.solve_max_flow()
-                    reward = (self.last_obj - objective_value)/self.reference_budget #Modified reward function for EX20
-                    self.last_obj = objective_value
-                elif not self.deterministic_outcomes and valid_action:
-                    if self.multiple_interdiction_attempts:
-                        edges_interdicted = (self.state['edge_interdicted'] > 0).astype(int)
-                        arr =((1-self.state['edge_interdiction_probability'])**self.state['edge_interdicted'])
-                        arr = edges_interdicted*arr
-                    else:
-                        arr =(self.state['edge_interdicted']*self.state['edge_interdiction_probability'])
-                    non_zero_elements = arr[arr!=0]
-                    if non_zero_elements.size >0:
-                        x = np.mean(non_zero_elements)
-                        if x <= 0.5:
-                            # Linear interpolation from (0,1) to (0.5,20000)
-                            iterations = int(1 + (1000 - 1) * (x / 0.5))
-                        else:
-                            # Linear interpolation from (0.5,20000) to (1,1)
-                            iterations =int(1000 - (1000 - 1) * ((x - 0.5) / 0.5))
-                    else:
-                        iterations = 1
-                    interim_objective_value = np.empty(iterations)
-                    for i in range(iterations):
-                        interim_objective_value[i], _ = self.solve_max_flow()
-                    objective_value = np.mean(interim_objective_value)
-                    reward = max(self.last_obj - objective_value, 0)/self.reference_budget #Modified reward function for EX20
-                    if reward > 0:
-                        self.last_obj = objective_value
-        
-                # Remaining Budget is insufficient for future valid action or Network is Deterministic and Max Flow is Zero
-                if (remaining_budget[0] < least_resources or (self.deterministic_outcomes and objective_value == 0)):
-                    done = True
-                
-            # Update state observation
-            self.state['budget']= remaining_budget
-        
-        reward = reward + penalty #Compute reward
-        
-        return self.state, float(reward), bool(done), False, {}  # state, reward, terminated, truncated, info
+    def _apply_invalid_action(self, action, remaining_budget):
+        """Apply penalty for invalid action."""
+        penalty = self.PENALTY_VALUE
+        remaining_budget[0] = max(0, remaining_budget[0] - self.state['edge_costs'][action])
+        return penalty, remaining_budget
+
+    def _calculate_zero_sum_reward(self, action):
+        """Calculate reward for zero-sum strategy (maximize disruption)."""
+        if self.deterministic_outcomes:
+            objective_value, _ = self.solve_max_flow()
+            reward = (self.last_obj - objective_value) / self.reference_budget
+            self.last_obj = objective_value
+        else:
+            # Stochastic outcome calculation
+            objective_value = self._calculate_stochastic_objective()
+            reward = max(self.last_obj - objective_value, 0) / self.reference_budget
+            if reward > 0:
+                self.last_obj = objective_value   
+        return reward
+
+    def _calculate_stochastic_objective(self):
+        """Calculate objective value under stochastic interdiction outcomes."""
+        if self.multiple_interdiction_attempts:
+            edges_interdicted = (self.state['edge_interdicted'] > 0).astype(int)
+            success_probs = ((1 - self.state['edge_interdiction_probability']) ** 
+                            self.state['edge_interdicted'])
+            prob_array = edges_interdicted * success_probs
+        else:
+            prob_array = (self.state['edge_interdicted'] * 
+                         self.state['edge_interdiction_probability'])
+    
+        non_zero_probs = prob_array[prob_array != 0]
+        if non_zero_probs.size == 0:
+            iterations = 1
+        else:
+            mean_prob = np.mean(non_zero_probs)
+            if mean_prob <= 0.5:
+                iterations = int(1 + (1000 - 1) * (mean_prob / 0.5))
+            else:
+                iterations = int(1000 - (1000 - 1) * ((mean_prob - 0.5) / 0.5))
+    
+        objective_values = []
+        for _ in range(iterations):
+            obj_val, _ = self.solve_max_flow()
+            objective_values.append(obj_val)
+    
+        return np.mean(objective_values)
+
+########################  WORK IN HERE NEXT #ISSUE #4     
+    def _calculate_canalize_reward(self, action):
+        """Calculate reward for canalize strategy (force flow through specific path)."""
+        # Reward for successful interdiction of non-target edges
+        if self.state['canalize_objective'][action] == 0:
+            # Interdicting non-target edge - positive reward
+            objective_value, flows = self.solve_max_flow()
+            target_flow = self._calculate_target_path_flow(flows, 'canalize_objective')
+            reward = target_flow / max(objective_value, 1)
+            return reward * 2  # Amplify reward for good actions
+        else:
+            # Interdicting target edge - negative reward
+            return -0.5
+
+    def _calculate_isolate_reward(self, action):
+        """Calculate reward for isolate strategy (cut off specific sink connections)."""
+        # Check if action targets a sink edge that should be isolated
+        edge = self.interdictable_edges[action]
+        if edge[1] == self.sink_nodes[0]:  # This is a sink edge
+            sink_edge_idx = self._get_sink_edge_index(edge)
+            if sink_edge_idx is not None and self.state['isolate_objective'][sink_edge_idx] == 1:
+                # Reward for isolating target sink connection
+                return 1.0
+            else:
+                # Penalty for isolating non-target sink connection
+                return -0.5
+    
+        # For non-sink edges, small reward if it helps isolation
+        objective_value, _ = self.solve_max_flow()
+        flow_reduction = (self.last_obj - objective_value) / self.reference_budget
+        return flow_reduction * 0.5  # Smaller reward for indirect help
+
+    def _calculate_divert_reward(self, action):
+        """Calculate reward for divert strategy (redirect flow from one path to another)."""
+        # Calculate reward based on flow diversion success
+        objective_value, flows = self.solve_max_flow()
+        from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
+        to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
+    
+        if self.state['divert_from_objective'][action] == 1:
+            # Interdicting "from" path - reward if "to" path gets more flow
+            return (to_flow - from_flow) / max(objective_value, 1)
+        elif self.state['divert_to_objective'][action] == 1:
+            # Interdicting "to" path - penalty
+            return -0.5
+        else:
+            # Interdicting other edges - small reward for general disruption
+            flow_reduction = (self.last_obj - objective_value) / self.reference_budget
+            return flow_reduction * 0.2
+
+    def _calculate_target_path_flow(self, flows, objective_key):
+        """Calculate total flow through edges marked in the objective."""
+        target_flow = 0
+        objective = self.state[objective_key]
+    
+        for idx, edge in enumerate(self.interdictable_edges):
+            if idx < len(objective) and objective[idx] == 1:
+                target_flow += flows.get(edge, 0)
+                target_flow += flows.get((edge[1], edge[0]), 0)  # Reverse direction
+    
+        return target_flow
+
+    def _count_blocked_sink_edges(self):
+        """Count how many target sink edges are effectively blocked."""
+        blocked_count = 0
+        for idx, should_isolate in enumerate(self.state['isolate_objective']):
+            if should_isolate == 1:
+                sink_edge = self.sink_edges[idx]
+                if sink_edge in self.interdictable_edges:
+                    edge_idx = self.edge_to_index[sink_edge]
+                    if self.state['edge_interdicted'][edge_idx] > 0:
+                        blocked_count += 1
+        return blocked_count
+
+    def _get_sink_edge_index(self, edge):
+        """Get the index of a sink edge in the isolate objective array."""
+        try:
+            return self.sink_edges.index(edge)
+        except ValueError:
+            return None
+##############
+
+    def _is_episode_complete(self, remaining_budget):
+        """Determine if the episode should end."""
+        # Calculate minimum resources needed for next action
+        if self.multiple_interdiction_attempts:
+            least_resources = min(self.state['edge_costs'][self.state['edge_costs'] > 0], default=float('inf'))
+        else:
+            available_costs = self.state['edge_costs'] * (1 - self.state['edge_interdicted'])
+            least_resources = min(available_costs[available_costs > 0], default=float('inf'))
+    
+        # Episode ends if insufficient budget or network is completely disrupted
+        if remaining_budget[0] < least_resources:
+            return True
+    
+        if self.deterministic_outcomes:
+            objective_value, _ = self.solve_max_flow()
+            if objective_value == 0:
+                return True
+        return False
 
     def render(self, mode='human'):
         print(f"State: {self.state}")
