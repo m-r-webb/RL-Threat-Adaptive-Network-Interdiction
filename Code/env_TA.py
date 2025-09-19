@@ -409,8 +409,17 @@ class CustomEnv(gym.Env):
         # Add strategy-specific components
         self.state = self._add_strategy_components(base_state)
 
-        # Calculate reference values
-        self.reference_obj, _ = self.solve_max_flow()
+        # Calculate reference objective value for the attacker's strategy
+        if self.attacker_strategy == 'zero_sum':
+            self.reference_obj, _ = self._compute_objective_and_flows()
+        elif self.attacker_strategy == 'canalize':
+            self.reference_obj = self._calculate_canalize_objective()
+        elif self.attacker_strategy == 'isolate':
+            self.reference_obj = self._calculate_isolate_objective()
+        elif self.attacker_strategy == 'divert':
+            self.reference_start_flows = self._calculate_divert_objective()
+            self.reference_obj = 0
+        
         self.last_obj = self.reference_obj
         self.reference_budget = remaining_budget[0]
 
@@ -638,7 +647,7 @@ class CustomEnv(gym.Env):
                                     "isolate": self._calculate_isolate_reward,
                                     "divert": self._calculate_divert_reward}
             calculator = strategy_calculators.get(self.attacker_strategy)
-            reward = calculator(action)
+            reward = calculator()
         else:
             #Determine penalty and decrement budget
             reward, remaining_budget = self._apply_invalid_action(action, remaining_budget)
@@ -653,6 +662,8 @@ class CustomEnv(gym.Env):
         
     def _validate_action(self, action, remaining_budget):
         """Validate if the given action is legal."""
+        ## Checks for all attacker strategies
+        # Check if action is within action space
         if action >= self.num_interdictable_edges:
             return False
     
@@ -668,7 +679,18 @@ class CustomEnv(gym.Env):
         max_interdictions = self.MAX_INTERDICTION_ATTEMPTS if self.multiple_interdiction_attempts else 1
         if self.state['edge_interdicted'][action] >= max_interdictions:
             return False
-    
+
+        ## Attacker Strategy Specific Checks
+        # Canalization - Check attacker does not target canalization path
+        if self.attacker_strategy == 'canalize':
+            if self.state['canalize_objective'][action] == 1:
+                return False
+
+        # Divert - Check attacker does not target the divert to path
+        if self.attacker_strategy == 'divert':
+            if self.state['divert_to_objective'][action] == 1:
+                return False
+        
         return True
         
     def _apply_valid_action(self, action, remaining_budget):
@@ -687,21 +709,15 @@ class CustomEnv(gym.Env):
         remaining_budget[0] = max(0, remaining_budget[0] - self.state['edge_costs'][action])
         return penalty, remaining_budget
 
-    def _calculate_zero_sum_reward(self, action):
+    def _calculate_zero_sum_reward(self):
         """Calculate reward for zero-sum strategy (maximize disruption)."""
-        if self.deterministic_outcomes:
-            objective_value, _ = self.solve_max_flow()
-            reward = (self.last_obj - objective_value) / self.reference_budget
-            self.last_obj = objective_value
-        else:
-            # Stochastic outcome calculation
-            objective_value = self._calculate_stochastic_objective()
-            reward = max(self.last_obj - objective_value, 0) / self.reference_budget
-            if reward > 0:
-                self.last_obj = objective_value   
+        objective_value, _ = self._compute_objective_and_flows()
+        reward = max(self.last_obj - objective_value, 0) / self.reference_budget
+        if reward > 0:
+            self.last_obj = objective_value   
         return reward
 
-    def _calculate_stochastic_objective(self):
+    def _calculate_stochastic_objective_and_flow(self):
         """Calculate objective value under stochastic interdiction outcomes."""
         if self.multiple_interdiction_attempts:
             edges_interdicted = (self.state['edge_interdicted'] > 0).astype(int)
@@ -723,93 +739,111 @@ class CustomEnv(gym.Env):
                 iterations = int(1000 - (1000 - 1) * ((mean_prob - 0.5) / 0.5))
     
         objective_values = []
+        all_flows = []
         for _ in range(iterations):
-            obj_val, _ = self.solve_max_flow()
+            obj_val, flows = self.solve_max_flow()
             objective_values.append(obj_val)
-    
-        return np.mean(objective_values)
+            all_flows.append(flows)
 
-########################  WORK IN HERE NEXT #ISSUE #4     
-    def _calculate_canalize_reward(self, action):
+        mean_objective = np.mean(objective_values)
+        mean_flows = {edge: np.mean([flows[edge] for flows in all_flows]) for edge in all_flows[0].keys()}
+
+        return mean_objective, mean_flows
+    
+    def _compute_objective_and_flows(self):
+        """Calculate the max flow objective and edge flows."""
+        # Reward for successful interdiction of non-target edges
+        if self.deterministic_outcomes:
+            objective, flows = self.solve_max_flow()
+        else:
+            # Stochastic outcome calculation
+            objective, flows = self._calculate_stochastic_objective_and_flow()    
+        
+        return objective, flows
+
+    def _calculate_canalize_objective(self):
+        """Calculate objective for canalize strategy (flow through specific path)."""
+        # Reward for successful interdiction of non-target edges
+        _, flows = self._compute_objective_and_flows()    
+        target_path_flow = self._calculate_target_path_flow(flows, 'canalize_objective')
+        return target_path_flow
+        
+    def _calculate_canalize_reward(self):
         """Calculate reward for canalize strategy (force flow through specific path)."""
         # Reward for successful interdiction of non-target edges
-        if self.state['canalize_objective'][action] == 0:
-            # Interdicting non-target edge - positive reward
-            objective_value, flows = self.solve_max_flow()
-            target_flow = self._calculate_target_path_flow(flows, 'canalize_objective')
-            reward = target_flow / max(objective_value, 1)
-            return reward * 2  # Amplify reward for good actions
-        else:
-            # Interdicting target edge - negative reward
-            return -0.5
+        target_path_flow = self._calculate_canalize_objective()
+        
+        reward = (target_path_flow - self.last_obj) / self.reference_budget
+        self.last_obj = target_path_flow
+        return reward
+        
+    def _calculate_isolate_objective(self):
+        """Calculate objective for isolate strategy (reduce flow to specific nodes)."""
+        # Reward for successful interdiction of non-target edges
+        _, flows = self._compute_objective_and_flows()    
+        target_node_flow = self._calculate_target_node_flow(flows, 'isolate_objective')
+        return target_node_flow
+        
+    def _calculate_isolate_reward(self):
+        """Calculate reward for isolate strategy (reduce flow to specific nodes)."""
+        # Reward reduction in flow to target nodes
+        target_node_flow = self._calculate_isolate_objective()
+        
+        reward = (self.last_obj-target_node_flow) / self.reference_budget
+        self.last_obj = target_node_flow
+        return reward
 
-    def _calculate_isolate_reward(self, action):
-        """Calculate reward for isolate strategy (cut off specific sink connections)."""
-        # Check if action targets a sink edge that should be isolated
-        edge = self.interdictable_edges[action]
-        if edge[1] == self.sink_nodes[0]:  # This is a sink edge
-            sink_edge_idx = self._get_sink_edge_index(edge)
-            if sink_edge_idx is not None and self.state['isolate_objective'][sink_edge_idx] == 1:
-                # Reward for isolating target sink connection
-                return 1.0
-            else:
-                # Penalty for isolating non-target sink connection
-                return -0.5
-    
-        # For non-sink edges, small reward if it helps isolation
-        objective_value, _ = self.solve_max_flow()
-        flow_reduction = (self.last_obj - objective_value) / self.reference_budget
-        return flow_reduction * 0.5  # Smaller reward for indirect help
-
-    def _calculate_divert_reward(self, action):
-        """Calculate reward for divert strategy (redirect flow from one path to another)."""
-        # Calculate reward based on flow diversion success
-        objective_value, flows = self.solve_max_flow()
+    def _calculate_divert_objective(self):
+        """Calculate objective for divert strategy (redirect flow from one path to another)."""
+        # Reward for successful interdiction of non-target edges
+        _, flows = self._compute_objective_and_flows()   
+        
         from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
         to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
-    
-        if self.state['divert_from_objective'][action] == 1:
-            # Interdicting "from" path - reward if "to" path gets more flow
-            return (to_flow - from_flow) / max(objective_value, 1)
-        elif self.state['divert_to_objective'][action] == 1:
-            # Interdicting "to" path - penalty
-            return -0.5
-        else:
-            # Interdicting other edges - small reward for general disruption
-            flow_reduction = (self.last_obj - objective_value) / self.reference_budget
-            return flow_reduction * 0.2
+        
+        return (from_flow, to_flow)
+
+    def _calculate_divert_reward(self):
+        """Calculate reward for divert strategy (redirect flow from one path to another)."""
+        # Calculate reward based on flow diversion success
+        flows_from_and_to = self._calculate_divert_objective()
+
+        diverted_flow_from = self.reference_start_flows[0] - flows_from_and_to[0]
+        diverted_flow_to = flows_from_and_to[1] - self.reference_start_flows[1] 
+        diverted_flow = min(diverted_flow_from, diverted_flow_to)
+        
+        reward = (diverted_flow - self.last_obj) / self.reference_budget
+        self.last_obj = diverted_flow
+        return reward
 
     def _calculate_target_path_flow(self, flows, objective_key):
         """Calculate total flow through edges marked in the objective."""
-        target_flow = 0
         objective = self.state[objective_key]
+        target_flows = []
     
         for idx, edge in enumerate(self.interdictable_edges):
-            if idx < len(objective) and objective[idx] == 1:
-                target_flow += flows.get(edge, 0)
-                target_flow += flows.get((edge[1], edge[0]), 0)  # Reverse direction
+            if objective[idx] == 1:
+                forward_flow = flows.get(edge, 0)
+                reverse_flow = flows.get((edge[1], edge[0]), 0)
+                # Take the maximum of forward and reverse flow for this edge
+                edge_flow = max(forward_flow, reverse_flow)
+                target_flows.append(edge_flow)
     
-        return target_flow
+        # Return minimum flow among target edges
+        return min(target_flows)
 
-    def _count_blocked_sink_edges(self):
-        """Count how many target sink edges are effectively blocked."""
-        blocked_count = 0
-        for idx, should_isolate in enumerate(self.state['isolate_objective']):
-            if should_isolate == 1:
-                sink_edge = self.sink_edges[idx]
-                if sink_edge in self.interdictable_edges:
-                    edge_idx = self.edge_to_index[sink_edge]
-                    if self.state['edge_interdicted'][edge_idx] > 0:
-                        blocked_count += 1
-        return blocked_count
-
-    def _get_sink_edge_index(self, edge):
-        """Get the index of a sink edge in the isolate objective array."""
-        try:
-            return self.sink_edges.index(edge)
-        except ValueError:
-            return None
-##############
+    def _calculate_target_node_flow(self, flows, objective_key):
+        """Calculate total flow into nodes marked in the objective."""
+        objective = self.state[objective_key]
+        node_flows = []
+    
+        for idx, edge in enumerate(self.edge_groups[self.sink_nodes[0]]['in']):
+            if objective[idx] == 1:
+                edge_flow = flows.get(edge, 0)
+                node_flows.append(edge_flow)
+    
+        # Return sum flow among target nodes
+        return np.sum(node_flows)
 
     def _is_episode_complete(self, remaining_budget):
         """Determine if the episode should end."""
