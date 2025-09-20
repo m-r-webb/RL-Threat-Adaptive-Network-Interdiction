@@ -79,13 +79,16 @@ def create_nodes_edges(node_filename, edge_filename):
 class CustomEnv(gym.Env):
     """Custom Gym environment for network interdiction problems."""
     # Class constants
+    DEFAULT_BUDGET_RANGE = (0, 100)
     DEFAULT_EDGE_CAPACITY_RANGE = (0, 100)
-    DEFAULT_EDGE_COST_RANGE = (3, 5)
-    DEFAULT_TRAINING_BUDGET_RANGE = (5, 50)
+    DEFAULT_EDGE_COST_RANGE = (0, 10)
+    DEFAULT_TRAINING_BUDGET_RANGE = (5, 10)
+    DEFAULT_TRAINING_EDGE_CAPACITY_RANGE = (30, 60)
+    DEFAULT_TRAINING_EDGE_COST_RANGE = (3, 5)
     MAX_INTERDICTION_ATTEMPTS = 10
-    MAX_SOURCE_FLOW = 150
-    MAX_SINK_NEED = 50
-    GUROBI_ENV = grb.Env(params={"OutputFlag": 0, "LogToConsole": 0, "Threads": 2})
+    MAX_SOURCE_FLOW = 125
+    MAX_SINK_NEED = 40
+    GUROBI_ENV = grb.Env(params={"OutputFlag": 0, "LogToConsole": 0, "Threads": 1})
     PENALTY_VALUE = -1
     
     def __init__(self, nodes, edges, deterministic_agent=True, initial_budget = None, 
@@ -179,7 +182,7 @@ class CustomEnv(gym.Env):
             'edge_costs': spaces.Box(low=self.DEFAULT_EDGE_COST_RANGE[0], high=self.DEFAULT_EDGE_COST_RANGE[1],
                                      shape=(self.max_num_edges,), dtype=int),
             'edge_interdiction_probability': spaces.Box(low=0, high=1, shape=(self.max_num_edges,), dtype=float),
-            'budget': spaces.Box(low=0, high=100, shape=(1,), dtype=int),
+            'budget': spaces.Box(low=self.DEFAULT_BUDGET_RANGE[0], high=self.DEFAULT_BUDGET_RANGE[1], shape=(1,), dtype=int),
             'edge_departure_node': spaces.Box(low=1, high=self.max_num_nodes, shape=(self.max_num_edges,), dtype=int),
             'edge_arrival_node': spaces.Box(low=1, high=self.max_num_nodes, shape=(self.max_num_edges,), dtype=int)
         }
@@ -374,10 +377,12 @@ class CustomEnv(gym.Env):
 
         # Generate network parameters
         # Sample edge capacities
-        edge_capacities = self.base_spaces['edge_capacity'].sample()
+        raw_capacities = self.base_spaces['edge_capacity'].sample()
+        edge_capacities = ((raw_capacities / 100.0) * (self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[1]-self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[0]) + self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[0]).astype(int)
         
         # Sample edge costs and interdiction probabilities
-        edge_costs = self.base_spaces['edge_costs'].sample()
+        raw_costs = self.base_spaces['edge_costs'].sample()
+        edge_costs = (((raw_costs) / 10) * (self.DEFAULT_TRAINING_EDGE_COST_RANGE[1]-self.DEFAULT_TRAINING_EDGE_COST_RANGE[0]) + self.DEFAULT_TRAINING_EDGE_COST_RANGE[0]).astype(int)
         
         #Sample interdiction probabilities based on deterministic setting
         if self.deterministic_outcomes:
