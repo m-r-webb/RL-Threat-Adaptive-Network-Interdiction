@@ -99,7 +99,22 @@ class SimpleFeatureExtractor(BaseFeaturesExtractor):    #IM Update
                  edge_interdicted_mean = 5, edge_interdicted_std= 2.889,
                  attacker_strategy = 'zero_sum'
                 ):
-        super().__init__(observation_space, features_dim=num_edges * embedding_dim + 1)
+        # Calculate features_dim based on strategy
+        base_features = num_edges * embedding_dim + 1  # +1 for budget
+        
+        if attacker_strategy == 'isolate' and not multiple_interdiction_attempts:
+            # Get isolate_objective dimensions from observation space
+            isolate_space = observation_space.spaces.get('isolate_objective')
+            if isolate_space is not None:
+                isolate_dim = isolate_space.shape[0] if hasattr(isolate_space, 'shape') else isolate_space.n
+                isolate_features = isolate_dim * 8  # 8 is embedding dimension
+                total_features = base_features + isolate_features
+            else:
+                total_features = base_features
+        else:
+            total_features = base_features
+        
+        super().__init__(observation_space, features_dim=total_features)
 
         #Register normalization parameters as buffers
         self.register_buffer('edge_capacity_mean', th.tensor(edge_capacity_mean))
@@ -145,7 +160,7 @@ class SimpleFeatureExtractor(BaseFeaturesExtractor):    #IM Update
                 )
         elif attacker_strategy == 'isolate':
                 self.edge_proj = nn.Sequential(
-                    nn.Linear(3 + 16 + 6 + 6, embedding_dim),  # 3(cont) + 8(binary) + 16(dep) + 16(arr)
+                    nn.Linear(3 + 8 + 6 + 6, embedding_dim),  # 3(cont) + 8(binary) + 16(dep) + 16(arr)
                     nn.ReLU(),#negative_slope=0.01),
                     nn.LayerNorm(embedding_dim)
                 )
@@ -211,7 +226,9 @@ class SimpleFeatureExtractor(BaseFeaturesExtractor):    #IM Update
                 combined = th.cat([cont_features, binary_emb, binary_emb2, binary_emb3, dep_emb, arr_emb], dim=-1)
             elif attacker_strategy == 'isolate':
                 binary_emb2 = self.binary_embed(isolate_objective)
-                combined = th.cat([cont_features, binary_emb, binary_emb2, dep_emb, arr_emb], dim=-1)
+                combined = th.cat([cont_features, binary_emb, dep_emb, arr_emb], dim=-1)
+                batch_size = cont_features.shape[0]
+                binary_emb2_flattened = binary_emb2.view(batch_size, -1)  # [B, sink_edges * 8]
 
         # Project features
         edge_embeddings = self.edge_proj(combined)  # [B, edges, 128]
@@ -219,9 +236,13 @@ class SimpleFeatureExtractor(BaseFeaturesExtractor):    #IM Update
         # Flatten and add budget
         batch_size = edge_embeddings.shape[0]
         flattened = edge_embeddings.view(batch_size, -1)
-        budget = budget.reshape(-1,1)
-        
-        return th.cat([flattened, budget], dim=-1)
+        budget = budget.reshape(batch_size, -1)  # Ensure correct batch dimension
+
+        if attacker_strategy == 'isolate':
+            binary_emb2 = binary_emb2.reshape(-1,1)
+            return th.cat([flattened, budget, binary_emb2_flattened], dim=-1)
+        else:
+            return th.cat([flattened, budget], dim=-1)
 
 class SimpleFeatureExtractorLSTM(BaseFeaturesExtractor):                   
     def __init__(self, observation_space, num_edges=60, num_nodes=27, 
@@ -421,7 +442,7 @@ policy_kwargs = dict(
 #    net_arch=dict(pi=[512,512,512, 512], vf=[512,256,128,64]), #G5x5_PPO_EX006A, _MaskablePPO_EX005A
 #    net_arch=dict(pi=[7680,7680,7680, 7680], vf=[7680,7680,7680, 7680]), #G5x5_MaskablePPO_EX005B&1
 #    net_arch=dict(pi=[1024,1024,1024, 512], vf=[1024,1024,512,256]), #G5x5_MaskablePPO_EX005C&1
-#    net_arch=dict(pi=[512,512,512, 512], vf=[512,256,128,64]), #G5x5_PPO_EX006A _A2C_EX006A
+##    net_arch=dict(pi=[512,512], vf=[512,256]), #G5x5_PPO_EX006A _A2C_EX006A
 #     net_arch=dict(pi=[512,512,512,512,512,512,512], vf=[512,256,128,64,32,16,8]), #G8x8_PPO_EX006A
 #     net_arch=dict(pi=[1548,1548,1548,1548,1548,1548,1548], vf=[1548,774,387,194,97,48,24]), #G8x8_PPO_EX006A
 
@@ -502,7 +523,7 @@ if __name__ == "__main__":
     
     elif agent == "DQN":
         from stable_baselines3 import DQN
-        model = DQN("MultiInputPolicy", vec_env, verbose=0, buffer_size=3000000, learning_starts=10000,
+        model = DQN("MultiInputPolicy", vec_env, verbose=0, buffer_size=1000000, learning_starts=10000,
                     batch_size=720,
                     train_freq=5, #10
                     target_update_interval=5000,
@@ -542,5 +563,6 @@ if __name__ == "__main__":
                                              name_prefix=model_name)
    
     # Train the agent
-    model.learn(total_timesteps=timesteps, callback=[checkpoint_callback, eval_callback, replay_buffer_callback], #CurriculumCallback()],
+    model.learn(total_timesteps=timesteps, callback=[checkpoint_callback, eval_callback,     #],
+                                                     replay_buffer_callback], #CurriculumCallback()],
                 progress_bar = False)
