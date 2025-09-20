@@ -3,7 +3,7 @@
 #LSTMv2 Features Extractor - PPO_EX003LSTMv2 - Edge to 128 embedding in LSTM with budget cell state
 
 ##Inputs
-graphName = "G3x4"
+graphName = "G4x5"
 
 # Type of agent to train (uncomment only one)
 #agent = "A2C"
@@ -15,17 +15,15 @@ agent = "DQN"
 # Deterministic or Stochastic Outcomes?
 deterministicOutcomes = False
 multiple_interdiction_attempts=False
-min_training_budget=3
-max_training_budget=15
+attacker_strategy = "isolate"  # 'canalize'  'divert'    'isolate'   'zero_sum'
 
 if deterministicOutcomes:
     deterministicLetter = "D"
 else:
     deterministicLetter = "S"
 
-#G5x5
-#version = "EX001" #Stochastic PPO, DQN
-version = "EX002" #Deterministic PPO Unlettered: 5x5, B: 50x50, C:normalized budget DQN A: 512,512,265 network B: 512,512,265,256 network, increased exploration to .9
+#G3x5
+version = "EX001I" #C: Canalize, D: Divert, I: Isolate, Z: Zero-Sum 
 
 # Model Name
 model_name = f"{graphName}_{deterministicLetter}_{agent}_{version}"
@@ -34,7 +32,7 @@ print(model_name)
 initial_learning_rate = 0.0001  #B: 0.0003
 
 # Time Steps to Train
-timesteps = 30000000
+timesteps = 15000000
 
 # Number of parallel cpus
 n_cpus = 144  # Number of environments
@@ -60,7 +58,7 @@ from sb3_contrib.common.wrappers import ActionMasker
 from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback  # Replace EvalCallback
 
 # Import custom environment .py file
-import env_IM as ce #modified for multiple_interdictions
+import env_TA as ce #modified for multiple_interdictions
 
 # Graph nodes and edges to use
 node_filename = f"{graphName}_Nodes.csv"  # Dynamically include graphName
@@ -81,27 +79,10 @@ def linear_schedule(initial_value: float):
     return func
 
 def make_env():
-    env = ce.CustomEnv(nodes, edges, deterministic_agent=deterministicOutcomes, min_training_budget=min_training_budget,
-                       max_training_budget = max_training_budget, multiple_interdiction_attempts=multiple_interdiction_attempts)
+    env = ce.CustomEnv(nodes, edges, deterministic_agent=deterministicOutcomes,
+                       multiple_interdiction_attempts=multiple_interdiction_attempts,
+                       attacker_strategy=attacker_strategy)
     return env
-    
-#IMPLEMENT CURRICULUM LEARNING
-class CurriculumCallback(BaseCallback):
-    def __init__(self, decay_freq=576000, verbose=0):
-        super().__init__(verbose)
-        self.decay_freq = decay_freq
-        
-    def _on_step(self) -> bool:
-        if self.num_timesteps % self.decay_freq == 0:
-            # Update all environments simultaneously
-            self.training_env.env_method("decay_zero_prob")
-        if self.num_timesteps % (self.decay_freq*2) == 0:
-            self.training_env.env_method("increase_budget")
-            # Get current probability for monitoring
-            #zero_probs = self.training_env.get_attr("zero_prob")
-            #self.logger.record("curriculum/zero_prob", np.mean(zero_probs))
-        return True
-#END IMPLEMENT CURRICULUM LEARNING
 
 #Custom Features Extractor
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
@@ -110,12 +91,13 @@ from torch.nn import Linear
 import torch.nn.functional as F
 
 class SimpleFeatureExtractor(BaseFeaturesExtractor):    #IM Update
-    def __init__(self, observation_space, num_edges=17, num_nodes=14, embedding_dim=128,
+    def __init__(self, observation_space, num_edges=25, num_nodes=22, embedding_dim=128,
                  edge_capacity_mean=50, edge_capacity_std=28.868,
-                 edge_cost_mean=4, edge_cost_std= 0.577,
-                 budget_mean = 9, budget_std= 3.46,  #20, budget_std= 11.547, #
+                 edge_cost_mean=5, edge_cost_std= 1.543,
+                 budget_mean = 50, budget_std= 28.868,  #20, budget_std= 11.547, #
                  multiple_interdiction_attempts = True,
                  edge_interdicted_mean = 5, edge_interdicted_std= 2.889,
+                 attacker_strategy = 'zero_sum'
                 ):
         super().__init__(observation_space, features_dim=num_edges * embedding_dim + 1)
 
@@ -140,21 +122,40 @@ class SimpleFeatureExtractor(BaseFeaturesExtractor):    #IM Update
         
         # Feature processors
         self.binary_embed = nn.Embedding(2, 8)  # For edge_interdicted
-        self.node_embed = nn.Embedding(self.num_nodes, 16)  # For dep/arr nodes
+        self.node_embed = nn.Embedding(self.num_nodes, 6)  # For dep/arr nodes
 
-        if self.multiple_interdiction_attempts:
+        if attacker_strategy == 'zero_sum' :
+            if self.multiple_interdiction_attempts:
+                self.edge_proj = nn.Sequential(
+                    nn.Linear(4 + 6 + 6, embedding_dim),  # 4(cont) + 16(dep) + 16(arr)
+                    nn.ReLU(),
+                    nn.LayerNorm(embedding_dim)
+                )
+            else:
+                self.edge_proj = nn.Sequential(
+                    nn.Linear(3 + 8 + 6 + 6, embedding_dim),  # 3(cont) + 8(binary) + 16(dep) + 16(arr)
+                    nn.ReLU(),
+                    nn.LayerNorm(embedding_dim)
+                )
+        elif attacker_strategy == 'canalize':
+                self.edge_proj = nn.Sequential(
+                    nn.Linear(3 + 16 + 6 + 6, embedding_dim),  # 3(cont) + 8(binary) + 16(dep) + 16(arr)
+                    nn.ReLU(),#negative_slope=0.01),
+                    nn.LayerNorm(embedding_dim)
+                )
+        elif attacker_strategy == 'isolate':
+                self.edge_proj = nn.Sequential(
+                    nn.Linear(3 + 16 + 6 + 6, embedding_dim),  # 3(cont) + 8(binary) + 16(dep) + 16(arr)
+                    nn.ReLU(),#negative_slope=0.01),
+                    nn.LayerNorm(embedding_dim)
+                )
+        elif attacker_strategy == 'divert':
             self.edge_proj = nn.Sequential(
-                nn.Linear(4 + 16 + 16, embedding_dim),  # 4(cont) + 16(dep) + 16(arr)
-                nn.LeakyReLU(negative_slope=0.01),
+                nn.Linear(3 + 24 + 6 + 6, embedding_dim),  # 3(cont) + 8(binary) + 16(dep) + 16(arr)
+                nn.ReLU(),#negative_slope=0.01),
                 nn.LayerNorm(embedding_dim)
             )
-        else:
-            self.edge_proj = nn.Sequential(
-                nn.Linear(3 + 8 + 16 + 16, embedding_dim),  # 3(cont) + 8(binary) + 16(dep) + 16(arr)
-                nn.LeakyReLU(negative_slope=0.01),
-                nn.LayerNorm(embedding_dim)
-            )
-
+            
     def forward(self, observations):
         ## Original feature processing
         edge_capacity = th.as_tensor(observations['edge_capacity'], dtype=th.float32)
@@ -181,6 +182,15 @@ class SimpleFeatureExtractor(BaseFeaturesExtractor):    #IM Update
         dep_emb = self.node_embed(dep_nodes)  # [B, edges, 16]
         arr_emb = self.node_embed(arr_nodes)  # [B, edges, 16]
 
+        if attacker_strategy == 'canalize':
+            canalize_objective = th.as_tensor(observations['canalize_objective'], dtype=th.long)
+
+        if attacker_strategy == 'divert':
+            divert_from_objective = th.as_tensor(observations['divert_from_objective'], dtype=th.long)
+            divert_to_objective = th.as_tensor(observations['divert_to_objective'], dtype=th.long)
+
+        if attacker_strategy == 'isolate':
+            isolate_objective = th.as_tensor(observations['isolate_objective'], dtype=th.long)
         
         if self.multiple_interdiction_attempts:
             cont_features = th.stack([edge_capacity, edge_costs, edge_prob, edge_interdicted], dim=-1)  # [B, edges, 4]
@@ -189,8 +199,19 @@ class SimpleFeatureExtractor(BaseFeaturesExtractor):    #IM Update
         else:
             cont_features = th.stack([edge_capacity, edge_costs, edge_prob], dim=-1)  # [B, edges, 3]
             binary_emb = self.binary_embed(edge_interdicted)  # [B, edges, 8]
-        
-            combined = th.cat([cont_features, binary_emb, dep_emb, arr_emb], dim=-1)
+
+            if attacker_strategy == 'zero_sum':
+                combined = th.cat([cont_features, binary_emb, dep_emb, arr_emb], dim=-1)
+            elif attacker_strategy == 'canalize':
+                binary_emb2 = self.binary_embed(canalize_objective)
+                combined = th.cat([cont_features, binary_emb, binary_emb2, dep_emb, arr_emb], dim=-1)
+            elif attacker_strategy == 'divert':
+                binary_emb2 = self.binary_embed(divert_from_objective)
+                binary_emb3 = self.binary_embed(divert_to_objective)
+                combined = th.cat([cont_features, binary_emb, binary_emb2, binary_emb3, dep_emb, arr_emb], dim=-1)
+            elif attacker_strategy == 'isolate':
+                binary_emb2 = self.binary_embed(isolate_objective)
+                combined = th.cat([cont_features, binary_emb, binary_emb2, dep_emb, arr_emb], dim=-1)
 
         # Project features
         edge_embeddings = self.edge_proj(combined)  # [B, edges, 128]
@@ -387,10 +408,11 @@ class SimpleFeatureExtractorLSTMv2(BaseFeaturesExtractor): #Put budget in cell s
 policy_kwargs = dict(
     features_extractor_class=SimpleFeatureExtractor, # SimpleFeatureExtractorLSTM, #
     features_extractor_kwargs={
-        'num_edges': 17, #40, #168, #  270, #60, #
-        'num_nodes': 14, #27,  #102, #27, #
+        'num_edges': 25, #40, #168, #  270, #60, #
+        'num_nodes': 22, #27,  #102, #27, #
         'embedding_dim': 64, #128,
         'multiple_interdiction_attempts': multiple_interdiction_attempts,
+        'attacker_strategy': attacker_strategy
        # "lstm_hidden_dim": 256
     },
 #    net_arch=dict(pi=[1024,1024,512,256], vf=[1024,1024,512,256]),  # Post-feature-extractor layers
@@ -408,7 +430,7 @@ policy_kwargs = dict(
 #    net_arch=[512,512,512,512], #G5x5_DQN_EX006A,M
      net_arch=[512,512],
 #    net_arch=[4096,2048,1024,512],   # Version B:[512, 512, 512, 512], #DQN
-    activation_fn=nn.LeakyReLU,
+    activation_fn=nn.ReLU,
 #    ortho_init=True  # Enable orthogonal initialization
 )
 
@@ -436,10 +458,9 @@ if __name__ == "__main__":
     # Create evaluation environment (not vectorized)
     eval_env = DummyVecEnv([  # Single environment (not vectorized)
         lambda: Monitor(
-            ce.CustomEnv(
-                nodes, edges, deterministic_agent=deterministicOutcomes, 
-                      fixed_costs=fixedCosts, curriculum_training=False, min_training_budget = min_training_budget, max_training_budget = max_training_budget,
-                        multiple_interdiction_attempts=multiple_interdiction_attempts
+            ce.CustomEnv(nodes, edges, deterministic_agent=deterministicOutcomes, 
+                         multiple_interdiction_attempts=multiple_interdiction_attempts,
+                         attacker_strategy = attacker_strategy
             )
         )
     ])
@@ -481,10 +502,10 @@ if __name__ == "__main__":
     
     elif agent == "DQN":
         from stable_baselines3 import DQN
-        model = DQN("MultiInputPolicy", vec_env, verbose=0, buffer_size=3000000, learning_starts=100000,
+        model = DQN("MultiInputPolicy", vec_env, verbose=0, buffer_size=3000000, learning_starts=10000,
                     batch_size=720,
                     train_freq=5, #10
-                    target_update_interval=10000,
+                    target_update_interval=5000,
                     gradient_steps=2,  #4
                     exploration_fraction=0.6, exploration_initial_eps=1.0, exploration_final_eps=0.05,
                     policy_kwargs=policy_kwargs, 
@@ -522,4 +543,4 @@ if __name__ == "__main__":
    
     # Train the agent
     model.learn(total_timesteps=timesteps, callback=[checkpoint_callback, eval_callback, replay_buffer_callback], #CurriculumCallback()],
-                progress_bar = True)
+                progress_bar = False)
