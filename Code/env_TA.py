@@ -135,6 +135,9 @@ class CustomEnv(gym.Env):
                 self.interdictable_edges.append(key)
                 self.edge_departures.append(key[0])
                 self.edge_arrivals.append(key[1])
+
+        self.all_interdictable_edges = list(self.interdictable_edges) + [(v, u) for (u, v) in self.interdictable_edges]
+
         
         self.source_edges = [e for e in self.all_edges if e[0] in self.source_nodes]
         self.sink_edges = [e for e in self.all_edges if e[1] in self.sink_nodes]
@@ -207,19 +210,6 @@ class CustomEnv(gym.Env):
         # Combine base spaces with strategy-specific spaces
         observation_dict = {**self.base_spaces, **self.strategy_spaces.get(self.attacker_strategy, {})}
         return spaces.Dict(observation_dict)
-
-    # Maskable Actions - Need to Update for Threat Adaptive
-    def action_masks(self) -> np.ndarray:
-        mask = []
-        for edge in self.interdictable_edges:
-            edge_obj = self.edges_episode[edge]
-            if self.multiple_interdiction_attempts:
-                mask = self.state['edge_capacity'] * self.state['edge_interdiction_probability'] * np.where(self.state['edge_costs'] > self.state['budget'][0],0,1)
-                mask = np.where(mask==0,0,1)
-            else:
-                mask = (1-self.state['edge_interdicted']) * self.state['edge_capacity'] * self.state['edge_interdiction_probability'] * np.where(self.state['edge_costs'] > self.state['budget'][0],0,1)
-                mask = np.where(mask==0,0,1)
-            return np.array(mask, dtype=np.bool_)
     
     def solve_max_flow(self, routing_assumption = "gurobi_default"):  
         """Solve the Max Flow network problem, output objective value and edge flows"""
@@ -279,10 +269,10 @@ class CustomEnv(gym.Env):
         )
     
         # Minimum flow forward and reverse constraints
-        self.maxflow_model.addConstrs((self.flow_var[e] >= self.edge_used[e] for e in self.interdictable_edges), name="min_flow_forward")
-        self.maxflow_model.addConstrs((self.flow_var[(e[1], e[0])] >= self.edge_used[(e[1], e[0])] for e in self.interdictable_edges),
-                                      name="min_flow_reverse"
-        )
+        self.maxflow_model.addConstrs((self.flow_var[e] >= self.edge_used[e] for e in self.all_interdictable_edges), name="min_flow_forward")
+#        self.maxflow_model.addConstrs((self.flow_var[(e[1], e[0])] >= self.edge_used[(e[1], e[0])] for e in self.interdictable_edges),
+#                                      name="min_flow_reverse"
+#        )
     
         # Source and sink capacity limits
         self.maxflow_model.addConstr(self.flow_var[self.super_edge] <= self.MAX_SOURCE_FLOW, name="max_source_flow")
@@ -299,27 +289,13 @@ class CustomEnv(gym.Env):
                                           self.state["edge_interdicted"][:self.num_interdictable_edges]) * self.state["edge_capacity"][:self.num_interdictable_edges]
     
         # Remove old capacity constraints if they exist
-        if hasattr(self, 'mf_capacity_constraints'):
-            for con in self.mf_capacity_constraints.values():
-                self.maxflow_model.remove(con)
-    
-        # Add new capacity constraints
-        self.mf_capacity_constraints = {}
-        for idx, e in enumerate(self.interdictable_edges):
-            # Forward direction
-            con_forward = self.maxflow_model.addConstr(
-                self.flow_var[e] <= upper_bounds[idx] * self.edge_used[e],
-                name=f"flow_capacity_{e[0]}_{e[1]}"
-            )
-        
-            # Reverse direction
-            con_reverse = self.maxflow_model.addConstr(
-                self.flow_var[(e[1], e[0])] <= upper_bounds[idx] * self.edge_used[(e[1], e[0])],
-                name=f"flow_capacity_{e[1]}_{e[0]}"
-            )
-        
-            self.mf_capacity_constraints[f"{e[0]}_{e[1]}"] = con_forward
-            self.mf_capacity_constraints[f"{e[1]}_{e[0]}"] = con_reverse
+        if hasattr(self, 'forward_cons'):
+            self.maxflow_model.remove(self.forward_cons)
+
+        # Single batch addition for forward constraints
+        self.forward_cons = self.maxflow_model.addConstrs((
+            self.flow_var[e] <= upper_bounds[idx % self.num_interdictable_edges] * self.edge_used[e] 
+            for idx, e in enumerate(self.all_interdictable_edges)), name="flow_capacity_forward")
 
     def _set_routing_objectives(self, routing_assumption):
         """Set model objectives based on routing assumption."""
@@ -443,8 +419,7 @@ class CustomEnv(gym.Env):
                 delattr(self, model_name)
     
         # Clean up related attributes
-        cleanup_attrs = ['benders_cuts', 'stochastic_alpha', 'stochastic_beta', 'stochastic_source_sink_constr', 'stochastic_aabg_constr',\
-                         'stochastic_alpha_IM', 'stochastic_beta_IM', 'stochastic_source_sink_constr_IM', 'stochastic_aabg_constr_IM']
+        cleanup_attrs = ['benders_cuts', 'stochastic_alpha', 'stochastic_beta', 'stochastic_source_sink_constr', 'stochastic_aabg_constr', 'stochastic_alpha_IM', 'stochastic_beta_IM', 'stochastic_source_sink_constr_IM', 'stochastic_aabg_constr_IM']
     
         for attr in cleanup_attrs:
             if hasattr(self, attr):
@@ -469,11 +444,15 @@ class CustomEnv(gym.Env):
     def _create_base_state(self, network_params):
         """Create the base state dictionary with common components."""
         # Update edge attributes in the episode graph
-        for edge_id, edge in enumerate(self.interdictable_edges):
-            self.edges_episode[edge].capacity = network_params['capacities'][edge_id]
-            self.edges_episode[edge].interdiction_cost = network_params['costs'][edge_id]
-            self.edges_episode[edge].interdiction_probability = network_params['probabilities'][edge_id]
-
+        for edge, cap, cost, prob in zip(self.interdictable_edges,
+                                         network_params['capacities'],
+                                         network_params['costs'],
+                                         network_params['probabilities']):
+            e = self.edges_episode[edge]
+            e.capacity = cap
+            e.interdiction_cost = cost
+            e.interdiction_probability = prob
+            
         # Create node arrays
         departure_nodes = np.full(self.max_num_edges, self.max_num_nodes)
         arrival_nodes = np.full(self.max_num_edges, self.max_num_nodes)
@@ -743,15 +722,15 @@ class CustomEnv(gym.Env):
             else:
                 iterations = int(1000 - (1000 - 1) * ((mean_prob - 0.5) / 0.5))
     
-        objective_values = []
-        all_flows = []
-        for _ in range(iterations):
-            obj_val, flows = self.solve_max_flow()
-            objective_values.append(obj_val)
-            all_flows.append(flows)
+        results = [self.solve_max_flow() for _ in range(iterations)]
+        objective_values, all_flows = zip(*results)
 
         mean_objective = np.mean(objective_values)
-        mean_flows = {edge: np.mean([flows[edge] for flows in all_flows]) for edge in all_flows[0].keys()}
+        edges = list(all_flows[0].keys())
+        # Build a 2D array: (num_iters, num_edges)
+        arr = np.array([[flows[edge] for edge in edges] for flows in all_flows])
+        mean_vals = arr.mean(axis=0)
+        mean_flows = dict(zip(edges, mean_vals))
 
         return mean_objective, mean_flows
     
@@ -903,7 +882,7 @@ class CustomEnv(gym.Env):
 
             self.budget_constr = self.optimal_deterministic_model.addConstr(
                 grb.quicksum(self.edges_episode[e].interdiction_cost * self.gamma[e]
-                             for e in self.interdictable_edges) <= self.remaining_budget[0],
+                             for e in self.interdictable_edges) <= self.state['budget'][0],
                 name="budget"
             )
 
