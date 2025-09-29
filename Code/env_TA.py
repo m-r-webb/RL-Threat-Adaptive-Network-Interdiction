@@ -98,7 +98,7 @@ class CustomEnv(gym.Env):
         #Setup core environment attributes
         self.nodes = nodes
         self.edges_reset = edges
-        self.edges_episode = copy.deepcopy(self.edges_reset)
+        self.edges_episode = copy.deepcopy(self.edges_reset)        
         self.multiple_interdiction_attempts = multiple_interdiction_attempts
         self.attacker_strategy = attacker_strategy
         self.deterministic_outcomes = deterministic_agent
@@ -156,6 +156,9 @@ class CustomEnv(gym.Env):
         
         # Create edge-to-index mapping
         self.edge_to_index = {edge: idx for idx, edge in enumerate(self.interdictable_edges)}
+
+        for edge_id in self.edge_groups[self.sink_nodes[0]]['in']:
+            self.edges_episode[edge_id].capacity = self.MAX_SINK_NEED
             
     def _setup_spaces(self):
         """Setup observation and action spaces based on environment configuration."""
@@ -851,16 +854,17 @@ class CustomEnv(gym.Env):
     def render(self, mode='human'):
         print(f"State: {self.state}")
     # END Gymnasium Environment Methods
-
+            
     def solve_optimal_interdiction(self):
         if self.deterministic_outcomes == True: #Solve Deterministic Case with Wood's Max/Min Formulation
             if not hasattr(self, 'optimal_deterministic_model'):
                 # Initialize the Gurobi model
-                self.optimal_deterministic_model = grb.Model("Network Interdiction Model 1D", env=self.GUROBI_ENV)
+                self.optimal_deterministic_model = grb.Model("Network Interdiction Model 1U", env=self.GUROBI_ENV)
                 
                 # Define Decision Variables
                 self.alpha = self.optimal_deterministic_model.addVars(self.nodes.keys(), vtype=grb.GRB.BINARY, name="alpha")
-                self.beta = self.optimal_deterministic_model.addVars(self.edges_reset.keys(), vtype=grb.GRB.BINARY, name="beta")
+                edges_with_sink_source = list(self.edges_reset.keys()) + [(self.sink_nodes[0],self.source_nodes[0])]
+                self.beta = self.optimal_deterministic_model.addVars(edges_with_sink_source, vtype=grb.GRB.BINARY, name="beta")
                 self.gamma = self.optimal_deterministic_model.addVars(self.interdictable_edges, vtype=grb.GRB.BINARY, name="gamma")
                 
                 # Define Constraints
@@ -873,7 +877,7 @@ class CustomEnv(gym.Env):
                      (self.gamma[e] if e in self.interdictable_edges else 0) >= 0 for e in self.edges_reset.keys()),
                     name="flow_conservation_reverse")
 
-                self.optimal_deterministic_model.addConstr(self.alpha[self.sink_nodes[0]]-self.alpha[self.source_nodes[0]] >=1,
+                self.optimal_deterministic_model.addConstr(self.alpha[self.sink_nodes[0]]-self.alpha[self.source_nodes[0]]+self.beta[(self.sink_nodes[0],self.source_nodes[0])] >=1,
                                                           name = "sink-source")
             
             # Update Constraints
@@ -887,7 +891,7 @@ class CustomEnv(gym.Env):
             )
 
             # Define Objective Value
-            self.optimal_deterministic_model.setObjective(grb.quicksum(edge.capacity * self.beta[edge_id] for edge_id, edge in self.edges_episode.items()), grb.GRB.MINIMIZE)
+            self.optimal_deterministic_model.setObjective(grb.quicksum(edge.capacity * self.beta[edge_id] for edge_id, edge in self.edges_episode.items())+self.MAX_SOURCE_FLOW*self.beta[(self.sink_nodes[0],self.source_nodes[0])], grb.GRB.MINIMIZE)
 
             # Optimize
             self.optimal_deterministic_model.optimize()
