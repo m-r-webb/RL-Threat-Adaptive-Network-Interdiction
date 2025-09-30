@@ -159,6 +159,8 @@ class CustomEnv(gym.Env):
 
         for edge_id in self.edge_groups[self.sink_nodes[0]]['in']:
             self.edges_episode[edge_id].capacity = self.MAX_SINK_NEED
+
+        self.edges_with_sink_source = list(self.edges_reset.keys()) + [(self.sink_nodes[0],self.source_nodes[0])]
             
     def _setup_spaces(self):
         """Setup observation and action spaces based on environment configuration."""
@@ -863,8 +865,7 @@ class CustomEnv(gym.Env):
                 
                 # Define Decision Variables
                 self.alpha = self.optimal_deterministic_model.addVars(self.nodes.keys(), vtype=grb.GRB.BINARY, name="alpha")
-                edges_with_sink_source = list(self.edges_reset.keys()) + [(self.sink_nodes[0],self.source_nodes[0])]
-                self.beta = self.optimal_deterministic_model.addVars(edges_with_sink_source, vtype=grb.GRB.BINARY, name="beta")
+                self.beta = self.optimal_deterministic_model.addVars(self.edges_with_sink_source, vtype=grb.GRB.BINARY, name="beta")
                 self.gamma = self.optimal_deterministic_model.addVars(self.interdictable_edges, vtype=grb.GRB.BINARY, name="gamma")
                 
                 # Define Constraints
@@ -951,7 +952,7 @@ class CustomEnv(gym.Env):
              # Budget constraint
             self.stochastic_budget_constr = self.optimal_stochastic_model.addConstr(grb.quicksum(
                 self.edges_episode[e].interdiction_cost * self.stochastic_gamma[e] 
-                for e in self.interdictable_edges) <= self.remaining_budget[0], name="budget")
+                for e in self.interdictable_edges) <= self.state['budget'][0], name="budget")
 
             self.stochastic_old_state = self.state
             self.stochastic_old_interdicted_edges = interdicted_edges
@@ -975,19 +976,19 @@ class CustomEnv(gym.Env):
                 
             self.stochastic_alpha = self.optimal_stochastic_model.addVars([(i, s) for s in self.scenarios for i in self.nodes], 
                                                   vtype=grb.GRB.BINARY, name="alpha")
-            self.stochastic_beta = self.optimal_stochastic_model.addVars([(e, s) for s in self.scenarios for e in self.edges_reset],
+            self.stochastic_beta = self.optimal_stochastic_model.addVars([(e, s) for s in self.scenarios for e in self.edges_with_sink_source],
                                                                           vtype=grb.GRB.BINARY, name="beta")
 
             if hasattr(self, 'stochastic_source_sink_constr'):
                 self.optimal_stochastic_model.remove(self.stochastic_source_sink_constr)
                 del self.stochastic_source_sink_constr 
 
-            self.stochastic_source_sink_constr = self.optimal_stochastic_model.addConstrs((self.stochastic_alpha[self.sink_nodes[0],s] - self.stochastic_alpha[self.source_nodes[0], s] >= 1 for s in self.scenarios), name="source_sink")
+            self.stochastic_source_sink_constr = self.optimal_stochastic_model.addConstrs((self.stochastic_alpha[self.sink_nodes[0],s] - self.stochastic_alpha[self.source_nodes[0], s] +self.stochastic_beta[(self.sink_nodes[0],self.source_nodes[0]),s]>= 1 for s in self.scenarios), name="source_sink")
 
             # Objective Function
             self.optimal_stochastic_model.setObjective((1/n_scenarios)*grb.quicksum(self.edges_episode[e].capacity * self.stochastic_beta[e, s]
                 for s in self.scenarios
-                for e in self.edges_reset), grb.GRB.MINIMIZE)
+                for e in self.edges_reset) + grb.quicksum(self.MAX_SOURCE_FLOW*self.stochastic_beta[(self.sink_nodes[0],self.source_nodes[0]),s] for s in self.scenarios), grb.GRB.MINIMIZE)
         
         # Scenario generation
         scenario_outcomes = np.random.binomial(1, self.state["edge_interdiction_probability"], 
@@ -1036,7 +1037,7 @@ class CustomEnv(gym.Env):
              # Budget constraint
             self.stochastic_budget_constr_IM = self.optimal_stochastic_model_IM.addConstr(grb.quicksum(
                 self.edges_episode[e].interdiction_cost * k * self.stochastic_gamma_IM[e,k] 
-                for e in self.interdictable_edges for k in range(1,9)) <= self.remaining_budget[0], name="budget_IM")
+                for e in self.interdictable_edges for k in range(1,9)) <= self.state['budget'][0], name="budget_IM")
 
             self.stochastic_old_state_IM = self.state
             self.stochastic_old_interdicted_edges_IM = interdicted_edges
