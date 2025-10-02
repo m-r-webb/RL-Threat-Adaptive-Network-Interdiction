@@ -399,11 +399,11 @@ class CustomEnv(gym.Env):
         if self.attacker_strategy == 'zero_sum':
             self.reference_obj, _ = self._compute_objective_and_flows()
         elif self.attacker_strategy == 'canalize':
-            self.reference_obj = self._calculate_canalize_objective()
+            self.reference_obj, _ = self._calculate_canalize_objective_and_flows()
         elif self.attacker_strategy == 'isolate':
-            self.reference_obj = self._calculate_isolate_objective()
+            self.reference_obj, _ = self._calculate_isolate_objective_and_flows()
         elif self.attacker_strategy == 'divert':
-            self.reference_start_flows = self._calculate_divert_objective()
+            self.reference_start_flows, _ = self._calculate_divert_objective_and_flows()
             self.reference_obj = 0
         
         self.last_obj = self.reference_obj
@@ -749,39 +749,39 @@ class CustomEnv(gym.Env):
         
         return objective, flows
 
-    def _calculate_canalize_objective(self):
+    def _calculate_canalize_objective_and_flows(self):
         """Calculate objective for canalize strategy (flow through specific path)."""
         # Reward for successful interdiction of non-target edges
         _, flows = self._compute_objective_and_flows()    
         target_path_flow = self._calculate_target_path_flow(flows, 'canalize_objective')
-        return target_path_flow
+        return target_path_flow, flows
         
     def _calculate_canalize_reward(self):
         """Calculate reward for canalize strategy (force flow through specific path)."""
         # Reward for successful interdiction of non-target edges
-        target_path_flow = self._calculate_canalize_objective()
+        target_path_flow, _ = self._calculate_canalize_objective_and_flows()
         
         reward = (target_path_flow - self.last_obj) / self.reference_budget
         self.last_obj = target_path_flow
         return reward
         
-    def _calculate_isolate_objective(self):
+    def _calculate_isolate_objective_and_flows(self):
         """Calculate objective for isolate strategy (reduce flow to specific nodes)."""
         # Reward for successful interdiction of non-target edges
         _, flows = self._compute_objective_and_flows()    
         target_node_flow = self._calculate_target_node_flow(flows, 'isolate_objective')
-        return target_node_flow
+        return target_node_flow, flows
         
     def _calculate_isolate_reward(self):
         """Calculate reward for isolate strategy (reduce flow to specific nodes)."""
         # Reward reduction in flow to target nodes
-        target_node_flow = self._calculate_isolate_objective()
+        target_node_flow, _ = self._calculate_isolate_objective_and_flows()
         
         reward = (self.last_obj-target_node_flow) / self.reference_budget
         self.last_obj = target_node_flow
         return reward
 
-    def _calculate_divert_objective(self):
+    def _calculate_divert_objective_and_flows(self):
         """Calculate objective for divert strategy (redirect flow from one path to another)."""
         # Reward for successful interdiction of non-target edges
         _, flows = self._compute_objective_and_flows()   
@@ -789,12 +789,12 @@ class CustomEnv(gym.Env):
         from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
         to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
         
-        return (from_flow, to_flow)
+        return (from_flow, to_flow), flows
 
     def _calculate_divert_reward(self):
         """Calculate reward for divert strategy (redirect flow from one path to another)."""
         # Calculate reward based on flow diversion success
-        flows_from_and_to = self._calculate_divert_objective()
+        flows_from_and_to, _ = self._calculate_divert_objective_and_flows()
 
         diverted_flow_from = self.reference_start_flows[0] - flows_from_and_to[0]
         diverted_flow_to = flows_from_and_to[1] - self.reference_start_flows[1] 
@@ -1114,7 +1114,7 @@ class CustomEnv(gym.Env):
 
         return (self.optimal_stochastic_model_IM.objVal, interdicted_edges, interdicted_quantities)
 
-    def solve_zero_backward_induction(self):
+    def solve_backward_induction(self):
         """
         Solve the optimal interdiction strategy for attacker using backward induction.
         This method finds the optimal interdictions for a particular attacker strategy.
@@ -1139,33 +1139,33 @@ class CustomEnv(gym.Env):
             # Check if we've already solved this state
             if state_key in memo:
                 return memo[state_key]
+
+            temp_state = self.state.copy()
+            temp_state['edge_interdicted'] = interdicted_state.copy()
+            temp_state['budget'] = np.array([remaining_budget])
+                
+            old_state = self.state
+            self.state = temp_state
+
+            if self.attacker_strategy == "zero_sum":
+                final_objective, flows = self._compute_objective_and_flows()
+                final_objective = -final_objective
+            elif self.attacker_strategy == 'canalize':
+                final_objective, flows = self._calculate_canalize_objective_and_flows()
+            elif self.attacker_strategy == 'isolate':
+                final_objective, flows = self._calculate_isolate_objective_and_flows()
+                final_objective = -final_objective
+            elif self.attacker_strategy == 'divert':
+                final_objective, flows = self._calculate_divert_objective_and_flows()
+                    
+            self.state = old_state
         
             # Base case: no more budget or maximum depth reached
             if remaining_budget < self.min_edge_cost or depth >= 20:
-                temp_state = self.state.copy()
-                temp_state['edge_interdicted'] = interdicted_state.copy()
-                temp_state['budget'] = np.array([remaining_budget])
-                
-                old_state = self.state
-                self.state = temp_state
-
-                final_objective, _ = self._compute_objective_and_flows()
-                    
-                self.state = old_state
-                final_objective = -final_objective
-                
                 memo[state_key] = (final_objective, [])
                 return final_objective, []
         
             # Find all valid actions from current state
-            temp_state = self.state.copy()
-            temp_state['edge_interdicted'] = interdicted_state.copy()
-            temp_state['budget'] = np.array([remaining_budget])
-            old_state = self.state
-            self.state = temp_state
-            final_objective, flows = self._compute_objective_and_flows()
-            self.state = old_state
-            
             valid_actions = []
             for action in range(self.num_interdictable_edges):
                 if self._validate_action(action, [remaining_budget], interdicted_state) and flows.get(self.interdictable_edges[action], 0) != 0:
@@ -1173,9 +1173,6 @@ class CustomEnv(gym.Env):
         
             # If no valid actions, evaluate terminal state
             if not valid_actions:
-                
-                final_objective = -final_objective
-
                 memo[state_key] = (final_objective, [])
                 return final_objective, []
         
@@ -1205,7 +1202,9 @@ class CustomEnv(gym.Env):
         initial_interdicted_state = self.state['edge_interdicted'].copy()
     
         optimal_reward, optimal_sequence = dp_solve(initial_budget, initial_interdicted_state)
-
+        if self.attacker_strategy == "zero_sum" or self.attacker_strategy == 'isolate':
+            optimal_reward = -optimal_reward
+        
         optimal_actions = [self.interdictable_edges[idx] for idx in optimal_sequence]
 
-        return -1*optimal_reward, optimal_actions
+        return optimal_reward, optimal_actions
