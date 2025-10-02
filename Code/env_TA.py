@@ -624,7 +624,7 @@ class CustomEnv(gym.Env):
             return self.state, float(reward), True, False, {}
 
         # Validate action
-        valid_action = self._validate_action(action, remaining_budget)
+        valid_action = self._validate_action(action, remaining_budget, self.state['edge_interdicted'])
         
         # Apply action effects
         if valid_action:
@@ -649,7 +649,7 @@ class CustomEnv(gym.Env):
     
         return self.state, float(reward), bool(done), False, {}
         
-    def _validate_action(self, action, remaining_budget):
+    def _validate_action(self, action, remaining_budget, interdicted_edges):
         """Validate if the given action is legal."""
         ## Checks for all attacker strategies
         # Check if action is within action space
@@ -666,7 +666,7 @@ class CustomEnv(gym.Env):
     
         # Check interdiction limit
         max_interdictions = self.MAX_INTERDICTION_ATTEMPTS if self.multiple_interdiction_attempts else 1
-        if self.state['edge_interdicted'][action] >= max_interdictions:
+        if interdicted_edges[action]+1 > max_interdictions:
             return False
 
         ## Attacker Strategy Specific Checks
@@ -726,7 +726,6 @@ class CustomEnv(gym.Env):
                 iterations = int(1 + (1000 - 1) * (mean_prob / 0.5))
             else:
                 iterations = int(1000 - (1000 - 1) * ((mean_prob - 0.5) / 0.5))
-    
         results = [self.solve_max_flow() for _ in range(iterations)]
         objective_values, all_flows = zip(*results)
 
@@ -1115,3 +1114,107 @@ class CustomEnv(gym.Env):
         interdicted_quantities = [k for e, k in interdiction_decisions]
 
         return (self.optimal_stochastic_model_IM.objVal, interdicted_edges, interdicted_quantities)
+
+    def solve_zero_backward_induction(self):
+        """
+        Solve the optimal interdiction strategy for attacker using backward induction.
+        This method finds the optimal interdictions for a particular attacker strategy.
+    
+        Returns:
+            tuple: (optimal_objective_value, optimal_interdiction_sequence)
+        """
+    
+    # Get the canalize objective path
+        if self.attacker_strategy == 'canalize':
+            canalize_edges = []
+            for idx, edge in enumerate(self.interdictable_edges):
+                if self.state['canalize_objective'][idx] == 1:
+                    canalize_edges.append(edge)
+    
+        # Initialize the dynamic programming table
+        # State: (remaining_budget, interdicted_edges_state)
+        def state_to_key(budget, interdicted_state):
+            return (budget, tuple(interdicted_state))
+    
+        # Memoization dictionary: state -> (max_reward, best_action_sequence)
+        memo = {}
+        self.min_edge_cost = min(self.state['edge_costs'])
+        
+        def dp_solve(remaining_budget, interdicted_state, depth=0):
+            """Dynamic programming recursive function for backward induction."""
+            state_key = state_to_key(remaining_budget, interdicted_state)
+        
+            # Check if we've already solved this state
+            if state_key in memo:
+                print("Time Saved")
+                return memo[state_key]
+        
+            # Base case: no more budget or maximum depth reached
+            if remaining_budget < self.min_edge_cost or depth >= 20:
+                temp_state = self.state.copy()
+                temp_state['edge_interdicted'] = interdicted_state.copy()
+                temp_state['budget'] = np.array([remaining_budget])
+                
+                old_state = self.state
+                self.state = temp_state
+
+                final_objective, _ = self._compute_objective_and_flows()
+                    
+                self.state = old_state
+                final_objective = -final_objective
+                
+                memo[state_key] = (final_objective, [])
+                return final_objective, []
+        
+            # Find all valid actions from current state
+            temp_state = self.state.copy()
+            temp_state['edge_interdicted'] = interdicted_state.copy()
+            temp_state['budget'] = np.array([remaining_budget])
+            old_state = self.state
+            self.state = temp_state
+            final_objective, flows = self._compute_objective_and_flows()
+            self.state = old_state
+            
+            valid_actions = []
+            for action in range(self.num_interdictable_edges):
+                if self._validate_action(action, [remaining_budget], interdicted_state) and flows.get(self.interdictable_edges[action], 0) != 0:
+                    valid_actions.append(action)
+        
+            # If no valid actions, evaluate terminal state
+            if not valid_actions:
+                
+                final_objective = -final_objective
+
+                memo[state_key] = (final_objective, [])
+                return final_objective, []
+        
+            # Evaluate each possible action
+            best_reward = -float('inf')
+            best_sequence = []
+        
+            for action in valid_actions:
+                # Create new state after taking this action
+                new_interdicted_state = interdicted_state.copy()
+                new_interdicted_state[action] += 1
+                new_budget = remaining_budget - self.state['edge_costs'][action]
+            
+                # Recursively solve for the remaining problem
+                future_reward, future_sequence = dp_solve(new_budget, new_interdicted_state, depth + 1)
+            
+                # Update best solution if this is better
+                if future_reward > best_reward:
+                    best_reward = future_reward
+                    best_sequence = [action] + future_sequence
+        
+            memo[state_key] = (best_reward, best_sequence)
+            return best_reward, best_sequence
+        
+        # Start the backward induction from current state
+        initial_budget = self.state['budget'][0]
+        initial_interdicted_state = self.state['edge_interdicted'].copy()
+    
+        optimal_reward, optimal_sequence = dp_solve(initial_budget, initial_interdicted_state)
+
+        optimal_actions = [self.interdictable_edges[idx] for idx in optimal_sequence]
+        print(memo)
+        return -1*optimal_reward, optimal_actions
