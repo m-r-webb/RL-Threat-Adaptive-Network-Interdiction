@@ -917,7 +917,6 @@ class CustomEnv(gym.Env):
                     objective_value, interdicted_edges, interdicted_quantities = self.solve_stochastic_max_flow_IM(n_scenarios=M, seed=seed)
                 else:
                     objective_value, interdicted_edges = self.solve_stochastic_max_flow(n_scenarios=M, seed=seed)
-                #print(seed,": ", objective_value, ", ", interdicted_edges)
                 # Convert interdicted_edges to a frozenset for hashability
                 interdicted_set = frozenset(interdicted_edges)
                     
@@ -1124,13 +1123,6 @@ class CustomEnv(gym.Env):
             tuple: (optimal_objective_value, optimal_interdiction_sequence)
         """
     
-    # Get the canalize objective path
-        if self.attacker_strategy == 'canalize':
-            canalize_edges = []
-            for idx, edge in enumerate(self.interdictable_edges):
-                if self.state['canalize_objective'][idx] == 1:
-                    canalize_edges.append(edge)
-    
         # Initialize the dynamic programming table
         # State: (remaining_budget, interdicted_edges_state)
         def state_to_key(budget, interdicted_state):
@@ -1146,7 +1138,6 @@ class CustomEnv(gym.Env):
         
             # Check if we've already solved this state
             if state_key in memo:
-                print("Time Saved")
                 return memo[state_key]
         
             # Base case: no more budget or maximum depth reached
@@ -1216,5 +1207,5 @@ class CustomEnv(gym.Env):
         optimal_reward, optimal_sequence = dp_solve(initial_budget, initial_interdicted_state)
 
         optimal_actions = [self.interdictable_edges[idx] for idx in optimal_sequence]
-        print(memo)
+
         return -1*optimal_reward, optimal_actions
