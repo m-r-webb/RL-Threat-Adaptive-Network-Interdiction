@@ -12,13 +12,13 @@ from gymnasium import spaces
 import numpy as np
 import copy
 import random
-import networkx as nx
-
+#import networkx as nx
+from tqdm import tqdm
 import tensorflow as tf
 tf.get_logger().setLevel('ERROR')          # Optional: Suppress Python-
 
-import torch as th
-import time
+#import torch as th
+#import time
 from collections import defaultdict
 
 
@@ -1122,22 +1122,45 @@ class CustomEnv(gym.Env):
         Returns:
             tuple: (optimal_objective_value, optimal_interdiction_sequence)
         """
-    
-        # Initialize the dynamic programming table
-        # State: (remaining_budget, interdicted_edges_state)
-        def state_to_key(budget, interdicted_state):
-            return (budget, tuple(interdicted_state))
-    
         # Memoization dictionary: state -> (max_reward, best_action_sequence)
         memo = {}
         self.min_edge_cost = min(self.state['edge_costs'])
+        if self.attacker_strategy == 'divert':
+            self.reference_start_flows, _ = self._calculate_divert_objective_and_flows()
+            
+        ### Estimate total states (rough approximation)
+        max_budget = self.state['budget'][0]
+        budget_levels = max_budget // self.min_edge_cost
+        estimated_states = self.num_interdictable_edges**budget_levels
+        update_rate = max(estimated_states // 20, 1)
+
+        states_processed = 0
+        pbar = tqdm(total=estimated_states, desc="DP States", unit=" states")
+        ###
+
+        # Initialize the dynamic programming table
+        def state_to_key(interdicted_state):
+            return tuple(interdicted_state)
+        
+        def update_progress(num_states_processed):
+            # Update progress every 100 states
+            nonlocal states_processed
+            states_processed += num_states_processed
+            if states_processed>=update_rate:
+                pbar.update(states_processed)
+                pbar.set_postfix({
+                    'Memo': len(memo),
+                })
+                states_processed = 0
+            return
         
         def dp_solve(remaining_budget, interdicted_state, depth=0):
-            """Dynamic programming recursive function for backward induction."""
-            state_key = state_to_key(remaining_budget, interdicted_state)
+            """Dynamic programming recursive function for backward induction."""           
+            state_key = state_to_key(interdicted_state)
         
             # Check if we've already solved this state
             if state_key in memo:
+                update_progress(self.num_interdictable_edges**(budget_levels-depth))
                 return memo[state_key]
 
             temp_state = self.state.copy()
@@ -1156,13 +1179,18 @@ class CustomEnv(gym.Env):
                 final_objective, flows = self._calculate_isolate_objective_and_flows()
                 final_objective = -final_objective
             elif self.attacker_strategy == 'divert':
-                final_objective, flows = self._calculate_divert_objective_and_flows()
-                    
+                flows_from_and_to, flows = self._calculate_divert_objective_and_flows()
+                diverted_flow_from = self.reference_start_flows[0] - flows_from_and_to[0]
+                diverted_flow_to = flows_from_and_to[1] - self.reference_start_flows[1] 
+                final_objective = min(diverted_flow_from, diverted_flow_to)
+
+            
             self.state = old_state
         
             # Base case: no more budget or maximum depth reached
             if remaining_budget < self.min_edge_cost or depth >= 20:
                 memo[state_key] = (final_objective, [])
+                update_progress(self.num_interdictable_edges**(budget_levels-depth))
                 return final_objective, []
         
             # Find all valid actions from current state
@@ -1170,10 +1198,13 @@ class CustomEnv(gym.Env):
             for action in range(self.num_interdictable_edges):
                 if self._validate_action(action, [remaining_budget], interdicted_state) and flows.get(self.interdictable_edges[action], 0) != 0:
                     valid_actions.append(action)
+                else:
+                    update_progress(self.num_interdictable_edges**(budget_levels-(depth+1)))
         
             # If no valid actions, evaluate terminal state
             if not valid_actions:
                 memo[state_key] = (final_objective, [])
+                update_progress(self.num_interdictable_edges**(budget_levels-depth))
                 return final_objective, []
         
             # Evaluate each possible action
@@ -1196,12 +1227,16 @@ class CustomEnv(gym.Env):
         
             memo[state_key] = (best_reward, best_sequence)
             return best_reward, best_sequence
+
         
         # Start the backward induction from current state
         initial_budget = self.state['budget'][0]
         initial_interdicted_state = self.state['edge_interdicted'].copy()
     
         optimal_reward, optimal_sequence = dp_solve(initial_budget, initial_interdicted_state)
+        pbar.update(states_processed)        
+        pbar.close()
+        
         if self.attacker_strategy == "zero_sum" or self.attacker_strategy == 'isolate':
             optimal_reward = -optimal_reward
         
