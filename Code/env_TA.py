@@ -1114,7 +1114,7 @@ class CustomEnv(gym.Env):
 
         return (self.optimal_stochastic_model_IM.objVal, interdicted_edges, interdicted_quantities)
 
-    def solve_backward_induction(self):
+    def solve_backward_induction(self, verbose=False):
         """
         Solve the optimal interdiction strategy for attacker using backward induction.
         This method finds the optimal interdictions for a particular attacker strategy.
@@ -1135,7 +1135,7 @@ class CustomEnv(gym.Env):
         update_rate = max(estimated_states // 20, 1)
 
         states_processed = 0
-        pbar = tqdm(total=estimated_states, desc="DP States", unit=" states")
+        pbar = tqdm(total=estimated_states, desc="DP States", unit=" states", disable=not verbose)
         ###
 
         # Initialize the dynamic programming table
