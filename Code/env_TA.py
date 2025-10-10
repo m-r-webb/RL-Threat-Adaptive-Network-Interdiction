@@ -738,10 +738,10 @@ class CustomEnv(gym.Env):
 
         return mean_objective, mean_flows
     
-    def _compute_objective_and_flows(self):
+    def _compute_objective_and_flows(self, deterministic_mode = self.deterministic_outcomes):
         """Calculate the max flow objective and edge flows."""
         # Reward for successful interdiction of non-target edges
-        if self.deterministic_outcomes:
+        if deterministic_mode:
             objective, flows = self.solve_max_flow()
         else:
             # Stochastic outcome calculation
