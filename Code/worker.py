@@ -27,8 +27,8 @@ def run_episode_worker(args):
     # Solve and time the episode
     start_time = time.perf_counter()
     if env_attacker_strategy == "zero_sum":
-        optimal_obj_val, optimal_interdiction_edges = env.solve_optimal_interdiction()
-        #    optimal_obj_val, optimal_interdiction_edges = env.solve_stochastic_max_flow(n_scenarios = 1000)
+        #optimal_obj_val, optimal_interdiction_edges = env.solve_optimal_interdiction()
+        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction(verbose=False)
     else:
         optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction(verbose=False)
     end_time = time.perf_counter()
