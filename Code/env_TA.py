@@ -403,7 +403,10 @@ class CustomEnv(gym.Env):
         elif self.attacker_strategy == 'isolate':
             self.reference_obj, _ = self._calculate_isolate_objective_and_flows()
         elif self.attacker_strategy == 'divert':
-            self.reference_start_flows, _ = self._calculate_divert_objective_and_flows()
+            _, flows = self.solve_max_flow()
+            from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
+            to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
+            self.reference_start_flows = (from_flow, to_flow)
             self.reference_obj = 0
         
         self.last_obj = self.reference_obj
@@ -653,7 +656,7 @@ class CustomEnv(gym.Env):
         """Validate if the given action is legal."""
         ## Checks for all attacker strategies
         # Check if action is within action space
-        if action >= self.num_interdictable_edges:
+        if action > self.num_interdictable_edges:
             return False
     
         # Check budget constraint
@@ -706,8 +709,16 @@ class CustomEnv(gym.Env):
             self.last_obj = objective_value   
         return reward
 
-    def _calculate_stochastic_objective_and_flow(self):
-        """Calculate objective value under stochastic interdiction outcomes."""
+    def _calculate_stochastic_objective_and_flow(self, strategy_type):
+        """
+        Calculate objective value under stochastic interdiction outcomes.
+        
+        Args:
+            strategy_type: One of 'zero_sum', 'canalize', 'isolate', or 'divert'
+        
+        Returns:
+            mean_objective: Mean objective across all Monte Carlo iterations
+        """
         if self.multiple_interdiction_attempts:
             edges_interdicted = (self.state['edge_interdicted'] > 0).astype(int)
             success_probs = ((1 - self.state['edge_interdiction_probability']) ** 
@@ -716,7 +727,7 @@ class CustomEnv(gym.Env):
         else:
             prob_array = (self.state['edge_interdicted'] * 
                          self.state['edge_interdiction_probability'])
-    
+
         non_zero_probs = prob_array[prob_array != 0]
         if non_zero_probs.size == 0:
             iterations = 1
@@ -726,35 +737,75 @@ class CustomEnv(gym.Env):
                 iterations = int(1 + (1000 - 1) * (mean_prob / 0.5))
             else:
                 iterations = int(1000 - (1000 - 1) * ((mean_prob - 0.5) / 0.5))
-        results = [self.solve_max_flow() for _ in range(iterations)]
-        objective_values, all_flows = zip(*results)
+        
+        objectives = []
+        all_flows = []  # Store flows from each iteration
 
-        mean_objective = np.mean(objective_values)
-        edges = list(all_flows[0].keys())
-        # Build a 2D array: (num_iters, num_edges)
-        arr = np.array([[flows[edge] for edge in edges] for flows in all_flows])
-        mean_vals = arr.mean(axis=0)
-        mean_flows = dict(zip(edges, mean_vals))
-
-        return mean_objective, mean_flows
     
-    def _compute_objective_and_flows(self, deterministic_mode = self.deterministic_outcomes):
+        for _ in range(iterations):
+            # Solve max flow for this iteration
+            max_flow_obj, flows = self.solve_max_flow()
+            all_flows.append(flows)  # Store the flows
+        
+            # Compute the objective based on strategy type
+            if strategy_type == 'zero_sum':
+                objective = max_flow_obj
+            
+            elif strategy_type == 'canalize':
+                objective = self._calculate_target_path_flow(flows, 'canalize_objective')
+            
+            elif strategy_type == 'isolate':
+                objective = self._calculate_target_node_flow(flows, 'isolate_objective')
+            
+            elif strategy_type == 'divert':
+                from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
+                to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
+                
+                diverted_flow_from = self.reference_start_flows[0] - from_flow
+                diverted_flow_to = to_flow - self.reference_start_flows[1] 
+                objective = np.min([diverted_flow_from,diverted_flow_to])
+            
+            objectives.append(objective)
+
+        # Compute mean flows across all iterations
+        mean_flows = {}
+        if all_flows:
+            # Get all unique edges across all iterations
+            all_edges = set()
+            for flow_dict in all_flows:
+                all_edges.update(flow_dict.keys())
+        
+            # Compute mean for each edge
+            for edge in all_edges:
+                edge_flows = [flow_dict.get(edge, 0) for flow_dict in all_flows]
+                mean_flows[edge] = np.mean(edge_flows)
+        
+        # Return mean objective and mean flows
+        return np.mean(objectives), mean_flows
+    
+    def _compute_objective_and_flows(self, deterministic_mode=None):
         """Calculate the max flow objective and edge flows."""
-        # Reward for successful interdiction of non-target edges
+        if deterministic_mode is None:
+            deterministic_mode = self.deterministic_outcomes
+        
         if deterministic_mode:
             objective, flows = self.solve_max_flow()
         else:
             # Stochastic outcome calculation
-            objective, flows = self._calculate_stochastic_objective_and_flow()    
-        
+            objective, flows = self._calculate_stochastic_objective_and_flow('zero_sum')
+    
         return objective, flows
 
     def _calculate_canalize_objective_and_flows(self):
         """Calculate objective for canalize strategy (flow through specific path)."""
-        # Reward for successful interdiction of non-target edges
-        _, flows = self._compute_objective_and_flows()    
-        target_path_flow = self._calculate_target_path_flow(flows, 'canalize_objective')
-        return target_path_flow, flows
+        if self.deterministic_outcomes:
+            _, flows = self.solve_max_flow()
+            target_path_flow = self._calculate_target_path_flow(flows, 'canalize_objective')
+            return target_path_flow, flows
+        else:
+            # Stochastic calculation - returns mean objective directly
+            objective, mean_flows = self._calculate_stochastic_objective_and_flow('canalize')
+            return objective, mean_flows
         
     def _calculate_canalize_reward(self):
         """Calculate reward for canalize strategy (force flow through specific path)."""
@@ -767,10 +818,14 @@ class CustomEnv(gym.Env):
         
     def _calculate_isolate_objective_and_flows(self):
         """Calculate objective for isolate strategy (reduce flow to specific nodes)."""
-        # Reward for successful interdiction of non-target edges
-        _, flows = self._compute_objective_and_flows()    
-        target_node_flow = self._calculate_target_node_flow(flows, 'isolate_objective')
-        return target_node_flow, flows
+        if self.deterministic_outcomes:
+            _, flows = self.solve_max_flow()
+            target_node_flow = self._calculate_target_node_flow(flows, 'isolate_objective')
+            return target_node_flow, flows
+        else:
+            # Stochastic calculation - returns mean objective directly
+            objective, mean_flows = self._calculate_stochastic_objective_and_flow('isolate')
+            return objective, mean_flows
         
     def _calculate_isolate_reward(self):
         """Calculate reward for isolate strategy (reduce flow to specific nodes)."""
@@ -781,24 +836,30 @@ class CustomEnv(gym.Env):
         self.last_obj = target_node_flow
         return reward
 
-    def _calculate_divert_objective_and_flows(self):
+    def _calculate_divert_objective_and_flows(self, mode = None):
         """Calculate objective for divert strategy (redirect flow from one path to another)."""
-        # Reward for successful interdiction of non-target edges
-        _, flows = self._compute_objective_and_flows()   
-        
-        from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
-        to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
-        
-        return (from_flow, to_flow), flows
+        if mode is None:
+            mode is self.deterministic_outcomes
+
+        if mode:
+            _, flows = self.solve_max_flow()
+            from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
+            to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
+            diverted_flow_from = self.reference_start_flows[0] - from_flow
+            diverted_flow_to = to_flow - self.reference_start_flows[1] 
+            objective = np.min([diverted_flow_from,diverted_flow_to])
+            
+            return objective, flows
+        else:
+            # Stochastic calculation - returns mean objectives directly
+            mean_objective, mean_flows = self._calculate_stochastic_objective_and_flow('divert')
+            # Return as tuple to maintain consistent interface with reward calculation
+            return mean_objective, mean_flows
 
     def _calculate_divert_reward(self):
         """Calculate reward for divert strategy (redirect flow from one path to another)."""
         # Calculate reward based on flow diversion success
-        flows_from_and_to, _ = self._calculate_divert_objective_and_flows()
-
-        diverted_flow_from = self.reference_start_flows[0] - flows_from_and_to[0]
-        diverted_flow_to = flows_from_and_to[1] - self.reference_start_flows[1] 
-        diverted_flow = min(diverted_flow_from, diverted_flow_to)
+        diverted_flow, _ = self._calculate_divert_objective_and_flows()
         
         reward = (diverted_flow - self.last_obj) / self.reference_budget
         self.last_obj = diverted_flow
@@ -1125,8 +1186,8 @@ class CustomEnv(gym.Env):
         # Memoization dictionary: state -> (max_reward, best_action_sequence)
         memo = {}
         self.min_edge_cost = min(self.state['edge_costs'])
-        if self.attacker_strategy == 'divert':
-            self.reference_start_flows, _ = self._calculate_divert_objective_and_flows()
+        #if self.attacker_strategy == 'divert':
+        #    self.reference_start_flows, _ = self._calculate_divert_objective_and_flows(mode = True)
             
         ### Estimate total states (rough approximation)
         max_budget = self.state['budget'][0]
@@ -1179,12 +1240,8 @@ class CustomEnv(gym.Env):
                 final_objective, flows = self._calculate_isolate_objective_and_flows()
                 final_objective = -final_objective
             elif self.attacker_strategy == 'divert':
-                flows_from_and_to, flows = self._calculate_divert_objective_and_flows()
-                diverted_flow_from = self.reference_start_flows[0] - flows_from_and_to[0]
-                diverted_flow_to = flows_from_and_to[1] - self.reference_start_flows[1] 
-                final_objective = min(diverted_flow_from, diverted_flow_to)
-
-            
+                final_objective, flows = self._calculate_divert_objective_and_flows()
+                
             self.state = old_state
         
             # Base case: no more budget or maximum depth reached
