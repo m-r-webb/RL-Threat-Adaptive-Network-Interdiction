@@ -93,7 +93,7 @@ class PointerNetworkFeatureExtractor(BaseFeaturesExtractor):
     """
     Feature extractor that processes edge features for pointer network
     """
-    def __init__(self, observation_space, num_edges=25, num_nodes=22, 
+    def __init__(self, observation_space, 
                  edge_embedding_dim=128, hidden_dim=256,
                  edge_capacity_mean=50, edge_capacity_std=28.868,
                  edge_cost_mean=5, edge_cost_std=1.543,
@@ -118,15 +118,13 @@ class PointerNetworkFeatureExtractor(BaseFeaturesExtractor):
             self.register_buffer('edge_interdicted_mean', th.tensor(edge_interdicted_mean))
             self.register_buffer('edge_interdicted_std', th.tensor(edge_interdicted_std))
         
-        self.num_edges = num_edges
-        self.num_nodes = num_nodes
         self.edge_embedding_dim = edge_embedding_dim
         self.hidden_dim = hidden_dim
         self.attacker_strategy = attacker_strategy
         
         # Edge feature processors
         self.binary_embed = nn.Embedding(2, 8)
-        self.node_embed = nn.Embedding(self.num_nodes, 6)
+        self.nodeproj = nn.Linear(1, 6)  # Projects any node ID to 6-dim        
         
         # Determine input dimension based on strategy
         if attacker_strategy == 'zero_sum':
@@ -172,8 +170,8 @@ class PointerNetworkFeatureExtractor(BaseFeaturesExtractor):
         arr_nodes = th.as_tensor(observations['edge_arrival_node'], dtype=th.long)
         
         # Create edge embeddings
-        dep_emb = self.node_embed(dep_nodes)  # [B, edges, 6]
-        arr_emb = self.node_embed(arr_nodes)  # [B, edges, 6]
+        dep_emb = self.nodeproj(dep_nodes.unsqueeze(-1).float())  
+        arr_emb = self.nodeproj(arr_nodes.unsqueeze(-1).float())
         
         # Combine features based on strategy
         if self.multiple_interdiction_attempts:
@@ -469,8 +467,6 @@ else:
 policy_kwargs = dict(
     features_extractor_class=PointerNetworkFeatureExtractor,
     features_extractor_kwargs={
-        'num_edges': action_space_size,  # Use calculated size
-        'num_nodes': 22,
         'edge_embedding_dim': 128,
         'hidden_dim': 256,
         'multiple_interdiction_attempts': multiple_interdiction_attempts,

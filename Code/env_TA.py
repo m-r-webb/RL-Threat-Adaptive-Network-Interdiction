@@ -166,8 +166,11 @@ class CustomEnv(gym.Env):
         """Setup observation and action spaces based on environment configuration."""
         # Calculate space dimensions
         self.num_interdictable_edges = len(self.interdictable_edges)
-        self.max_num_edges = self.num_interdictable_edges
-        self.max_num_nodes = self.sink_nodes[0]
+        self.max_num_edges = 1000  # Maximum edges across all test graphs
+        self.max_num_nodes = 400    # Maximum nodes across all test graphs
+    
+        # Store actual size for this specific graph
+        self.actual_num_edges = self.num_interdictable_edges
         
         # Create base spaces
         self.base_spaces = self._create_base_spaces()
@@ -460,7 +463,17 @@ class CustomEnv(gym.Env):
             e.capacity = cap
             e.interdiction_cost = cost
             e.interdiction_probability = prob
-            
+
+        # Pad all edge arrays to max_num_edges
+        padded_capacities = np.zeros(self.max_num_edges, dtype=int)
+        padded_capacities[:self.actual_num_edges] = network_params['capacities']
+    
+        padded_costs = np.zeros(self.max_num_edges, dtype=int)
+        padded_costs[:self.actual_num_edges] = network_params['costs']
+    
+        padded_probabilities = np.zeros(self.max_num_edges, dtype=np.float32)
+        padded_probabilities[:self.actual_num_edges] = network_params['probabilities']
+        
         # Create node arrays
         departure_nodes = np.full(self.max_num_edges, self.max_num_nodes)
         arrival_nodes = np.full(self.max_num_edges, self.max_num_nodes)
@@ -468,10 +481,10 @@ class CustomEnv(gym.Env):
         arrival_nodes[:len(np.array(self.edge_arrivals))]=np.array(self.edge_arrivals)
     
         return {
-            'edge_capacity': network_params['capacities'],
-            'edge_interdicted': np.zeros(self.max_num_edges),
-            'edge_costs': network_params['costs'],
-            'edge_interdiction_probability': network_params['probabilities'],
+            'edge_capacity': padded_capacities,  
+            'edge_interdicted': np.zeros(self.max_num_edges, dtype=int),
+            'edge_costs': padded_costs,  
+            'edge_interdiction_probability': padded_probabilities,  
             'edge_departure_node': departure_nodes,
             'edge_arrival_node': arrival_nodes,
             'budget': network_params['budget']
@@ -493,8 +506,7 @@ class CustomEnv(gym.Env):
     def _add_canalize_components(self, base_state):
         """Add canalize-specific objective to state."""
         path_edges = self._find_simple_path()
-        canalize_objective = np.zeros(self.max_num_edges)
-    
+        canalize_objective = np.zeros(self.max_num_edges, dtype=int)
         for edge_id, edge in enumerate(self.interdictable_edges):
             if edge in path_edges or (edge[1], edge[0]) in path_edges:
                 canalize_objective[edge_id] = 1
@@ -526,14 +538,16 @@ class CustomEnv(gym.Env):
         to_path = self._find_alternative_path(from_path)
     
         # Convert paths to objective arrays
-        divert_from = np.zeros(self.max_num_edges)
+        divert_from = np.zeros(self.max_num_edges, dtype=int)
         for e, edge in enumerate(self.interdictable_edges):
             if edge in from_path or (edge[1],edge[0]) in from_path:
-                divert_from[e]=1
-        divert_to = np.zeros(self.max_num_edges)
+                divert_from[e] = 1
+        # Padded entries remain 0
+    
+        divert_to = np.zeros(self.max_num_edges, dtype=int)
         for e, edge in enumerate(self.interdictable_edges):
             if edge in to_path or (edge[1],edge[0]) in to_path:
-                divert_to[e]=1
+                divert_to[e] = 1
         return {**base_state, 'divert_from_objective': divert_from, 'divert_to_objective': divert_to}
 
     def _find_simple_path(self):
@@ -656,7 +670,7 @@ class CustomEnv(gym.Env):
         """Validate if the given action is legal."""
         ## Checks for all attacker strategies
         # Check if action is within action space
-        if action > self.num_interdictable_edges:
+        if action >= self.actual_num_edges:  # Padded actions are invalid
             return False
     
         # Check budget constraint
