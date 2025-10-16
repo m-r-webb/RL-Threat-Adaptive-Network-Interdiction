@@ -73,8 +73,6 @@ def create_nodes_edges(node_filename, edge_filename):
 
     return nodes, edges
 
-#TO DO: - Update solve optimal flow() for undirected edges and threat strategies
-
 #Create a custom gymnasium environment for the RL agent
 class CustomEnv(gym.Env):
     """Custom Gym environment for network interdiction problems."""
@@ -90,6 +88,8 @@ class CustomEnv(gym.Env):
     MAX_SINK_NEED = 40
     GUROBI_ENV = grb.Env(params={"OutputFlag": 0, "LogToConsole": 0, "Threads": 1})
     PENALTY_VALUE = -1
+    max_num_edges = 500  # Maximum edges across all test graphs  Should work through G15x15
+    max_num_nodes = 250    # Maximum nodes across all test graphs
     
     def __init__(self, nodes, edges, deterministic_agent=True, initial_budget = None, 
                  multiple_interdiction_attempts=True, attacker_strategy="zero_sum"):
@@ -166,8 +166,6 @@ class CustomEnv(gym.Env):
         """Setup observation and action spaces based on environment configuration."""
         # Calculate space dimensions
         self.num_interdictable_edges = len(self.interdictable_edges)
-        self.max_num_edges = 1000  # Maximum edges across all test graphs
-        self.max_num_nodes = 400    # Maximum nodes across all test graphs
     
         # Store actual size for this specific graph
         self.actual_num_edges = self.num_interdictable_edges
@@ -210,7 +208,7 @@ class CustomEnv(gym.Env):
         self.strategy_spaces = {
             "zero_sum": {},
             "canalize": {'canalize_objective': spaces.MultiBinary(self.max_num_edges)},
-            "isolate": {'isolate_objective': spaces.MultiBinary(len(self.sink_edges))},
+            "isolate": {'isolate_objective': spaces.MultiBinary(self.max_num_edges)},
             "divert": {'divert_from_objective': spaces.MultiBinary(self.max_num_edges),
                        'divert_to_objective': spaces.MultiBinary(self.max_num_edges)}
         }
@@ -439,18 +437,23 @@ class CustomEnv(gym.Env):
         self.num_stochastic_scenarios = None
         self.num_stochastic_scenarios_IM = None
 
-    def _set_random_seeds(self, seed):
+    def _set_random_seeds(self, seed):      
         """Set random seeds for reproducibility."""
         # Set seeds for base spaces
         spaces_to_seed = ['edge_capacity', 'edge_costs', 'edge_interdiction_probability', 'budget']
-        
         for space_name in spaces_to_seed:
             self.base_spaces[space_name].seed(seed)
-        
-        # Set seed for strategy-specific spaces
-        self.strategy_spaces['isolate']['isolate_objective'].seed(seed)
-        
+    
+        # Set seed for strategy-specific spaces if they exist
+        strategy = self.strategy_spaces.get(self.attacker_strategy, {})
+        for objective_name, objective_space in strategy.items():
+            objective_space.seed(seed)
+    
+        # Set Python's random module seed
         random.seed(seed)
+    
+        # Set NumPy random seed (if using numpy random functions)
+        np.random.seed(seed)
 
     def _create_base_state(self, network_params):
         """Create the base state dictionary with common components."""
@@ -513,14 +516,33 @@ class CustomEnv(gym.Env):
         return {**base_state, 'canalize_objective': canalize_objective}
 
     def _add_isolate_components(self, base_state):
-        """Add isolate-specific objective to state."""
+        """Add isolate-specific objective to state (edge-based, sink-connected only)."""
+        # Get number of edges that connect to sink
         num_in_edges = len(self.edge_groups[self.sink_nodes[0]]['in'])
     
+        # Create mapping from interdictable_edges indices to sink-connecting edges
+        sink_edge_indices = []
+        for idx, edge in enumerate(self.interdictable_edges):
+            if edge in self.edge_groups[self.sink_nodes[0]]['in']:
+                sink_edge_indices.append(idx)
+    
+        # Sample from the space until we get a valid non-zero objective
         while True:
-            isolate_objective = self.strategy_spaces['isolate']['isolate_objective'].sample()
-            num_isolated = np.sum(isolate_objective)
-            if 1 <= num_isolated < num_in_edges:
+            # Sample from the original space (size = len(sink_edges))
+            sampled_objective = self.strategy_spaces['isolate']['isolate_objective'].sample()
+        
+            # Create padded isolate objective (size = max_num_edges)
+            isolate_objective = np.zeros(self.max_num_edges, dtype=int)
+        
+            # Map sampled values to sink-connecting edge indices
+            for sample_idx, edge_idx in enumerate(sink_edge_indices):
+                if sample_idx < len(sampled_objective):
+                    isolate_objective[edge_idx] = sampled_objective[sample_idx]
+        
+            # Check if the objective is non-zero (at least one sink edge marked)
+            if np.sum(isolate_objective) > 0:
                 break
+    
         return {**base_state, 'isolate_objective': isolate_objective}
 
     def _add_divert_components(self, base_state):
@@ -769,7 +791,7 @@ class CustomEnv(gym.Env):
                 objective = self._calculate_target_path_flow(flows, 'canalize_objective')
             
             elif strategy_type == 'isolate':
-                objective = self._calculate_target_node_flow(flows, 'isolate_objective')
+                objective = self._calculate_target_edge_flow(flows, 'isolate_objective')
             
             elif strategy_type == 'divert':
                 from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
@@ -831,10 +853,10 @@ class CustomEnv(gym.Env):
         return reward
         
     def _calculate_isolate_objective_and_flows(self):
-        """Calculate objective for isolate strategy (reduce flow to specific nodes)."""
+        """Calculate objective for isolate strategy (reduce flow on specific edges)."""
         if self.deterministic_outcomes:
             _, flows = self.solve_max_flow()
-            target_node_flow = self._calculate_target_node_flow(flows, 'isolate_objective')
+            target_node_flow = self._calculate_target_edge_flow(flows, 'isolate_objective')
             return target_node_flow, flows
         else:
             # Stochastic calculation - returns mean objective directly
@@ -895,18 +917,20 @@ class CustomEnv(gym.Env):
         # Return minimum flow among target edges
         return min(target_flows)
 
-    def _calculate_target_node_flow(self, flows, objective_key):
-        """Calculate total flow into nodes marked in the objective."""
+    def _calculate_target_edge_flow(self, flows, objective_key):
+        """Calculate total flow on edges marked in the objective."""
         objective = self.state[objective_key]
-        node_flows = []
+        total_flow = 0
     
-        for idx, edge in enumerate(self.edge_groups[self.sink_nodes[0]]['in']):
+        for idx, edge in enumerate(self.interdictable_edges):
             if objective[idx] == 1:
-                edge_flow = flows.get(edge, 0)
-                node_flows.append(edge_flow)
+                forward_flow = flows.get(edge, 0)
+                reverse_flow = flows.get((edge[1], edge[0]), 0)
+                # Sum both directions for this edge
+                total_flow += forward_flow + reverse_flow
     
         # Return sum flow among target nodes
-        return np.sum(node_flows)
+        return np.sum(total_flow)
 
     def _is_episode_complete(self, remaining_budget):
         """Determine if the episode should end."""
