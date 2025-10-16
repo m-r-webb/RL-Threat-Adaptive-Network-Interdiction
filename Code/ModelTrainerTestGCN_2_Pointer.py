@@ -127,13 +127,39 @@ class PointerNetworkFeatureExtractor(BaseFeaturesExtractor):
         self.nodeproj = nn.Linear(1, 6)  # Projects any node ID to 6-dim        
         
         # Determine input dimension based on strategy
+        base_continuous = 3  # edge_capacity, edge_costs, edge_prob
+        base_binary = 8  # edge_interdicted embedding
+        node_features = 12  # 6(dep) + 6(arr)
+
         if attacker_strategy == 'zero_sum':
             if self.multiple_interdiction_attempts:
-                input_dim = 4 + 6 + 6  # 4(cont) + 6(dep) + 6(arr)
+                input_dim = 4 + node_features  # 4(cont) + 12(nodes)
             else:
-                input_dim = 3 + 8 + 6 + 6  # 3(cont) + 8(binary) + 6(dep) + 6(arr)
+                input_dim = base_continuous + base_binary + node_features  # 3+8+12
+        
+        elif attacker_strategy == 'canalize':
+            # Add 1 binary feature for canalize_objective
+            if self.multiple_interdiction_attempts:
+                input_dim = 4 + 1 + node_features  # 4(cont) + 1(canalize) + 12(nodes)
+            else:
+                input_dim = base_continuous + base_binary + 1 + node_features  # 3+8+1+12
+        
+        elif attacker_strategy == 'isolate':
+            # Add 1 binary feature for isolate_objective
+            if self.multiple_interdiction_attempts:
+                input_dim = 4 + 1 + node_features  # 4(cont) + 1(isolate) + 12(nodes)
+            else:
+                input_dim = base_continuous + base_binary + 1 + node_features  # 3+8+1+12
+        
+        elif attacker_strategy == 'divert':
+            # Add 2 binary features for divert objectives
+            if self.multiple_interdiction_attempts:
+                input_dim = 4 + 2 + node_features  # 4(cont) + 2(divert) + 12(nodes)
+            else:
+                input_dim = base_continuous + base_binary + 2 + node_features  # 3+8+2+12
         else:
-            input_dim = 3 + 8 + 6 + 6  # Default case
+            # Default (shouldn't reach here)
+            input_dim = base_continuous + base_binary + node_features
             
         # Edge embedding layer
         self.edge_embedding = nn.Sequential(
@@ -151,49 +177,55 @@ class PointerNetworkFeatureExtractor(BaseFeaturesExtractor):
         # Process edge features
         edge_capacity = th.as_tensor(observations['edge_capacity'], dtype=th.float32)
         edge_capacity = (edge_capacity - self.edge_capacity_mean) / (self.edge_capacity_std + 1e-8)
-        
+    
         edge_costs = th.as_tensor(observations['edge_costs'], dtype=th.float32)
         edge_costs = (edge_costs - self.edge_cost_mean) / (self.edge_cost_std + 1e-8)
-        
+    
         edge_prob = th.as_tensor(observations['edge_interdiction_probability'], dtype=th.float32)
-        
+    
         if self.multiple_interdiction_attempts:
             edge_interdicted = th.as_tensor(observations['edge_interdicted'], dtype=th.float32)
             edge_interdicted = (edge_interdicted - self.edge_interdicted_mean) / (self.edge_interdicted_std + 1e-8)
         else:
             edge_interdicted = th.as_tensor(observations['edge_interdicted'], dtype=th.long)
-        
+    
         budget = th.as_tensor(observations['budget'], dtype=th.float32)
         budget = (budget - self.budget_mean) / (self.budget_std + 1e-8)
-        
+    
         dep_nodes = th.as_tensor(observations['edge_departure_node'], dtype=th.long)
         arr_nodes = th.as_tensor(observations['edge_arrival_node'], dtype=th.long)
-        
-        # Create edge embeddings
-        dep_emb = self.nodeproj(dep_nodes.unsqueeze(-1).float())  
-        arr_emb = self.nodeproj(arr_nodes.unsqueeze(-1).float())
-        
+    
+        # Create node embeddings
+        dep_emb = self.nodeproj(dep_nodes.unsqueeze(-1).float())  # B, edges, 6
+        arr_emb = self.nodeproj(arr_nodes.unsqueeze(-1).float())  # B, edges, 6
+    
+        # Extract strategy-specific objectives
+        objective_features = []
+        if self.attacker_strategy == 'canalize':
+            canalize_obj = th.as_tensor(observations['canalize_objective'], dtype=th.float32).unsqueeze(-1)
+            objective_features.append(canalize_obj)
+        elif self.attacker_strategy == 'isolate':
+            isolate_obj = th.as_tensor(observations['isolate_objective'], dtype=th.float32).unsqueeze(-1)
+            objective_features.append(isolate_obj)
+        elif self.attacker_strategy == 'divert':
+            divert_from = th.as_tensor(observations['divert_from_objective'], dtype=th.float32).unsqueeze(-1)
+            divert_to = th.as_tensor(observations['divert_to_objective'], dtype=th.float32).unsqueeze(-1)
+            objective_features.extend([divert_from, divert_to])
+    
         # Combine features based on strategy
         if self.multiple_interdiction_attempts:
             cont_features = th.stack([edge_capacity, edge_costs, edge_prob, edge_interdicted], dim=-1)
-            combined = th.cat([cont_features, dep_emb, arr_emb], dim=-1)
+            if objective_features:
+                combined = th.cat([cont_features] + objective_features + [dep_emb, arr_emb], dim=-1)
+            else:
+                combined = th.cat([cont_features, dep_emb, arr_emb], dim=-1)
         else:
             cont_features = th.stack([edge_capacity, edge_costs, edge_prob], dim=-1)
             binary_emb = self.binary_embed(edge_interdicted)
-            combined = th.cat([cont_features, binary_emb, dep_emb, arr_emb], dim=-1)
-        
-        # Create edge embeddings
-        edge_embeddings = self.edge_embedding(combined)  # [B, edges, embedding_dim]
-        
-        # Store for pointer network
-        self._last_edge_embeddings = edge_embeddings
-        self._last_budget = budget
-        self._last_sequence_length = edge_embeddings.shape[1]
-        
-        # Return dummy features for SB3 compatibility
-        batch_size = edge_embeddings.shape[0]
-        budget_reshaped = budget.reshape(batch_size, -1)
-        return th.cat([edge_embeddings.mean(dim=1), budget_reshaped], dim=-1)
+            if objective_features:
+                combined = th.cat([cont_features, binary_emb] + objective_features + [dep_emb, arr_emb], dim=-1)
+            else:
+                combined = th.cat([cont_features, binary_emb, dep_emb, arr_emb], dim=-1)
 
 class PointerNetwork(nn.Module):
     """
