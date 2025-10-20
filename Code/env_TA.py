@@ -161,6 +161,13 @@ class CustomEnv(gym.Env):
             self.edges_episode[edge_id].capacity = self.MAX_SINK_NEED
 
         self.edges_with_sink_source = list(self.edges_reset.keys()) + [(self.sink_nodes[0],self.source_nodes[0])]
+
+        # Identify sink-connecting interdictable edges
+        self.cached_sink_edge_indices = [
+            idx for idx, edge in enumerate(self.interdictable_edges)
+            if edge[1] in {e[0] for e in self.edge_groups[self.sink_nodes[0]]['in']}
+        ]
+        self.num_cached_sink_edge_indices = len(self.cached_sink_edge_indices)
             
     def _setup_spaces(self):
         """Setup observation and action spaces based on environment configuration."""
@@ -193,7 +200,8 @@ class CustomEnv(gym.Env):
             'edge_interdiction_probability': spaces.Box(low=0, high=1, shape=(self.max_num_edges,), dtype=float),
             'budget': spaces.Box(low=self.DEFAULT_BUDGET_RANGE[0], high=self.DEFAULT_BUDGET_RANGE[1], shape=(1,), dtype=int),
             'edge_departure_node': spaces.Box(low=1, high=self.max_num_nodes, shape=(self.max_num_edges,), dtype=int),
-            'edge_arrival_node': spaces.Box(low=1, high=self.max_num_nodes, shape=(self.max_num_edges,), dtype=int)
+            'edge_arrival_node': spaces.Box(low=1, high=self.max_num_nodes, shape=(self.max_num_edges,), dtype=int),
+            'padding_mask': spaces.Box(low=0, high=1, shape=(self.max_num_edges,), dtype=np.float32)
         }
 
     def _create_interdiction_space(self):
@@ -264,7 +272,7 @@ class CustomEnv(gym.Env):
                                      name="source_conservation"
         )
     
-        self.maxflow_model.addConstr(grb.quicksum(self.flow_var[e] for e in self.edge_groups[self.max_num_nodes]['in']) -
+        self.maxflow_model.addConstr(grb.quicksum(self.flow_var[e] for e in self.edge_groups[self.sink_nodes[0]]['in']) -
                                      self.flow_var[self.super_edge] == 0, name="sink_conservation"
         )
     
@@ -283,16 +291,22 @@ class CustomEnv(gym.Env):
         # Source and sink capacity limits
         self.maxflow_model.addConstr(self.flow_var[self.super_edge] <= self.MAX_SOURCE_FLOW, name="max_source_flow")
     
-        self.maxflow_model.addConstrs((self.flow_var[e] <= self.MAX_SINK_NEED for e in self.edge_groups[self.max_num_nodes]['in']),
+        self.maxflow_model.addConstrs((self.flow_var[e] <= self.MAX_SINK_NEED for e in self.edge_groups[self.sink_nodes[0]]['in']),
                                       name="sink_node_max_capacities"
         )
 
     def _update_capacity_constraints(self):
         """Update edge capacity constraints based on current interdiction state."""
         # Calculate current edge capacities considering interdiction
-        upper_bounds = np.random.binomial(1,
-                                          (1 - self.state["edge_interdiction_probability"][:self.num_interdictable_edges]) **
-                                          self.state["edge_interdicted"][:self.num_interdictable_edges]) * self.state["edge_capacity"][:self.num_interdictable_edges]
+        # Ensure probabilities are float to avoid integer power errors
+        probs = self.state["edge_interdiction_probability"][:self.num_interdictable_edges].astype(float)
+        interdicted = self.state["edge_interdicted"][:self.num_interdictable_edges].astype(int)
+    
+        # Compute success probabilities
+        success_probs = (1.0 - probs) ** interdicted
+    
+        # Generate binomial outcomes
+        upper_bounds = np.random.binomial(1, success_probs) * self.state["edge_capacity"][:self.num_interdictable_edges]
     
         # Remove old capacity constraints if they exist
         if hasattr(self, 'forward_cons'):
@@ -359,18 +373,18 @@ class CustomEnv(gym.Env):
 
         # Generate network parameters
         # Sample edge capacities
-        raw_capacities = self.base_spaces['edge_capacity'].sample()
+        raw_capacities = self.base_spaces['edge_capacity'].sample()[:self.actual_num_edges]
         edge_capacities = ((raw_capacities / 100.0) * (self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[1]-self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[0]) + self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[0]).astype(int)
         
         # Sample edge costs and interdiction probabilities
-        raw_costs = self.base_spaces['edge_costs'].sample()
+        raw_costs = self.base_spaces['edge_costs'].sample()[:self.actual_num_edges]
         edge_costs = (((raw_costs) / 10) * (self.DEFAULT_TRAINING_EDGE_COST_RANGE[1]-self.DEFAULT_TRAINING_EDGE_COST_RANGE[0]) + self.DEFAULT_TRAINING_EDGE_COST_RANGE[0]).astype(int)
         
         #Sample interdiction probabilities based on deterministic setting
         if self.deterministic_outcomes:
             edge_interdiction_probabilities = np.ones(self.max_num_edges, dtype=np.float32)
         else:
-            probs = self.base_spaces['edge_interdiction_probability'].sample()
+            probs = self.base_spaces['edge_interdiction_probability'].sample()[:self.actual_num_edges]
             # Round to 0.25 increments for consistency
             sample_rounded = np.round(probs * 4)
             edge_interdiction_probabilities = (sample_rounded.astype(float) / 4)
@@ -385,10 +399,12 @@ class CustomEnv(gym.Env):
             scaled_budget = ((budget_range[1] - budget_range[0]) * budget_sample[0] / 100) + budget_range[0]
             remaining_budget = np.array([round(scaled_budget)], dtype=int)
             
-        network_params =  {'capacities': edge_capacities,
-                           'costs': edge_costs,
-                           'probabilities': edge_interdiction_probabilities,
-                           'budget': remaining_budget}
+        network_params = {
+            'capacities': edge_capacities, 
+            'costs': edge_costs,          
+            'probabilities': edge_interdiction_probabilities,
+            'budget': remaining_budget
+        }
 
         # Create base state
         base_state = self._create_base_state(network_params)
@@ -478,10 +494,14 @@ class CustomEnv(gym.Env):
         padded_probabilities[:self.actual_num_edges] = network_params['probabilities']
         
         # Create node arrays
-        departure_nodes = np.full(self.max_num_edges, self.max_num_nodes)
-        arrival_nodes = np.full(self.max_num_edges, self.max_num_nodes)
-        departure_nodes[:len(np.array(self.edge_departures))]=np.array(self.edge_departures)
-        arrival_nodes[:len(np.array(self.edge_arrivals))]=np.array(self.edge_arrivals)
+        departure_nodes = np.zeros(self.max_num_edges, dtype=int)
+        arrival_nodes = np.zeros(self.max_num_edges, dtype=int)
+        departure_nodes[:self.actual_num_edges] = np.array(self.edge_departures)
+        arrival_nodes[:self.actual_num_edges] = np.array(self.edge_arrivals)
+
+        # CREATE EXPLICIT PADDING MASK
+        padding_mask = np.zeros(self.max_num_edges, dtype=np.float32)
+        padding_mask[:self.actual_num_edges] = 1.0  # Mark valid edges as 1
     
         return {
             'edge_capacity': padded_capacities,  
@@ -490,7 +510,8 @@ class CustomEnv(gym.Env):
             'edge_interdiction_probability': padded_probabilities,  
             'edge_departure_node': departure_nodes,
             'edge_arrival_node': arrival_nodes,
-            'budget': network_params['budget']
+            'budget': network_params['budget'],
+            'padding_mask': padding_mask  # NEW - explicit padding information
         }
 
     def _add_strategy_components(self, base_state):
@@ -510,38 +531,24 @@ class CustomEnv(gym.Env):
         """Add canalize-specific objective to state."""
         path_edges = self._find_simple_path()
         canalize_objective = np.zeros(self.max_num_edges, dtype=int)
-        for edge_id, edge in enumerate(self.interdictable_edges):
-            if edge in path_edges or (edge[1], edge[0]) in path_edges:
-                canalize_objective[edge_id] = 1
+        
+        # Create boolean mask for path edges
+        edge_in_path = np.array([edge in path_edges or (edge[1], edge[0]) in path_edges for edge in self.interdictable_edges], dtype=bool)
+
+        # Vectorized assignment
+        canalize_objective[:len(edge_in_path)] = edge_in_path.astype(int)
+#        #for edge_id, edge in enumerate(self.interdictable_edges):
+#        #    if edge in path_edges or (edge[1], edge[0]) in path_edges:
+#        #        canalize_objective[edge_id] = 1
         return {**base_state, 'canalize_objective': canalize_objective}
 
     def _add_isolate_components(self, base_state):
         """Add isolate-specific objective to state (edge-based, sink-connected only)."""
-        # Get number of edges that connect to sink
-        num_in_edges = len(self.edge_groups[self.sink_nodes[0]]['in'])
-    
-        # Create mapping from interdictable_edges indices to sink-connecting edges
-        sink_edge_indices = []
-        for idx, edge in enumerate(self.interdictable_edges):
-            if edge in self.edge_groups[self.sink_nodes[0]]['in']:
-                sink_edge_indices.append(idx)
-    
-        # Sample from the space until we get a valid non-zero objective
-        while True:
-            # Sample from the original space (size = len(sink_edges))
-            sampled_objective = self.strategy_spaces['isolate']['isolate_objective'].sample()
-        
-            # Create padded isolate objective (size = max_num_edges)
-            isolate_objective = np.zeros(self.max_num_edges, dtype=int)
-        
-            # Map sampled values to sink-connecting edge indices
-            for sample_idx, edge_idx in enumerate(sink_edge_indices):
-                if sample_idx < len(sampled_objective):
-                    isolate_objective[edge_idx] = sampled_objective[sample_idx]
-        
-            # Check if the objective is non-zero (at least one sink edge marked)
-            if np.sum(isolate_objective) > 0:
-                break
+        # Create padded objective with at least 1 marked sink edge
+        isolate_objective = np.zeros(self.max_num_edges, dtype=int)
+        num_to_mark = np.random.randint(1, self.num_cached_sink_edge_indices + 1)
+        marked_indices = np.random.choice(self.cached_sink_edge_indices, size=num_to_mark, replace=False)
+        isolate_objective[marked_indices] = 1
     
         return {**base_state, 'isolate_objective': isolate_objective}
 
@@ -875,7 +882,7 @@ class CustomEnv(gym.Env):
     def _calculate_divert_objective_and_flows(self, mode = None):
         """Calculate objective for divert strategy (redirect flow from one path to another)."""
         if mode is None:
-            mode is self.deterministic_outcomes
+            mode = self.deterministic_outcomes
 
         if mode:
             _, flows = self.solve_max_flow()
@@ -920,17 +927,25 @@ class CustomEnv(gym.Env):
     def _calculate_target_edge_flow(self, flows, objective_key):
         """Calculate total flow on edges marked in the objective."""
         objective = self.state[objective_key]
+        # Get indices where objective is 1
+        target_indices = np.where(objective[:self.actual_num_edges] == 1)[0]
+        
         total_flow = 0
+
+        target_edges = [self.interdictable_edges[i] for i in target_indices]
     
-        for idx, edge in enumerate(self.interdictable_edges):
-            if objective[idx] == 1:
-                forward_flow = flows.get(edge, 0)
-                reverse_flow = flows.get((edge[1], edge[0]), 0)
-                # Sum both directions for this edge
-                total_flow += forward_flow + reverse_flow
+        # Batch get flows
+        flows_array = np.array([max(flows.get(edge, 0), flows.get((edge[1], edge[0]), 0)) for edge in target_edges])
+    
+#        for idx, edge in enumerate(self.interdictable_edges):
+#            if objective[idx] == 1:
+#                forward_flow = flows.get(edge, 0)
+#                reverse_flow = flows.get((edge[1], edge[0]), 0)
+#                # Sum both directions for this edge
+#                total_flow += forward_flow + reverse_flow
     
         # Return sum flow among target nodes
-        return np.sum(total_flow)
+        return np.sum(flows_array) #np.sum(total_flow)
 
     def _is_episode_complete(self, remaining_budget):
         """Determine if the episode should end."""
@@ -1221,21 +1236,24 @@ class CustomEnv(gym.Env):
         Returns:
             tuple: (optimal_objective_value, optimal_interdiction_sequence)
         """
-        # Memoization dictionary: state -> (max_reward, best_action_sequence)
-        memo = {}
-        self.min_edge_cost = min(self.state['edge_costs'])
-        #if self.attacker_strategy == 'divert':
-        #    self.reference_start_flows, _ = self._calculate_divert_objective_and_flows(mode = True)
-            
-        ### Estimate total states (rough approximation)
+        
+        # Calculate minimum edge cost for depth estimation (only from real edges)
+        real_edge_costs = self.state['edge_costs'][:self.actual_num_edges]
+        self.min_edge_cost = min(real_edge_costs[real_edge_costs > 0], default=float('inf'))
+        if self.min_edge_cost == float('inf'):
+            self.min_edge_cost = 1  # Fallback
+    
+        # Estimate total states
         max_budget = self.state['budget'][0]
         budget_levels = max_budget // self.min_edge_cost
-        estimated_states = self.num_interdictable_edges**budget_levels
+        estimated_states = self.actual_num_edges ** budget_levels  # Use actual_num_edges, not max
         update_rate = max(estimated_states // 20, 1)
+        
+        # Memoization dictionary: state -> (max_reward, best_action_sequence)
+        memo = {}
 
         states_processed = 0
         pbar = tqdm(total=estimated_states, desc="DP States", unit=" states", disable=not verbose)
-        ###
 
         # Initialize the dynamic programming table
         def state_to_key(interdicted_state):
@@ -1247,9 +1265,7 @@ class CustomEnv(gym.Env):
             states_processed += num_states_processed
             if states_processed>=update_rate:
                 pbar.update(states_processed)
-                pbar.set_postfix({
-                    'Memo': len(memo),
-                })
+                pbar.set_postfix({'Memo': len(memo)})
                 states_processed = 0
             return
         
@@ -1259,7 +1275,7 @@ class CustomEnv(gym.Env):
         
             # Check if we've already solved this state
             if state_key in memo:
-                update_progress(self.num_interdictable_edges**(budget_levels-depth))
+                update_progress(self.actual_num_edges**(budget_levels-depth))
                 return memo[state_key]
 
             temp_state = self.state.copy()
@@ -1281,25 +1297,26 @@ class CustomEnv(gym.Env):
                 final_objective, flows = self._calculate_divert_objective_and_flows()
                 
             self.state = old_state
-        
+            
             # Base case: no more budget or maximum depth reached
             if remaining_budget < self.min_edge_cost or depth >= 20:
+                               
                 memo[state_key] = (final_objective, [])
-                update_progress(self.num_interdictable_edges**(budget_levels-depth))
+                update_progress(self.actual_num_edges**(budget_levels-depth))
                 return final_objective, []
-        
+       
             # Find all valid actions from current state
             valid_actions = []
-            for action in range(self.num_interdictable_edges):
+            for action in range(self.actual_num_edges):
                 if self._validate_action(action, [remaining_budget], interdicted_state) and flows.get(self.interdictable_edges[action], 0) != 0:
                     valid_actions.append(action)
                 else:
-                    update_progress(self.num_interdictable_edges**(budget_levels-(depth+1)))
+                    update_progress(self.actual_num_edges**(budget_levels-(depth+1)))
         
             # If no valid actions, evaluate terminal state
             if not valid_actions:
                 memo[state_key] = (final_objective, [])
-                update_progress(self.num_interdictable_edges**(budget_levels-depth))
+                update_progress(self.actual_num_edges**(budget_levels-depth))
                 return final_objective, []
         
             # Evaluate each possible action
