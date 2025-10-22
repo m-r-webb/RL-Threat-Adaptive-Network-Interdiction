@@ -239,6 +239,7 @@ class CustomEnv(gym.Env):
             self._set_routing_objectives(routing_assumption)
     
         # Solve and return results
+        self.maxflow_model.params.Seed = 1
         self.maxflow_model.optimize()
         flow_results = {e: round(var.X) for e, var in self.flow_var.items()}
     
