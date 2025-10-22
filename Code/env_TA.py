@@ -86,7 +86,7 @@ class CustomEnv(gym.Env):
     MAX_INTERDICTION_ATTEMPTS = 10
     MAX_SOURCE_FLOW = 125
     MAX_SINK_NEED = 40
-    GUROBI_ENV = grb.Env(params={"OutputFlag": 0, "LogToConsole": 0, "Threads": 1})
+    GUROBI_ENV = grb.Env(params={"OutputFlag": 0, "LogToConsole": 0, "Threads": 1, "Seed": 1})
     PENALTY_VALUE = -1
     max_num_edges = 500  # Maximum edges across all test graphs  Should work through G15x15
     max_num_nodes = 250    # Maximum nodes across all test graphs
@@ -968,8 +968,87 @@ class CustomEnv(gym.Env):
         return False
 
     def render(self, mode='human'):
-        print(f"State: {self.state}")
-    # END Gymnasium Environment Methods
+       # print(f"State: {self.state}")
+       
+        """
+        Render the environment state, displaying only values where padding_mask == 1.
+        """
+        if mode != "human":
+            return
+    
+        print("=" * 80)
+        print("ENVIRONMENT STATE (Non-padded values only)")
+        print("=" * 80)
+    
+        # Get padding mask
+        padding_mask = self.state.get("padding_mask", np.ones(self.max_num_edges))
+        valid_indices = np.where(padding_mask == 1)[0]
+    
+        print(f"\nNumber of valid (non-padded) edges: {len(valid_indices)} / {self.max_num_edges}")
+        print(f"Actual number of edges in graph: {self.actual_num_edges}")
+    
+        # Budget information
+        print(f"\n{'Budget Information':^80}")
+        print("-" * 80)
+        print(f"Remaining Budget: {self.state['budget'][0]}")
+        print(f"Reference Budget: {self.reference_budget}")
+    
+        # Edge-based state information (filtered by padding mask)
+        print(f"\n{'Edge State Information':^80}")
+        print("-" * 80)
+        print(f"{'Index':<8} {'Origin':<8} {'Destination':<8} {'Capacity':<12} {'Cost':<8} {'Int. Prob':<12} {'Interdicted':<12}")
+        print("-" * 80)
+    
+        for idx in valid_indices[:25]:  # Show first 25 valid edges
+            capacity = self.state['edge_capacity'][idx]
+            cost = self.state['edge_costs'][idx]
+            prob = self.state['edge_interdiction_probability'][idx]
+            interdicted = self.state['edge_interdicted'][idx]
+            departure_node = self.state['edge_departure_node'][idx]
+            arrival_node = self.state['edge_arrival_node'][idx]
+        
+            print(f"{idx:<8} {departure_node:<8} {arrival_node:<8} {capacity:<12} {cost:<8} {prob:<12.2f} {interdicted:<12}")
+    
+        if len(valid_indices) > 25:
+            print(f"... ({len(valid_indices) - 25} more valid edges)")
+    
+        # Strategy-specific objectives (if present)
+        strategy_objectives = {
+            'canalize': 'canalize_objective',
+            'isolate': 'isolate_objective',
+            'divert_from': 'divert_from_objective',
+            'divert_to': 'divert_to_objective'
+        }
+    
+        has_objectives = any(obj_key in self.state for obj_key in strategy_objectives.values())
+    
+        if has_objectives:
+            print(f"\n{'Strategy Objectives':^80}")
+            print("-" * 80)
+        
+            for strategy_name, obj_key in strategy_objectives.items():
+                if obj_key in self.state:
+                    objective_values = self.state[obj_key][valid_indices]
+                    num_target_edges = np.sum(objective_values == 1)
+                    print(f"{strategy_name.capitalize()}: {num_target_edges} target edges (out of {len(valid_indices)} valid)")
+    
+        # Additional state fields (non-edge specific)
+        print(f"\n{'Other State Information':^80}")
+        print("-" * 80)
+    
+        if 'episode_step' in self.state:
+            print(f"Episode Step: {self.state['episode_step'][0]}")
+    
+        if 'max_flow_value' in self.state:
+            print(f"Max Flow Value: {self.state['max_flow_value'][0]:.2f}")
+    
+        print(f"\nReference Objective: {self.reference_obj}")
+    
+        if hasattr(self, 'last_obj'):
+            print(f"Last Objective: {self.last_obj}")
+    
+        print("=" * 80)
+        # END Gymnasium Environment Methods
             
     def solve_optimal_interdiction(self):
         if self.deterministic_outcomes == True: #Solve Deterministic Case with Wood's Max/Min Formulation
