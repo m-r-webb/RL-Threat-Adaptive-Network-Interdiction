@@ -752,7 +752,7 @@ class CustomEnv(gym.Env):
         if reward > 0:
             self.last_obj = objective_value   
         elif reward ==0:
-            reward = -0.01
+            reward = -0.1
         return reward
 
     def _calculate_stochastic_objective_and_flow(self, strategy_type):
