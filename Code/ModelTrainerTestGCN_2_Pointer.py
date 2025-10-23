@@ -295,23 +295,7 @@ class PointerNetwork(nn.Module):
             # Use padding mask to get actual sequence lengths
             seq_lengths = padding_mask.sum(dim=1).cpu().long()  # [batch]
             seq_lengths = th.clamp(seq_lengths, min=1)
-#        elif action_masks is not None:
-#            # Fallback to action masks if no padding mask (backward compatibility)
-#            if isinstance(action_masks, np.ndarray):
-#                action_masks_tensor = th.from_numpy(action_masks).to(device=inputs.device)
-#            else:
-#                action_masks_tensor = action_masks.to(device=inputs.device)
-#        
-#            if len(action_masks_tensor.shape) == 1:
-#                action_masks_tensor = action_masks_tensor.unsqueeze(0).expand(batch_size, -1)
-        
-            # Count valid (non-masked) actions per batch to get sequence lengths
-            # Only count the first seq_len actions (actual edges, not "do nothing")
-#            edge_masks = action_masks_tensor[:, :seq_len]  # [batch, seq_len]
-#            seq_lengths = edge_masks.sum(dim=1).cpu().long()  # [batch]
-        
-            # Ensure at least length 1 to avoid errors
-#            seq_lengths = th.clamp(seq_lengths, min=1)
+
         else:
             # If no mask, use full sequence length
             seq_lengths = th.full((batch_size,), seq_len, dtype=th.long, device='cpu')
