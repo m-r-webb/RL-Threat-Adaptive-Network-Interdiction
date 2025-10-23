@@ -930,9 +930,7 @@ class CustomEnv(gym.Env):
             if objective[idx] == 1:
                 forward_flow = flows.get(edge, 0)
                 reverse_flow = flows.get((edge[1], edge[0]), 0)
-                # Take the maximum of forward and reverse flow for this edge
-                edge_flow = max(forward_flow, reverse_flow)
-                target_flows.append(edge_flow)
+                target_flows.append(forward_flow+reverse_flow)
     
         # Return minimum flow among target edges
         return min(target_flows)
@@ -948,7 +946,7 @@ class CustomEnv(gym.Env):
         target_edges = [self.interdictable_edges[i] for i in target_indices]
     
         # Batch get flows
-        flows_array = np.array([max(flows.get(edge, 0), flows.get((edge[1], edge[0]), 0)) for edge in target_edges])
+        flows_array = np.array([(flows.get(edge, 0) + flows.get((edge[1], edge[0]), 0)) for edge in target_edges])
     
         # Return sum flow among target nodes
         return np.sum(flows_array) #np.sum(total_flow)
