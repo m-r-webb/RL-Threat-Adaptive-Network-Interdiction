@@ -20,7 +20,7 @@ else:
     deterministicLetter = "S"
 
 #G3x5
-version = "V2" #C: Canalize, D: Divert, I: Isolate, Z: Zero-Sum 
+version = "V3" #C: Canalize, D: Divert, I: Isolate, Z: Zero-Sum 
 
 # Model Name
 model_name = f"{graphName}_{deterministicLetter}_{agent}_{attacker_strategy}_{version}"
