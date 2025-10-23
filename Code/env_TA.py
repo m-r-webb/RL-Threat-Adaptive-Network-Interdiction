@@ -415,15 +415,15 @@ class CustomEnv(gym.Env):
 
         # Calculate reference objective value for the attacker's strategy
         if self.attacker_strategy == 'zero_sum':
-            self.reference_obj, _ = self._compute_objective_and_flows()
+            self.reference_obj, self.reference_flows = self._compute_objective_and_flows()
         elif self.attacker_strategy == 'canalize':
-            self.reference_obj, _ = self._calculate_canalize_objective_and_flows()
+            self.reference_obj, self.reference_flows = self._calculate_canalize_objective_and_flows()
         elif self.attacker_strategy == 'isolate':
-            self.reference_obj, _ = self._calculate_isolate_objective_and_flows()
+            self.reference_obj, self.reference_flows = self._calculate_isolate_objective_and_flows()
         elif self.attacker_strategy == 'divert':
-            _, flows = self.solve_max_flow()
-            from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
-            to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
+            _, self.reference_flows = self.solve_max_flow()
+            from_flow = self._calculate_target_path_flow(self.reference_flows, 'divert_from_objective')
+            to_flow = self._calculate_target_path_flow(self.reference_flows, 'divert_to_objective')
             self.reference_start_flows = (from_flow, to_flow)
             self.reference_obj = 0
         
@@ -710,6 +710,10 @@ class CustomEnv(gym.Env):
         # Check capacity constraint
         if self.state['edge_capacity'][action] == 0:
             return False
+
+        # Check interdiction probability constraint
+        if self.state['edge_interdiction_probability'][action] == 0:
+            return False
     
         # Check interdiction limit
         max_interdictions = self.MAX_INTERDICTION_ATTEMPTS if self.multiple_interdiction_attempts else 1
@@ -717,6 +721,12 @@ class CustomEnv(gym.Env):
             return False
 
         ## Attacker Strategy Specific Checks
+        # Zero-Sum - Check target has previous flow
+    #    if self.attacker_strategy == 'zero_sum':
+        edge = self.interdictable_edges[action]
+        if self.reference_flows[edge] == 0 and self.reference_flows[(edge[1],edge[0])] == 0:
+            return False
+        
         # Canalization - Check attacker does not target canalization path
         if self.attacker_strategy == 'canalize':
             if self.state['canalize_objective'][action] == 1:
@@ -747,7 +757,7 @@ class CustomEnv(gym.Env):
 
     def _calculate_zero_sum_reward(self):
         """Calculate reward for zero-sum strategy (maximize disruption)."""
-        objective_value, _ = self._compute_objective_and_flows()
+        objective_value, self.reference_flows = self._compute_objective_and_flows()
         reward = max(self.last_obj - objective_value, 0) / self.reference_budget
         if reward > 0:
             self.last_obj = objective_value   
@@ -856,7 +866,7 @@ class CustomEnv(gym.Env):
     def _calculate_canalize_reward(self):
         """Calculate reward for canalize strategy (force flow through specific path)."""
         # Reward for successful interdiction of non-target edges
-        target_path_flow, _ = self._calculate_canalize_objective_and_flows()
+        target_path_flow, self.reference_flows = self._calculate_canalize_objective_and_flows()
         
         reward = (target_path_flow - self.last_obj) / self.reference_budget
         self.last_obj = target_path_flow
@@ -876,7 +886,7 @@ class CustomEnv(gym.Env):
     def _calculate_isolate_reward(self):
         """Calculate reward for isolate strategy (reduce flow to specific nodes)."""
         # Reward reduction in flow to target nodes
-        target_node_flow, _ = self._calculate_isolate_objective_and_flows()
+        target_node_flow, self.reference_flows = self._calculate_isolate_objective_and_flows()
         
         reward = (self.last_obj-target_node_flow) / self.reference_budget
         self.last_obj = target_node_flow
@@ -905,7 +915,7 @@ class CustomEnv(gym.Env):
     def _calculate_divert_reward(self):
         """Calculate reward for divert strategy (redirect flow from one path to another)."""
         # Calculate reward based on flow diversion success
-        diverted_flow, _ = self._calculate_divert_objective_and_flows()
+        diverted_flow, self.reference_flows = self._calculate_divert_objective_and_flows()
         
         reward = (diverted_flow - self.last_obj) / self.reference_budget
         self.last_obj = diverted_flow
@@ -970,8 +980,6 @@ class CustomEnv(gym.Env):
         return False
 
     def render(self, mode='human'):
-       # print(f"State: {self.state}")
-       
         """
         Render the environment state, displaying only values where padding_mask == 1.
         """
@@ -998,7 +1006,7 @@ class CustomEnv(gym.Env):
         # Edge-based state information (filtered by padding mask)
         print(f"\n{'Edge State Information':^80}")
         print("-" * 80)
-        print(f"{'Index':<8} {'Origin':<8} {'Destination':<8} {'Capacity':<12} {'Cost':<8} {'Int. Prob':<12} {'Interdicted':<12}")
+        print(f"{'Index':<8} {'Origin':<8} {'Dest':<8} {'Capacity':<12} {'Cost':<8} {'Int. Prob':<12} {'Interdicted':<12}")
         print("-" * 80)
     
         for idx in valid_indices[:25]:  # Show first 25 valid edges
@@ -1368,15 +1376,15 @@ class CustomEnv(gym.Env):
             self.state = temp_state
 
             if self.attacker_strategy == "zero_sum":
-                final_objective, flows = self._compute_objective_and_flows()
+                final_objective, self.reference_flows = self._compute_objective_and_flows()
                 final_objective = -final_objective
             elif self.attacker_strategy == 'canalize':
-                final_objective, flows = self._calculate_canalize_objective_and_flows()
+                final_objective, self.reference_flows = self._calculate_canalize_objective_and_flows()
             elif self.attacker_strategy == 'isolate':
-                final_objective, flows = self._calculate_isolate_objective_and_flows()
+                final_objective, self.reference_flows = self._calculate_isolate_objective_and_flows()
                 final_objective = -final_objective
             elif self.attacker_strategy == 'divert':
-                final_objective, flows = self._calculate_divert_objective_and_flows()
+                final_objective, self.reference_flows = self._calculate_divert_objective_and_flows()
                 
             self.state = old_state
             
@@ -1390,7 +1398,8 @@ class CustomEnv(gym.Env):
             # Find all valid actions from current state
             valid_actions = []
             for action in range(self.actual_num_edges):
-                if self._validate_action(action, [remaining_budget], interdicted_state) and flows.get(self.interdictable_edges[action], 0) != 0:
+                edge = self.interdictable_edges[action]
+                if self._validate_action(action, [remaining_budget], interdicted_state): # and (flows.get(edge, 0) != 0 or flows.get((edge[1],edge[0]), 0) != 0):
                     valid_actions.append(action)
                 else:
                     update_progress(self.actual_num_edges**(budget_levels-(depth+1)))
