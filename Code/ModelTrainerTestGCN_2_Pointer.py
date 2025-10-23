@@ -12,7 +12,7 @@ agent = "MaskablePPO"
 # Deterministic or Stochastic Outcomes?
 deterministicOutcomes = False
 multiple_interdiction_attempts=False
-attacker_strategy = "isolate"  # 'canalize'  'divert'    'isolate'   'zero_sum'
+attacker_strategy = "zero_sum"  # 'canalize'  'divert'    'isolate'   'zero_sum'
 
 if deterministicOutcomes:
     deterministicLetter = "D"
@@ -26,7 +26,7 @@ version = "V2" #C: Canalize, D: Divert, I: Isolate, Z: Zero-Sum
 model_name = f"{graphName}_{deterministicLetter}_{agent}_{attacker_strategy}_{version}"
 print(model_name)
 # Initial Learning Rate
-initial_learning_rate = 0.0001  #B: 0.0003
+initial_learning_rate = 0.0003  #0.0001
 
 # Time Steps to Train
 timesteps = 15000000
@@ -604,11 +604,11 @@ if __name__ == "__main__":
         env=vec_env,
         verbose=0,
         learning_rate=linear_schedule(initial_learning_rate),
-        n_steps=128,  #35
-        n_epochs=5,   #5
-        ent_coef=0.05,
-        batch_size=6144,  #5040
-        gamma=0.999,
+        n_steps=200,  #128
+        n_epochs=10,   #5
+        ent_coef=0.01,  #0.05
+        batch_size=9600,  #6144
+        gamma=0.99,
         policy_kwargs=policy_kwargs
     )
     
