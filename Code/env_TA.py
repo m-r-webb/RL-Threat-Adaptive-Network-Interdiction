@@ -242,7 +242,7 @@ class CustomEnv(gym.Env):
         self.maxflow_model.params.Seed = 1
         self.maxflow_model.optimize()
         flow_results = {e: round(var.X) for e, var in self.flow_var.items()}
-    
+
         return round(self.maxflow_model.ObjVal), flow_results 
 
     def _initialize_maxflow_model(self):
