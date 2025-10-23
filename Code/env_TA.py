@@ -950,13 +950,6 @@ class CustomEnv(gym.Env):
         # Batch get flows
         flows_array = np.array([max(flows.get(edge, 0), flows.get((edge[1], edge[0]), 0)) for edge in target_edges])
     
-#        for idx, edge in enumerate(self.interdictable_edges):
-#            if objective[idx] == 1:
-#                forward_flow = flows.get(edge, 0)
-#                reverse_flow = flows.get((edge[1], edge[0]), 0)
-#                # Sum both directions for this edge
-#                total_flow += forward_flow + reverse_flow
-    
         # Return sum flow among target nodes
         return np.sum(flows_array) #np.sum(total_flow)
 
