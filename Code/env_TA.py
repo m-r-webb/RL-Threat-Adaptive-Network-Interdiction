@@ -20,6 +20,7 @@ tf.get_logger().setLevel('ERROR')          # Optional: Suppress Python-
 #import torch as th
 #import time
 from collections import defaultdict
+from collections import Counter
 
 
 # Class representing Node Object
@@ -88,6 +89,7 @@ class CustomEnv(gym.Env):
     MAX_SINK_NEED = 40
     GUROBI_ENV = grb.Env(params={"OutputFlag": 0, "LogToConsole": 0, "Threads": 1, "Seed": 1})
     PENALTY_VALUE = -1
+    SAMPLE_SIZE = 1000
     max_num_edges = 500  # Maximum edges across all test graphs  Should work through G15x15
     max_num_nodes = 250    # Maximum nodes across all test graphs
     
@@ -113,7 +115,27 @@ class CustomEnv(gym.Env):
 
         # Setup observation and action spaces
         self._setup_spaces()
-          
+
+    def _cache_flow_array(self):
+        """Fully vectorized cache using array indexing."""
+        num_edges = self.num_interdictable_edges
+    
+        # Pre-allocate
+        flow_array = np.zeros(num_edges, dtype=np.float32)
+    
+        # Vectorized extraction using list comprehension (compiled to C internally)
+        edges = self.interdictable_edges
+        flows = self.reference_flows
+    
+        # Batch get operations
+        forward_keys = edges
+        reverse_keys = [(e[1], e[0]) for e in edges]
+    
+        # Vectorized lookup and sum
+        flow_array = np.array([flows.get(fk, 0) + flows.get(rk, 0) for fk, rk in zip(forward_keys, reverse_keys)], dtype=np.float32)
+    
+        self.cached_flow_array = flow_array
+    
     def _setup_network_structure(self):
         """Initialize network nodes and edges structure."""
         # Define node types
@@ -225,31 +247,54 @@ class CustomEnv(gym.Env):
         observation_dict = {**self.base_spaces, **self.strategy_spaces.get(self.attacker_strategy, {})}
         return spaces.Dict(observation_dict)
     
-    def solve_max_flow(self, routing_assumption = "gurobi_default"):  
-        """Solve the Max Flow network problem, output objective value and edge flows"""
+    def solve_max_flow(self, capacity_dict=None,
+                       interdicted_edges=None,
+                       routing_assumption = "gurobi_default"):  
+        """
+        Solve the Max Flow network problem, output objective value and edge flows.
+    
+        Parameters:
+        -----------
+        capacity_dict : dict, optional
+            If provided, uses this capacity dictionary instead of current state.
+            Useful for batch solving with different capacity configurations.
+        interdicted_edges : list, optional
+            List of interdicted edges (for compatibility, can be ignored if using capacity_dict)
+        routing_assumption : str
+            Routing optimization objective ('gurobi_default', 'canalize', etc.)
+    
+        Returns:
+        --------
+        tuple: (objective_value, flow_dict)
+        """
         # Initialize model on first call
         if not hasattr(self, 'maxflow_model'):
             self._initialize_maxflow_model()
 
-        # Update capacity constraints for current state
-        self._update_capacity_constraints()
+        # Update capacity constraints
+        if capacity_dict is not None:
+            # Use provided capacity dict (optimized path)
+            self._update_capacity_constraints_from_dict(capacity_dict)
+        else:
+            # Use current state (legacy path)
+            self._update_capacity_constraints()
 
         # Update objectives based on routing assumption
         if self.old_routing != routing_assumption:
             self._set_routing_objectives(routing_assumption)
-    
+            
         # Solve and return results
         self.maxflow_model.params.Seed = 1
         self.maxflow_model.optimize()
         flow_results = {e: round(var.X) for e, var in self.flow_var.items()}
-
+        
         return round(self.maxflow_model.ObjVal), flow_results 
 
     def _initialize_maxflow_model(self):
         """Initialize the Gurobi max flow model with variables and constraints."""
         self.maxflow_model = grb.Model("Max Flow", env=self.GUROBI_ENV)
         self.super_edge = (len(self.nodes), 1)
-    
+        
         # Prepare edge list with super sink-source connection
         self.mf_all_edges = self.all_edges + [self.super_edge] 
 
@@ -297,7 +342,7 @@ class CustomEnv(gym.Env):
         )
 
     def _update_capacity_constraints(self):
-        """Update edge capacity constraints based on current interdiction state."""
+        """LEGACY Update edge capacity constraints based on current interdiction state."""
         # Calculate current edge capacities considering interdiction
         # Ensure probabilities are float to avoid integer power errors
         probs = self.state["edge_interdiction_probability"][:self.num_interdictable_edges].astype(float)
@@ -318,6 +363,23 @@ class CustomEnv(gym.Env):
             self.flow_var[e] <= upper_bounds[idx % self.num_interdictable_edges] * self.edge_used[e] 
             for idx, e in enumerate(self.all_interdictable_edges)), name="flow_capacity_forward")
 
+    def _update_capacity_constraints_from_dict(self, capacity_dict):
+        """
+        Update capacity constraints using provided capacity dictionary.
+        Optimized for batch processing.
+    
+        Parameters:
+        -----------
+        capacity_dict : dict
+            Mapping from edge tuple to capacity value
+        """
+        if hasattr(self, 'forward_cons'):
+            self.maxflow_model.remove(self.forward_cons)
+
+        self.forward_cons = self.maxflow_model.addConstrs((
+            self.flow_var[e] <= capacity_dict.get(e, 0) * self.edge_used[e] 
+            for idx, e in enumerate(self.all_interdictable_edges)), name="flow_capacity_forward")
+        
     def _set_routing_objectives(self, routing_assumption):
         """Set model objectives based on routing assumption."""
         # Clear existing objectives
@@ -429,6 +491,8 @@ class CustomEnv(gym.Env):
         
         self.last_obj = self.reference_obj
         self.reference_budget = remaining_budget[0]
+
+        self._cache_flow_array()
 
         return self.state, {}
 
@@ -765,9 +829,112 @@ class CustomEnv(gym.Env):
             reward = -0.1
         return reward
 
-    def _calculate_stochastic_objective_and_flow(self, strategy_type):
+    def _calculate_stochastic_objective_and_flow(self, strategy_type="zero_sum", use_optimized=False):
         """
-        Calculate objective value under stochastic interdiction outcomes.
+        Calculate stochastic objective and flows using Monte Carlo sampling.
+        
+        Parameters:
+        -----------
+        strategy_type : str
+            Type of attacker strategy ('zero_sum', 'canalize', 'isolate', 'divert')
+        use_optimized : bool
+            If True, uses optimized approach (group outcomes and solve once per unique state)
+            If False, uses legacy approach (solve for each sample)
+    
+        Returns:
+        --------
+        tuple: (mean_objective, mean_flows)
+        """
+    
+        if use_optimized:
+            return self._calculate_stochastic_optimized(strategy_type)
+        else:
+            return self._calculate_stochastic_legacy(strategy_type)
+
+    def _calculate_stochastic_optimized(self, strategy_type="zero_sum"):
+        """
+        Optimized stochastic calculation: group by unique outcomes and weight by probability.
+    
+        This method:
+        1. Samples interdiction outcomes (success/failure) based on probabilities
+        2. Groups identical outcomes together
+        3. Solves max flow once per unique outcome
+        4. Computes weighted average based on outcome frequencies
+        """
+        # Extract interdiction probabilities
+        probs = self.state['edge_interdiction_probability'][:self.num_interdictable_edges]
+        interdicted = self.state['edge_interdicted'][:self.num_interdictable_edges].astype(int)
+    
+        # Sample interdiction outcomes
+        outcome_samples = []
+        for _ in range(self.SAMPLE_SIZE):
+            # For each edge, determine if interdiction succeeds based on probability
+            success = np.random.binomial(1, probs)
+            
+            # Create outcome tuple (which edges are successfully interdicted)
+            if self.multiple_interdiction_attempts:
+                # Add to existing interdiction count
+                outcome = tuple(interdicted + success)
+            else:
+                # Binary: either interdicted or not
+                outcome = tuple(np.minimum(interdicted, success))
+        
+            outcome_samples.append(outcome)
+    
+        # Count unique outcomes and their frequencies
+        outcome_counts = Counter(outcome_samples)
+        unique_outcomes = list(outcome_counts.keys())
+    
+ #       print(f"  Optimized stochastic: {len(unique_outcomes)} unique outcomes from {self.SAMPLE_SIZE} samples")
+    
+        # Solve max flow once per unique outcome
+        outcome_results = {}
+        for outcome in unique_outcomes:
+            # Convert outcome to capacity dict
+            capacity_dict = self._create_capacity_dict_from_outcome(outcome)
+        
+            # Solve max flow for this outcome
+            obj, flows = self.solve_max_flow(capacity_dict, list(outcome))
+        
+            # Calculate strategy-specific objective
+            if strategy_type == "zero_sum":
+                objective = obj
+            elif strategy_type == "canalize":
+                objective = self._calculate_target_path_flow(flows, 'canalize_objective')
+            elif strategy_type == "isolate":
+                objective = self._calculate_target_edge_flow(flows, 'isolate_objective')
+            elif strategy_type == "divert":
+                from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
+                to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
+                diverted_flow_from = self.reference_start_flows[0] - from_flow
+                diverted_flow_to = to_flow - self.reference_start_flows[1]
+                objective = np.min([diverted_flow_from, diverted_flow_to])
+        
+            outcome_results[outcome] = {
+                'objective': objective,
+                'flows': flows,
+                'count': outcome_counts[outcome]
+            }
+        # Compute weighted averages
+        total_samples = sum(outcome_counts.values())
+        weighted_objective = sum(
+            result['objective'] * result['count'] / total_samples
+            for result in outcome_results.values()
+        )
+    
+        # Compute weighted average flows
+        weighted_flows = defaultdict(float)
+        for outcome, result in outcome_results.items():
+            weight = result['count'] / total_samples
+            for edge, flow in result['flows'].items():
+                weighted_flows[edge] += flow * weight
+    
+        return weighted_objective, dict(weighted_flows)
+
+
+    def _calculate_stochastic_legacy(self, strategy_type="zero_sum"):
+        """
+        Legacy Calculate objective value under stochastic interdiction outcomes.
         
         Args:
             strategy_type: One of 'zero_sum', 'canalize', 'isolate', or 'divert'
@@ -838,6 +1005,45 @@ class CustomEnv(gym.Env):
         
         # Return mean objective and mean flows
         return np.mean(objectives), mean_flows
+
+    def _create_capacity_dict_from_outcome(self, interdiction_outcome):
+        """
+        Create capacity dictionary from interdiction outcome.
+    
+        Parameters:
+        -----------
+        interdiction_outcome : tuple or array
+            Interdiction state for each interdictable edge
+    
+        Returns:
+        --------
+        dict: Mapping from edge to remaining capacity after interdictions
+        """
+        capacity_dict = {}
+    
+        for idx, edge in enumerate(self.interdictable_edges):
+            base_capacity = self.state['edge_capacity'][idx]
+        
+            if self.multiple_interdiction_attempts:
+                # Each interdiction reduces capacity
+                interdictions = interdiction_outcome[idx]
+                remaining_capacity = max(0, base_capacity - interdictions)
+            else:
+                # Binary: either full capacity or zero
+                is_interdicted = interdiction_outcome[idx]
+                remaining_capacity = 0 if is_interdicted else base_capacity
+        
+            capacity_dict[edge] = remaining_capacity
+    
+        # Add non-interdictable edges with full capacity
+        for edge in self.edges_reset:
+            if edge not in self.interdictable_edges:
+                capacity_dict[edge] = self.state['edge_capacity'][idx]
+    
+        return capacity_dict
+
+
+
     
     def _compute_objective_and_flows(self, deterministic_mode=None):
         """Calculate the max flow objective and edge flows."""
@@ -848,7 +1054,7 @@ class CustomEnv(gym.Env):
             objective, flows = self.solve_max_flow()
         else:
             # Stochastic outcome calculation
-            objective, flows = self._calculate_stochastic_objective_and_flow('zero_sum')
+            objective, flows = self._calculate_stochastic_objective_and_flow('zero_sum', True)
     
         return objective, flows
 
@@ -870,6 +1076,8 @@ class CustomEnv(gym.Env):
         
         reward = (target_path_flow - self.last_obj) / self.reference_budget
         self.last_obj = target_path_flow
+        if reward == 0:
+            reward = -0.1
         return reward
         
     def _calculate_isolate_objective_and_flows(self):
@@ -890,6 +1098,8 @@ class CustomEnv(gym.Env):
         
         reward = (self.last_obj-target_node_flow) / self.reference_budget
         self.last_obj = target_node_flow
+        if reward == 0:
+            reward = -0.1
         return reward
 
     def _calculate_divert_objective_and_flows(self, mode = None):
@@ -919,6 +1129,8 @@ class CustomEnv(gym.Env):
         
         reward = (diverted_flow - self.last_obj) / self.reference_budget
         self.last_obj = diverted_flow
+        if reward == 0:
+            reward = -0.1
         return reward
 
     def _calculate_target_path_flow(self, flows, objective_key):
