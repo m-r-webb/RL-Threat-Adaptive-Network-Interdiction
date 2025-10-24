@@ -1066,7 +1066,7 @@ class CustomEnv(gym.Env):
             return target_path_flow, flows
         else:
             # Stochastic calculation - returns mean objective directly
-            objective, mean_flows = self._calculate_stochastic_objective_and_flow('canalize')
+            objective, mean_flows = self._calculate_stochastic_objective_and_flow('canalize', True)
             return objective, mean_flows
         
     def _calculate_canalize_reward(self):
@@ -1088,7 +1088,7 @@ class CustomEnv(gym.Env):
             return target_node_flow, flows
         else:
             # Stochastic calculation - returns mean objective directly
-            objective, mean_flows = self._calculate_stochastic_objective_and_flow('isolate')
+            objective, mean_flows = self._calculate_stochastic_objective_and_flow('isolate',True)
             return objective, mean_flows
         
     def _calculate_isolate_reward(self):
@@ -1118,7 +1118,7 @@ class CustomEnv(gym.Env):
             return objective, flows
         else:
             # Stochastic calculation - returns mean objectives directly
-            mean_objective, mean_flows = self._calculate_stochastic_objective_and_flow('divert')
+            mean_objective, mean_flows = self._calculate_stochastic_objective_and_flow('divert',True)
             # Return as tuple to maintain consistent interface with reward calculation
             return mean_objective, mean_flows
 
