@@ -81,15 +81,15 @@ class CustomEnv(gym.Env):
     DEFAULT_BUDGET_RANGE = (0, 100)
     DEFAULT_EDGE_CAPACITY_RANGE = (0, 100)
     DEFAULT_EDGE_COST_RANGE = (0, 10)
-    DEFAULT_TRAINING_BUDGET_RANGE = (5, 10)  #Regular: (5, 10)     High_budget: (3, 20)
+    DEFAULT_TRAINING_BUDGET_RANGE = (5, 10)
     DEFAULT_TRAINING_EDGE_CAPACITY_RANGE = (30, 60)
     DEFAULT_TRAINING_EDGE_COST_RANGE = (3, 5)
     MAX_INTERDICTION_ATTEMPTS = 10
     MAX_SOURCE_FLOW = 125
     MAX_SINK_NEED = 40
     GUROBI_ENV = grb.Env(params={"OutputFlag": 0, "LogToConsole": 0, "Threads": 1, "Seed": 1})
-    PENALTY_VALUE = -1
-    SAMPLE_SIZE = 1000
+    PENALTY_VALUE = -0.1
+    SAMPLE_SIZE = 10000
     max_num_edges = 500  # Maximum edges across all test graphs  Should work through G15x15
     max_num_nodes = 250    # Maximum nodes across all test graphs
     
@@ -330,9 +330,6 @@ class CustomEnv(gym.Env):
     
         # Minimum flow forward and reverse constraints
         self.maxflow_model.addConstrs((self.flow_var[e] >= self.edge_used[e] for e in self.all_interdictable_edges), name="min_flow_forward")
-#        self.maxflow_model.addConstrs((self.flow_var[(e[1], e[0])] >= self.edge_used[(e[1], e[0])] for e in self.interdictable_edges),
-#                                      name="min_flow_reverse"
-#        )
     
         # Source and sink capacity limits
         self.maxflow_model.addConstr(self.flow_var[self.super_edge] <= self.MAX_SOURCE_FLOW, name="max_source_flow")
@@ -826,7 +823,7 @@ class CustomEnv(gym.Env):
         if reward > 0:
             self.last_obj = objective_value   
         elif reward ==0:
-            reward = -0.1
+            reward = self.PENALTY_VALUE
         return reward
 
     def _calculate_stochastic_objective_and_flow(self, strategy_type="zero_sum", use_optimized=False):
@@ -869,13 +866,15 @@ class CustomEnv(gym.Env):
         outcome_samples = []
         for _ in range(self.SAMPLE_SIZE):
             # For each edge, determine if interdiction succeeds based on probability
-            success = np.random.binomial(1, probs)
             
             # Create outcome tuple (which edges are successfully interdicted)
             if self.multiple_interdiction_attempts:
                 # Add to existing interdiction count
-                outcome = tuple(interdicted + success)
+                failure_probs = ((1 - probs) ** interdicted)
+                success = np.random.binomial(1, 1-failure_probs)
+                outcome = tuple(np.minimum(interdicted, success)) #tuple(interdicted + success)
             else:
+                success = np.random.binomial(1, probs)
                 # Binary: either interdicted or not
                 outcome = tuple(np.minimum(interdicted, success))
         
@@ -1026,8 +1025,8 @@ class CustomEnv(gym.Env):
         
             if self.multiple_interdiction_attempts:
                 # Each interdiction reduces capacity
-                interdictions = interdiction_outcome[idx]
-                remaining_capacity = max(0, base_capacity - interdictions)
+                is_interdicted = interdiction_outcome[idx]
+                remaining_capacity = 0 if is_interdicted else base_capacity
             else:
                 # Binary: either full capacity or zero
                 is_interdicted = interdiction_outcome[idx]
@@ -1077,7 +1076,7 @@ class CustomEnv(gym.Env):
         reward = (target_path_flow - self.last_obj) / self.reference_budget
         self.last_obj = target_path_flow
         if reward == 0:
-            reward = -0.1
+            reward = self.PENALTY_VALUE
         return reward
         
     def _calculate_isolate_objective_and_flows(self):
@@ -1099,7 +1098,7 @@ class CustomEnv(gym.Env):
         reward = (self.last_obj-target_node_flow) / self.reference_budget
         self.last_obj = target_node_flow
         if reward == 0:
-            reward = -0.1
+            reward = self.PENALTY_VALUE
         return reward
 
     def _calculate_divert_objective_and_flows(self, mode = None):
@@ -1130,7 +1129,7 @@ class CustomEnv(gym.Env):
         reward = (diverted_flow - self.last_obj) / self.reference_budget
         self.last_obj = diverted_flow
         if reward == 0:
-            reward = -0.1
+            reward = self.PENALTY_VALUE
         return reward
 
     def _calculate_target_path_flow(self, flows, objective_key):
