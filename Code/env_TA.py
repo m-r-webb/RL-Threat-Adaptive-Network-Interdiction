@@ -89,7 +89,7 @@ class CustomEnv(gym.Env):
     MAX_SINK_NEED = 40
     GUROBI_ENV = grb.Env(params={"OutputFlag": 0, "LogToConsole": 0, "Threads": 1, "Seed": 1})
     PENALTY_VALUE = -0.1
-    SAMPLE_SIZE = 10000
+    SAMPLE_SIZE = 1000
     max_num_edges = 500  # Maximum edges across all test graphs  Should work through G15x15
     max_num_nodes = 250    # Maximum nodes across all test graphs
     
