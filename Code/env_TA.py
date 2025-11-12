@@ -10,18 +10,14 @@ import gurobipy as grb                # Gurobi optimization library for solving 
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-import copy
-import random
-#import networkx as nx
+import copy, random
+#import random
 from tqdm import tqdm
 import tensorflow as tf
 tf.get_logger().setLevel('ERROR')          # Optional: Suppress Python-
 
-#import torch as th
-#import time
-from collections import defaultdict
-from collections import Counter
-
+from collections import defaultdict, Counter
+#from collections import Counter
 
 # Class representing Node Object
 class Node():
@@ -42,9 +38,6 @@ class Edge():
         self.interdiction_probability = interdiction_probability # Edge's susceptibility to interdiction
 
 def create_nodes_edges(node_filename, edge_filename):
-
-    #import os
-    
     # Get the current working directory
     current_dir = os.getcwd()
 
@@ -78,96 +71,84 @@ def create_nodes_edges(node_filename, edge_filename):
 class CustomEnv(gym.Env):
     """Custom Gym environment for network interdiction problems."""
     # Class constants
-    DEFAULT_BUDGET_RANGE = (0, 100)
-    DEFAULT_EDGE_CAPACITY_RANGE = (0, 100)
-    DEFAULT_EDGE_COST_RANGE = (0, 10)
-    DEFAULT_TRAINING_BUDGET_RANGE = (5, 10)
-    DEFAULT_TRAINING_EDGE_CAPACITY_RANGE = (30, 60)
-    DEFAULT_TRAINING_EDGE_COST_RANGE = (3, 5)
-    MAX_INTERDICTION_ATTEMPTS = 10
-    MAX_SOURCE_FLOW = 125
-    MAX_SINK_NEED = 40
     GUROBI_ENV = grb.Env(params={"OutputFlag": 0, "LogToConsole": 0, "Threads": 1, "Seed": 1})
-    PENALTY_VALUE = -0.1
-    SAMPLE_SIZE = 1000
-    max_num_edges = 500  # Maximum edges across all test graphs  Should work through G15x15
-    max_num_nodes = 250    # Maximum nodes across all test graphs
     
     def __init__(self, nodes, edges, deterministic_agent=True, initial_budget = None, 
-                 multiple_interdiction_attempts=True, attacker_strategy="zero_sum"):
+                 multiple_interdiction_attempts=True, attacker_strategy="zero_sum",
+                 budget_range=(0, 100), edge_capacity_range=(0, 100), 
+                 edge_cost_range=(0, 10), training_budget_range=(5, 10), 
+                 training_edge_capacity_range=(30, 60), training_edge_cost_range=(3, 5),
+                 max_interdiction_attempts=10, max_source_flow=125, 
+                 max_sink_need=40, penalty_value=-0.1, 
+                 sample_size=1000, max_num_edges=500, 
+                 max_num_nodes=250, old_routing="none"):
         super(CustomEnv, self).__init__()
 
         #Setup core environment attributes
         self.nodes = nodes
         self.edges_reset = edges
-        self.edges_episode = copy.deepcopy(self.edges_reset)        
-        self.multiple_interdiction_attempts = multiple_interdiction_attempts
-        self.attacker_strategy = attacker_strategy
+        self.edges_episode = copy.deepcopy(self.edges_reset)
         self.deterministic_outcomes = deterministic_agent
         self.initial_budget = initial_budget
-        
+        self.multiple_interdiction_attempts = multiple_interdiction_attempts
+        self.attacker_strategy = attacker_strategy
+        self.DEFAULT_BUDGET_RANGE = budget_range 
+        self.DEFAULT_EDGE_CAPACITY_RANGE = edge_capacity_range 
+        self.DEFAULT_EDGE_COST_RANGE = edge_cost_range 
+        self.DEFAULT_TRAINING_BUDGET_RANGE = training_budget_range 
+        self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE = training_edge_capacity_range 
+        self.DEFAULT_TRAINING_EDGE_COST_RANGE = training_edge_cost_range 
+        self.MAX_INTERDICTION_ATTEMPTS = max_interdiction_attempts 
+        self.MAX_SOURCE_FLOW = max_source_flow 
+        self.MAX_SINK_NEED = max_sink_need 
+        self.PENALTY_VALUE = penalty_value 
+        self.SAMPLE_SIZE = sample_size 
+        self.max_num_edges = max_num_edges
+        self.max_num_nodes = max_num_nodes
+        self.old_routing = old_routing
+
         self.num_stochastic_scenarios = None
         self.num_stochastic_scenarios_IM = None
-        self.old_routing = "none"
         
         # Initialize network structure
         self._setup_network_structure()
 
         # Setup observation and action spaces
         self._setup_spaces()
-
-    def _cache_flow_array(self):
-        """Fully vectorized cache using array indexing."""
-        num_edges = self.num_interdictable_edges
-    
-        # Pre-allocate
-        flow_array = np.zeros(num_edges, dtype=np.float32)
-    
-        # Vectorized extraction using list comprehension (compiled to C internally)
-        edges = self.interdictable_edges
-        flows = self.reference_flows
-    
-        # Batch get operations
-        forward_keys = edges
-        reverse_keys = [(e[1], e[0]) for e in edges]
-    
-        # Vectorized lookup and sum
-        flow_array = np.array([flows.get(fk, 0) + flows.get(rk, 0) for fk, rk in zip(forward_keys, reverse_keys)], dtype=np.float32)
-    
-        self.cached_flow_array = flow_array
     
     def _setup_network_structure(self):
         """Initialize network nodes and edges structure."""
         # Define node types
-        self.source_nodes = [1]
-        self.sink_nodes = [len(self.nodes)]
+        self.super_source_nodes = [1]
+        self.super_sink_nodes = [self.max_num_nodes]
         self.intermediate_nodes = list(range(2, len(self.nodes)))
-        
-        # Create all possible edges
-        self.all_edges = list({(u, v) for u, v in self.edges_reset.keys()}.union(
-                      {(v, u) for u, v in self.edges_reset.keys() if u not in self.source_nodes and v not in self.sink_nodes}))
-        
+              
         # Extract interdictable edges and their attributes
-        self.interdictable_edges = []
+        self.interdictable_edges =[]
+        self.noninterdictable_edges = []
         self.edge_departures =[]
-        self.edge_arrivals = []
+        self.edge_arrivals =[]
         
         for key, edge in self.edges_reset.items():
             if edge.interdictable == 1:
                 self.interdictable_edges.append(key)
-                self.edge_departures.append(key[0])
-                self.edge_arrivals.append(key[1])
+            else:
+                self.noninterdictable_edges.append(key)
+            self.edge_departures.append(key[0])
+            self.edge_arrivals.append(key[1])
+
+        self.both_edges = self.interdictable_edges + self.noninterdictable_edges
 
         self.all_interdictable_edges = list(self.interdictable_edges) + [(v, u) for (u, v) in self.interdictable_edges]
+        self.all_noninterdictable_edges = list(self.noninterdictable_edges) + [(v, u) for (u, v) in self.noninterdictable_edges]
 
-        
-        self.source_edges = [e for e in self.all_edges if e[0] in self.source_nodes]
-        self.sink_edges = [e for e in self.all_edges if e[1] in self.sink_nodes]
+        #Create all possible edges
+        self.all_both_edges = self.all_interdictable_edges + self.all_noninterdictable_edges
         
         # Create edge groups for efficient lookup
         out_edges = defaultdict(list)
         in_edges = defaultdict(list)
-        for edge in self.all_edges:
+        for edge in self.all_both_edges:
             out_edges[edge[0]].append(edge)
             in_edges[edge[1]].append(edge)
 
@@ -177,27 +158,31 @@ class CustomEnv(gym.Env):
                            for node_id in self.nodes}
         
         # Create edge-to-index mapping
-        self.edge_to_index = {edge: idx for idx, edge in enumerate(self.interdictable_edges)}
+        self.edge_to_index = {edge: idx for idx, edge in enumerate(self.both_edges)}  #Changed from interdictable to both_edges
 
-        for edge_id in self.edge_groups[self.sink_nodes[0]]['in']:
-            self.edges_episode[edge_id].capacity = self.MAX_SINK_NEED
+        #INSERT HERE: MAKE A LIST OF SINK EDGE INDICIES, SOURCE EDGE INDICES, AND NON_INTERDICTABLE_EDGE INDICIES FOR USE IN reset()
+        
+        self.source_nodes = []
+        for edge_id in self.edge_groups[self.super_source_nodes[0]]['in']:
+            self.source_nodes.append(edge_id[0])
+        self.sink_nodes = []
+        for edge_id in self.edge_groups[self.super_sink_nodes[0]]['in']:
+            self.sink_nodes.append(edge_id[0])
+#            self.edges_episode[edge_id].capacity = self.MAX_SINK_NEED      ACCOMPLISH THIS IN THE RESET METHOD
 
-        self.edges_with_sink_source = list(self.edges_reset.keys()) + [(self.sink_nodes[0],self.source_nodes[0])]
+#        self.edges_with_sink_source = list(self.edges_reset.keys()) + [(self.super_sink_nodes[0],self.super_source_nodes[0])]
 
         # Identify sink-connecting interdictable edges
-        self.cached_sink_edge_indices = [
-            idx for idx, edge in enumerate(self.interdictable_edges)
-            if edge[1] in {e[0] for e in self.edge_groups[self.sink_nodes[0]]['in']}
-        ]
-        self.num_cached_sink_edge_indices = len(self.cached_sink_edge_indices)
+#        self.cached_sink_edge_indices = [
+#            idx for idx, edge in enumerate(self.all_edges)
+#            if edge[1] in {e[0] for e in self.edge_groups[self.super_sink_nodes[0]]['in']}
+#        ]
+#        self.num_cached_sink_edge_indices = len(self.cached_sink_edge_indices)
             
     def _setup_spaces(self):
         """Setup observation and action spaces based on environment configuration."""
         # Calculate space dimensions
-        self.num_interdictable_edges = len(self.interdictable_edges)
-    
-        # Store actual size for this specific graph
-        self.actual_num_edges = self.num_interdictable_edges
+        self.num_both_edges = len(self.both_edges)
         
         # Create base spaces
         self.base_spaces = self._create_base_spaces()
@@ -293,17 +278,17 @@ class CustomEnv(gym.Env):
     def _initialize_maxflow_model(self):
         """Initialize the Gurobi max flow model with variables and constraints."""
         self.maxflow_model = grb.Model("Max Flow", env=self.GUROBI_ENV)
-        self.super_edge = (len(self.nodes), 1)
+        self.super_edge = (self.max_num_nodes, 1)
         
         # Prepare edge list with super sink-source connection
-        self.mf_all_edges = self.all_edges + [self.super_edge] 
+        self.mf_all_both_edges = self.all_both_edges + [self.super_edge] 
 
         ##VARIABLES
         # Add Flow variables
-        self.flow_var = self.maxflow_model.addVars(self.mf_all_edges, vtype=grb.GRB.CONTINUOUS, lb=0, name="flow_var")
+        self.flow_var = self.maxflow_model.addVars(self.mf_all_both_edges, vtype=grb.GRB.CONTINUOUS, lb=0, name="flow_var")
 
         # Add Edge Usage variables
-        self.edge_used = self.maxflow_model.addVars(self.mf_all_edges, vtype=grb.GRB.BINARY, name="edge_used")
+        self.edge_used = self.maxflow_model.addVars(self.all_both_edges, vtype=grb.GRB.BINARY, name="edge_used")
 
         ##CONSTRAINTS
         # Flow conservation for intermediate nodes
@@ -313,52 +298,56 @@ class CustomEnv(gym.Env):
              for n in self.intermediate_nodes), name="flow_conservation"
         )
     
-        # Source and sink flow conservation
+        # Super source and super sink flow conservation
         self.maxflow_model.addConstr(self.flow_var[self.super_edge] - grb.quicksum(self.flow_var[e] for e in self.edge_groups[1]['out']) == 0,
-                                     name="source_conservation"
+                                     name="super_source_conservation"
         )
     
-        self.maxflow_model.addConstr(grb.quicksum(self.flow_var[e] for e in self.edge_groups[self.sink_nodes[0]]['in']) -
-                                     self.flow_var[self.super_edge] == 0, name="sink_conservation"
+        self.maxflow_model.addConstr(grb.quicksum(self.flow_var[e] for e in self.edge_groups[self.super_sink_nodes[0]]['in']) -
+                                     self.flow_var[self.super_edge] == 0, name="super_sink_conservation"
         )
     
         # One-way flow constraints
-        self.maxflow_model.addConstrs((self.edge_used[(u, v)] + self.edge_used[(v, u)] <= 1 
-                                       for u, v in self.edges_reset.keys()  if u not in self.source_nodes and v not in self.sink_nodes),
-                                      name="one_way_flow"
+        self.maxflow_model.addConstrs(self.edge_used[(u, v)] + self.edge_used[(v, u)] <= 1 
+                                      for u, v in self.both_edges, name="one_way_flow"
         )
     
         # Minimum flow forward and reverse constraints
-        self.maxflow_model.addConstrs((self.flow_var[e] >= self.edge_used[e] for e in self.all_interdictable_edges), name="min_flow_forward")
+        self.maxflow_model.addConstrs((self.flow_var[e] >= self.edge_used[e] for e in self.all_both_edges), name="min_flow_forward")
     
-        # Source and sink capacity limits
-        self.maxflow_model.addConstr(self.flow_var[self.super_edge] <= self.MAX_SOURCE_FLOW, name="max_source_flow")
-    
-        self.maxflow_model.addConstrs((self.flow_var[e] <= self.MAX_SINK_NEED for e in self.edge_groups[self.sink_nodes[0]]['in']),
-                                      name="sink_node_max_capacities"
-        )
+        # Source and sink capacity limits   INCORPORATE THESE INTO RESET WITH EDGE CAPACITIES
+#        self.maxflow_model.addConstr(self.flow_var[self.super_edge] <= self.MAX_SOURCE_FLOW, name="max_source_flow")
+#    
+#        self.maxflow_model.addConstrs((self.flow_var[e] <= self.MAX_SINK_NEED for e in self.edge_groups[self.super_sink_nodes[0]]['in']),
+#                                      name="sink_node_max_capacities"
+#        )
 
     def _update_capacity_constraints(self):
         """LEGACY Update edge capacity constraints based on current interdiction state."""
         # Calculate current edge capacities considering interdiction
         # Ensure probabilities are float to avoid integer power errors
-        probs = self.state["edge_interdiction_probability"][:self.num_interdictable_edges].astype(float)
-        interdicted = self.state["edge_interdicted"][:self.num_interdictable_edges].astype(int)
+        probs = self.state["edge_interdiction_probability"][:self.num_both_edges].astype(float)
+        interdicted = self.state["edge_interdicted"][:self.num_both_edges].astype(int)
     
         # Compute success probabilities
         success_probs = (1.0 - probs) ** interdicted
     
         # Generate binomial outcomes
-        upper_bounds = np.random.binomial(1, success_probs) * self.state["edge_capacity"][:self.num_interdictable_edges]
+        upper_bounds = np.random.binomial(1, success_probs) * self.state["edge_capacity"][:self.num_both_edges]
     
         # Remove old capacity constraints if they exist
         if hasattr(self, 'forward_cons'):
             self.maxflow_model.remove(self.forward_cons)
+            self.maxflow_model.remove(self.reverse_cons)
 
         # Single batch addition for forward constraints
         self.forward_cons = self.maxflow_model.addConstrs((
-            self.flow_var[e] <= upper_bounds[idx % self.num_interdictable_edges] * self.edge_used[e] 
-            for idx, e in enumerate(self.all_interdictable_edges)), name="flow_capacity_forward")
+            self.flow_var[e] <= upper_bounds[idx % self.num_both_edges] * self.edge_used[e] 
+            for idx, e in enumerate(self.both_edges)), name="flow_capacity_forward")
+
+        self.reverse_cons = self.maxflow_model.addConstrs((
+            self.flow_var[(e[1],e[0])] <= upper_bounds[idx % self.num_both_edges] * self.edge_used[(e[1],e[0])] 
+            for idx, e in enumerate(self.both_edges)), name="flow_capacity_reverse")
 
     def _update_capacity_constraints_from_dict(self, capacity_dict):
         """
@@ -372,10 +361,15 @@ class CustomEnv(gym.Env):
         """
         if hasattr(self, 'forward_cons'):
             self.maxflow_model.remove(self.forward_cons)
+            self.maxflow_model.remove(self.reverse_cons)
 
         self.forward_cons = self.maxflow_model.addConstrs((
             self.flow_var[e] <= capacity_dict.get(e, 0) * self.edge_used[e] 
-            for idx, e in enumerate(self.all_interdictable_edges)), name="flow_capacity_forward")
+            for idx, e in enumerate(self.both_edges)), name="flow_capacity_forward")
+
+        self.reverse_cons = self.maxflow_model.addConstrs((
+            self.flow_var[(e[1],e[0])] <= capacity_dict.get(e, 0) * self.edge_used[(e[1],e[0])] 
+            for idx, e in enumerate(self.both_edges)), name="flow_capacity_reverse")
         
     def _set_routing_objectives(self, routing_assumption):
         """Set model objectives based on routing assumption."""
@@ -385,43 +379,33 @@ class CustomEnv(gym.Env):
         
         if routing_assumption == "gurobi_default":
             self.maxflow_model.setObjective(self.flow_var[self.super_edge], grb.GRB.MAXIMIZE)
-        elif routing_assumption == "consolidated":
-            # Primary: Maximize flow
-            self.maxflow_model.setObjectiveN(self.flow_var[(len(self.nodes),1)], index=0, priority=2, weight=1.0, 
-                                             abstol=0.0, reltol=0.0, name="max_flow")
-        
-            # Secondary: Minimize edges used
-            self.maxflow_model.setObjectiveN(grb.quicksum(self.edge_used[e] for e in self.mf_all_edges), index=1, priority=1, weight=-1.0,
-                                             abstol=0.0, reltol=0.0, name="min_edges")
-        elif routing_assumption == "distributed":
-            # Primary: Maximize flow
-            self.maxflow_model.setObjectiveN(self.flow_var[(len(self.nodes),1)], index=0, priority=3, weight=1.0, 
+        else:
+             # Primary: Maximize flow
+            self.maxflow_model.setObjectiveN(self.flow_var[self.super_edge], index=0, priority=3, weight=1.0, 
                                              abstol=0.0, reltol=0.0, name="max_flow")
 
-            # Secondary: Maximize edges used
-            self.maxflow_model.setObjectiveN(grb.quicksum(self.edge_used[e] for e in self.mf_all_edges), index=1, priority=2, weight=1.0,
-                                             abstol=0.0, reltol=0.0, name="max_edges")
+            if routing_assumption == "consolidated":
+                # Secondary: Minimize edges used
+                self.maxflow_model.setObjectiveN(grb.quicksum(self.edge_used[e] for e in self.all_both_edges), index=1, priority=1, weight=-1.0,
+                                                 abstol=0.0, reltol=0.0, name="min_edges")
+            elif routing_assumption == "distributed":
+                # Secondary: Maximize edges used
+                self.maxflow_model.setObjectiveN(grb.quicksum(self.edge_used[e] for e in self.all_both_edges), index=1, priority=2, weight=1.0,
+                                                 abstol=0.0, reltol=0.0, name="max_edges")
             
-            # Tertiary: Minimize the number of edges used
-            self.maxflow_model.setObjectiveN(grb.quicksum(self.flow_var[e] for e in self.mf_all_edges), index=1, priority=1, weight=-1.0,
-                                             abstol=0.0, reltol=0.0, name="max_edges")
-        elif routing_assumption == "least_vulnerable":
-            # Primary: Maximize flow
-            self.maxflow_model.setObjectiveN(self.flow_var[(len(self.nodes),1)], index=0, priority=2, weight=1.0, 
-                                             abstol=0.0, reltol=0.0, name="max_flow")
-        
-            # Secondary: Minimize vulnerability (weighted by interdiction probability)
-            self.maxflow_model.setObjectiveN(grb.quicksum(self.state["edge_interdiction_probability"][ind]*
-                                                          (self.flow_var[e]+self.flow_var[(e[1],e[0])]) 
-                                                          for ind, e in enumerate(self.interdictable_edges)), index=1, priority=1, weight=-1.0,
-                                             abstol=0.0, reltol=0.0, name="least_vulnerable")
-        else:
-            raise ValueError(f"Unknown routing assumption: {routing_assumption}")
+            elif routing_assumption == "least_vulnerable":
+                # Secondary: Minimize vulnerability (weighted by interdiction probability)
+                self.maxflow_model.setObjectiveN(grb.quicksum(self.state["edge_interdiction_probability"][ind]*
+                                                              (self.flow_var[e]+self.flow_var[(e[1],e[0])]) 
+                                                              for ind, e in enumerate(self.both_edges)), index=1, priority=1,
+                                                 weight=-1.0, abstol=0.0, reltol=0.0, name="least_vulnerable")
+            else:
+                raise ValueError(f"Unknown routing assumption: {routing_assumption}")
     
         self.old_routing = routing_assumption
     
     # BEGIN Gymnasium Environment Methods        
-    def reset(self, seed=None, options=None):
+    def reset(self, seed=None, options=None):                                    #PICKUP HERE!!!!  - Need to remember indexes for sink edges, source edges, and all non-interdictable edges so I can set capacities and interdiction probabilites after sampling
         """Reset the environment to initial state and return observation."""
         # Clean up any existing models
         self._cleanup_models()
@@ -433,18 +417,18 @@ class CustomEnv(gym.Env):
 
         # Generate network parameters
         # Sample edge capacities
-        raw_capacities = self.base_spaces['edge_capacity'].sample()[:self.actual_num_edges]
+        raw_capacities = self.base_spaces['edge_capacity'].sample()[:self.num_all_edges]
         edge_capacities = ((raw_capacities / 100.0) * (self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[1]-self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[0]) + self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[0]).astype(int)
         
         # Sample edge costs and interdiction probabilities
-        raw_costs = self.base_spaces['edge_costs'].sample()[:self.actual_num_edges]
+        raw_costs = self.base_spaces['edge_costs'].sample()[:self.num_all_edges]
         edge_costs = (((raw_costs) / 10) * (self.DEFAULT_TRAINING_EDGE_COST_RANGE[1]-self.DEFAULT_TRAINING_EDGE_COST_RANGE[0]) + self.DEFAULT_TRAINING_EDGE_COST_RANGE[0]).astype(int)
         
         #Sample interdiction probabilities based on deterministic setting
         if self.deterministic_outcomes:
             edge_interdiction_probabilities = np.ones(self.max_num_edges, dtype=np.float32)
         else:
-            probs = self.base_spaces['edge_interdiction_probability'].sample()[:self.actual_num_edges]
+            probs = self.base_spaces['edge_interdiction_probability'].sample()[:self.num_all_edges]
             # Round to 0.25 increments for consistency
             sample_rounded = np.round(probs * 4)
             edge_interdiction_probabilities = (sample_rounded.astype(float) / 4)
@@ -547,23 +531,23 @@ class CustomEnv(gym.Env):
 
         # Pad all edge arrays to max_num_edges
         padded_capacities = np.zeros(self.max_num_edges, dtype=int)
-        padded_capacities[:self.actual_num_edges] = network_params['capacities']
+        padded_capacities[:self.num_all_edges] = network_params['capacities']
     
         padded_costs = np.zeros(self.max_num_edges, dtype=int)
-        padded_costs[:self.actual_num_edges] = network_params['costs']
+        padded_costs[:self.num_all_edges] = network_params['costs']
     
         padded_probabilities = np.zeros(self.max_num_edges, dtype=np.float32)
-        padded_probabilities[:self.actual_num_edges] = network_params['probabilities']
+        padded_probabilities[:self.num_all_edges] = network_params['probabilities']
         
         # Create node arrays
         departure_nodes = np.zeros(self.max_num_edges, dtype=int)
         arrival_nodes = np.zeros(self.max_num_edges, dtype=int)
-        departure_nodes[:self.actual_num_edges] = np.array(self.edge_departures)
-        arrival_nodes[:self.actual_num_edges] = np.array(self.edge_arrivals)
+        departure_nodes[:self.num_all_edges] = np.array(self.edge_departures)
+        arrival_nodes[:self.num_all_edges] = np.array(self.edge_arrivals)
 
         # CREATE EXPLICIT PADDING MASK
         padding_mask = np.zeros(self.max_num_edges, dtype=np.float32)
-        padding_mask[:self.actual_num_edges] = 1.0  # Mark valid edges as 1
+        padding_mask[:self.num_all_edges] = 1.0  # Mark valid edges as 1
     
         return {
             'edge_capacity': padded_capacities,  
@@ -646,7 +630,7 @@ class CustomEnv(gym.Env):
         path_edges = []
         current_node = 1
         visited = {1}
-        sink = self.sink_nodes[0]
+        sink = self.super_sink_nodes[0]
     
         while current_node != sink:
             valid_edges = [e for e in self.edge_groups[current_node]['out'] if e[1] not in visited and e[1] >= current_node - 1]
@@ -669,7 +653,7 @@ class CustomEnv(gym.Env):
         """Extract the path with maximum flow from flows dictionary."""
         from_path = set()
         current_node = 1
-        sink = self.sink_nodes[0]
+        sink = self.super_sink_nodes[0]
     
         while current_node != sink:
             outgoing_edges = self.edge_groups[current_node]['out']
@@ -684,7 +668,7 @@ class CustomEnv(gym.Env):
         path_edges = set()
         current_node = 1
         visited = {1}
-        sink = self.sink_nodes[0]
+        sink = self.super_sink_nodes[0]
     
         while current_node != sink:
             valid_edges = []
@@ -718,6 +702,26 @@ class CustomEnv(gym.Env):
     
         return path_edges
 
+    def _cache_flow_array(self):
+        """Fully vectorized cache using array indexing."""
+        num_edges = self.num_interdictable_edges
+    
+        # Pre-allocate
+        flow_array = np.zeros(num_edges, dtype=np.float32)
+    
+        # Vectorized extraction using list comprehension
+        edges = self.interdictable_edges
+        flows = self.reference_flows
+    
+        # Batch get operations
+        forward_keys = edges
+        reverse_keys = [(e[1], e[0]) for e in edges]
+    
+        # Vectorized lookup and sum
+        flow_array = np.array([flows.get(fk, 0) + flows.get(rk, 0) for fk, rk in zip(forward_keys, reverse_keys)], dtype=np.float32)
+    
+        self.cached_flow_array = flow_array
+    
     def step(self, action):  
         """Execute one step in the environment based on the given action."""
         # Initialize step variables
@@ -761,7 +765,7 @@ class CustomEnv(gym.Env):
         """Validate if the given action is legal."""
         ## Checks for all attacker strategies
         # Check if action is within action space
-        if action >= self.actual_num_edges:  # Padded actions are invalid
+        if action >= self.num_all_edges:  # Padded actions are invalid
             return False
     
         # Check budget constraint
@@ -1020,29 +1024,13 @@ class CustomEnv(gym.Env):
         """
         capacity_dict = {}
     
-        for idx, edge in enumerate(self.interdictable_edges):
+        for idx, edge in enumerate(self.both_edges):
             base_capacity = self.state['edge_capacity'][idx]
         
-            if self.multiple_interdiction_attempts:
-                # Each interdiction reduces capacity
-                is_interdicted = interdiction_outcome[idx]
-                remaining_capacity = 0 if is_interdicted else base_capacity
-            else:
-                # Binary: either full capacity or zero
-                is_interdicted = interdiction_outcome[idx]
-                remaining_capacity = 0 if is_interdicted else base_capacity
+            is_interdicted = interdiction_outcome[idx]
+            capacity_dict[edge] = 0 if is_interdicted else base_capacity
         
-            capacity_dict[edge] = remaining_capacity
-    
-        # Add non-interdictable edges with full capacity
-        for edge in self.edges_reset:
-            if edge not in self.interdictable_edges:
-                capacity_dict[edge] = self.state['edge_capacity'][idx]
-    
         return capacity_dict
-
-
-
     
     def _compute_objective_and_flows(self, deterministic_mode=None):
         """Calculate the max flow objective and edge flows."""
@@ -1150,7 +1138,7 @@ class CustomEnv(gym.Env):
         """Calculate total flow on edges marked in the objective."""
         objective = self.state[objective_key]
         # Get indices where objective is 1
-        target_indices = np.where(objective[:self.actual_num_edges] == 1)[0]
+        target_indices = np.where(objective[:self.num_all_edges] == 1)[0]
         
         total_flow = 0
 
@@ -1197,7 +1185,7 @@ class CustomEnv(gym.Env):
         valid_indices = np.where(padding_mask == 1)[0]
     
         print(f"\nNumber of valid (non-padded) edges: {len(valid_indices)} / {self.max_num_edges}")
-        print(f"Actual number of edges in graph: {self.actual_num_edges}")
+        print(f"Actual number of edges in graph: {self.num_all_edges}")
     
         # Budget information
         print(f"\n{'Budget Information':^80}")
@@ -1283,7 +1271,7 @@ class CustomEnv(gym.Env):
                      (self.gamma[e] if e in self.interdictable_edges else 0) >= 0 for e in self.edges_reset.keys()),
                     name="flow_conservation_reverse")
 
-                self.optimal_deterministic_model.addConstr(self.alpha[self.sink_nodes[0]]-self.alpha[self.source_nodes[0]]+self.beta[(self.sink_nodes[0],self.source_nodes[0])] >=1,
+                self.optimal_deterministic_model.addConstr(self.alpha[self.super_sink_nodes[0]]-self.alpha[self.super_source_nodes[0]]+self.beta[(self.super_sink_nodes[0],self.super_source_nodes[0])] >=1,
                                                           name = "sink-source")
             
             # Update Constraints
@@ -1297,7 +1285,7 @@ class CustomEnv(gym.Env):
             )
 
             # Define Objective Value
-            self.optimal_deterministic_model.setObjective(grb.quicksum(edge.capacity * self.beta[edge_id] for edge_id, edge in self.edges_episode.items())+self.MAX_SOURCE_FLOW*self.beta[(self.sink_nodes[0],self.source_nodes[0])], grb.GRB.MINIMIZE)
+            self.optimal_deterministic_model.setObjective(grb.quicksum(edge.capacity * self.beta[edge_id] for edge_id, edge in self.edges_episode.items())+self.MAX_SOURCE_FLOW*self.beta[(self.super_sink_nodes[0],self.super_source_nodes[0])], grb.GRB.MINIMIZE)
 
             # Optimize
             self.optimal_deterministic_model.optimize()
@@ -1309,7 +1297,7 @@ class CustomEnv(gym.Env):
 
             return self.optimal_deterministic_model.ObjVal, interdicted_edges
         
-        else:  #Solve Stochastic Case with Cormican's Formulation          #PICKUP HERE!!!!
+        else:  #Solve Stochastic Case with Cormican's Formulation          
             M = 100                       # Number of training episodes
             N = 700                   # Number of test episodes
             seed_list = [100, 200, 300]#, 400, 500]
@@ -1387,12 +1375,12 @@ class CustomEnv(gym.Env):
                 self.optimal_stochastic_model.remove(self.stochastic_source_sink_constr)
                 del self.stochastic_source_sink_constr 
 
-            self.stochastic_source_sink_constr = self.optimal_stochastic_model.addConstrs((self.stochastic_alpha[self.sink_nodes[0],s] - self.stochastic_alpha[self.source_nodes[0], s] +self.stochastic_beta[(self.sink_nodes[0],self.source_nodes[0]),s]>= 1 for s in self.scenarios), name="source_sink")
+            self.stochastic_source_sink_constr = self.optimal_stochastic_model.addConstrs((self.stochastic_alpha[self.super_sink_nodes[0],s] - self.stochastic_alpha[self.super_source_nodes[0], s] +self.stochastic_beta[(self.super_sink_nodes[0],self.super_source_nodes[0]),s]>= 1 for s in self.scenarios), name="source_sink")
 
             # Objective Function
             self.optimal_stochastic_model.setObjective((1/n_scenarios)*grb.quicksum(self.edges_episode[e].capacity * self.stochastic_beta[e, s]
                 for s in self.scenarios
-                for e in self.edges_reset) + grb.quicksum(self.MAX_SOURCE_FLOW*self.stochastic_beta[(self.sink_nodes[0],self.source_nodes[0]),s] for s in self.scenarios), grb.GRB.MINIMIZE)
+                for e in self.edges_reset) + grb.quicksum(self.MAX_SOURCE_FLOW*self.stochastic_beta[(self.super_sink_nodes[0],self.super_source_nodes[0]),s] for s in self.scenarios), grb.GRB.MINIMIZE)
         
         # Scenario generation
         scenario_outcomes = np.random.binomial(1, self.state["edge_interdiction_probability"], 
@@ -1473,7 +1461,7 @@ class CustomEnv(gym.Env):
                 self.optimal_stochastic_model_IM.remove(self.stochastic_source_sink_constr_IM)
                 del self.stochastic_source_sink_constr_IM
 
-            self.stochastic_source_sink_constr_IM = self.optimal_stochastic_model_IM.addConstrs((self.stochastic_alpha_IM[self.sink_nodes[0],s] - self.stochastic_alpha_IM[self.source_nodes[0], s] >= 1 for s in self.scenarios_IM), name="source_sink_IM")
+            self.stochastic_source_sink_constr_IM = self.optimal_stochastic_model_IM.addConstrs((self.stochastic_alpha_IM[self.super_sink_nodes[0],s] - self.stochastic_alpha_IM[self.super_source_nodes[0], s] >= 1 for s in self.scenarios_IM), name="source_sink_IM")
 
             # Objective Function
             self.optimal_stochastic_model_IM.setObjective((1/n_scenarios)*grb.quicksum(self.edges_episode[e].capacity * self.stochastic_beta_IM[e, s]
@@ -1530,7 +1518,7 @@ class CustomEnv(gym.Env):
         """
         
         # Calculate minimum edge cost for depth estimation (only from real edges)
-        real_edge_costs = self.state['edge_costs'][:self.actual_num_edges]
+        real_edge_costs = self.state['edge_costs'][:self.num_all_edges]
         self.min_edge_cost = min(real_edge_costs[real_edge_costs > 0], default=float('inf'))
         if self.min_edge_cost == float('inf'):
             self.min_edge_cost = 1  # Fallback
@@ -1538,7 +1526,7 @@ class CustomEnv(gym.Env):
         # Estimate total states
         max_budget = self.state['budget'][0]
         budget_levels = max_budget // self.min_edge_cost
-        estimated_states = self.actual_num_edges ** budget_levels  # Use actual_num_edges, not max
+        estimated_states = self.num_all_edges ** budget_levels  # Use actual_num_edges, not max
         update_rate = max(estimated_states // 20, 1)
         
         # Memoization dictionary: state -> (max_reward, best_action_sequence)
@@ -1567,7 +1555,7 @@ class CustomEnv(gym.Env):
         
             # Check if we've already solved this state
             if state_key in memo:
-                update_progress(self.actual_num_edges**(budget_levels-depth))
+                update_progress(self.num_all_edges**(budget_levels-depth))
                 return memo[state_key]
 
             temp_state = self.state.copy()
@@ -1594,22 +1582,22 @@ class CustomEnv(gym.Env):
             if remaining_budget < self.min_edge_cost or depth >= 20:
                                
                 memo[state_key] = (final_objective, [])
-                update_progress(self.actual_num_edges**(budget_levels-depth))
+                update_progress(self.num_all_edges**(budget_levels-depth))
                 return final_objective, []
        
             # Find all valid actions from current state
             valid_actions = []
-            for action in range(self.actual_num_edges):
+            for action in range(self.num_all_edges):
                 edge = self.interdictable_edges[action]
                 if self._validate_action(action, [remaining_budget], interdicted_state): # and (flows.get(edge, 0) != 0 or flows.get((edge[1],edge[0]), 0) != 0):
                     valid_actions.append(action)
                 else:
-                    update_progress(self.actual_num_edges**(budget_levels-(depth+1)))
+                    update_progress(self.num_all_edges**(budget_levels-(depth+1)))
         
             # If no valid actions, evaluate terminal state
             if not valid_actions:
                 memo[state_key] = (final_objective, [])
-                update_progress(self.actual_num_edges**(budget_levels-depth))
+                update_progress(self.num_all_edges**(budget_levels-depth))
                 return final_objective, []
         
             # Evaluate each possible action
