@@ -1,11 +1,11 @@
 node,x_pos,y_pos,type
 1,0.1,2.65,source
-2,23.8,51.5,intermediate
-3,23.9,51.3,intermediate
-4,23.5,50.8,intermediate
-5,23.2,50.5,intermediate
-6,24.5,49.2,intermediate
-7,26.5,46,intermediate
+2,23.814,51.18,intermediate
+3,24.097,50.83,intermediate
+4,22.94,49.803,intermediate
+5,22.145,48.56,intermediate
+6,25.96,48.029,intermediate
+7,28.814,45.353,intermediate
 8,24.5,51.2,intermediate
 9,24.3,50.9,intermediate
 10,24,50.6,intermediate
@@ -21,7 +21,7 @@ node,x_pos,y_pos,type
 20,27,49.5,intermediate
 21,27.5,49.8,intermediate
 22,27.5,50.2,intermediate
-23,27.5,47,intermediate
+23,30.702,46.483,intermediate
 24,28.5,47.8,intermediate
 25,28.5,48.5,intermediate
 26,29,49,intermediate
