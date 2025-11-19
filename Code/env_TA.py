@@ -141,8 +141,6 @@ class CustomEnv(gym.Env):
             self.edge_departures.append(key[0])
             self.edge_arrivals.append(key[1])
 
-        #self.both_edges = self.noninterdictable_edges + self.interdictable_edges
-
         self.all_interdictable_edges = list(self.interdictable_edges) + [(v, u) for (u, v) in self.interdictable_edges]
         self.all_noninterdictable_edges = list(self.noninterdictable_edges) + [(v, u) for (u, v) in self.noninterdictable_edges]
 
@@ -183,6 +181,7 @@ class CustomEnv(gym.Env):
         self.sink_nodes = []
         for edge_id in self.edge_groups[self.super_sink_nodes[0]]['in']:
             self.sink_nodes.append(edge_id[0])
+        self.num_sink_nodes = len(self.sink_nodes)
             
     def _setup_spaces(self):
         """Setup observation and action spaces based on environment configuration."""
@@ -237,9 +236,7 @@ class CustomEnv(gym.Env):
         observation_dict = {**self.base_spaces, **self.strategy_spaces.get(self.attacker_strategy, {})}
         return spaces.Dict(observation_dict)
     
-    def solve_max_flow(self, capacity_dict=None,
-                       interdicted_edges=None,
-                       routing_assumption = "gurobi_default"):  
+    def solve_max_flow(self, capacity_dict=None, routing_assumption = "gurobi_default"):  
         """
         Solve the Max Flow network problem, output objective value and edge flows.
     
@@ -248,8 +245,6 @@ class CustomEnv(gym.Env):
         capacity_dict : dict, optional
             If provided, uses this capacity dictionary instead of current state.
             Useful for batch solving with different capacity configurations.
-        interdicted_edges : list, optional
-            List of interdicted edges (for compatibility, can be ignored if using capacity_dict)
         routing_assumption : str
             Routing optimization objective ('gurobi_default', 'canalize', etc.)
     
@@ -477,8 +472,6 @@ class CustomEnv(gym.Env):
         self.last_obj = self.reference_obj
         self.reference_budget = remaining_budget[0]
 
-        self._cache_flow_array()
-
         return self.state, {}
 
     def _cleanup_models(self):
@@ -577,13 +570,13 @@ class CustomEnv(gym.Env):
     
         return handler() if self.attacker_strategy == "zero_sum" else handler(base_state)
 
-    def _add_canalize_components(self, base_state):                                     #PICKUP HERE!!!! - Ensure Randomness is seeded for find_simple_path
+    def _add_canalize_components(self, base_state):
         """Add canalize-specific objective to state."""
         path_edges = self._find_simple_path()
         canalize_objective = np.zeros(self.max_num_edges, dtype=int)
         
         # Create boolean mask for path edges
-        edge_in_path = np.array([edge in path_edges or (edge[1], edge[0]) in path_edges for edge in self.interdictable_edges], dtype=bool)
+        edge_in_path = np.array([edge in path_edges or (edge[1], edge[0]) in path_edges for edge in self.both_edges], dtype=bool)
 
         # Vectorized assignment
         canalize_objective[:len(edge_in_path)] = edge_in_path.astype(int)
@@ -594,8 +587,10 @@ class CustomEnv(gym.Env):
         """Add isolate-specific objective to state (edge-based, sink-connected only)."""
         # Create padded objective with at least 1 marked sink edge
         isolate_objective = np.zeros(self.max_num_edges, dtype=int)
-        num_to_mark = np.random.randint(1, self.num_cached_sink_edge_indices + 1)
-        marked_indices = np.random.choice(self.cached_sink_edge_indices, size=num_to_mark, replace=False)
+        num_to_mark = np.random.randint(1, self.num_sink_nodes + 1)
+        chosen_nodes = np.random.choice(self.sink_nodes, size = num_to_mark, replace=False)
+        
+        marked_indices = np.where(np.isin(self.edge_departures, chosen_nodes) | np.isin(self.edge_arrivals, chosen_nodes))[0].tolist()
         isolate_objective[marked_indices] = 1
     
         return {**base_state, 'isolate_objective': isolate_objective}
@@ -690,7 +685,7 @@ class CustomEnv(gym.Env):
                 
                     valid_edges.append(edge)
         
-            if not valid_edges:
+            if not valid_edges or len(visited)>self.MAX_PATH_LENGTH:
                 # Restart if no valid path
                 current_node = 1
                 visited = {1}
@@ -703,28 +698,8 @@ class CustomEnv(gym.Env):
             current_node = selected_edge[1]
     
         return path_edges
-
-    def _cache_flow_array(self):
-        """Fully vectorized cache using array indexing."""
-        num_edges = self.num_both_edges
     
-        # Pre-allocate
-        flow_array = np.zeros(num_edges, dtype=np.float32)
-    
-        # Vectorized extraction using list comprehension
-        edges = self.interdictable_edges
-        flows = self.reference_flows
-    
-        # Batch get operations
-        forward_keys = edges
-        reverse_keys = [(e[1], e[0]) for e in edges]
-    
-        # Vectorized lookup and sum
-        flow_array = np.array([flows.get(fk, 0) + flows.get(rk, 0) for fk, rk in zip(forward_keys, reverse_keys)], dtype=np.float32)
-    
-        self.cached_flow_array = flow_array
-    
-    def step(self, action):  
+    def step(self, action):                                                     
         """Execute one step in the environment based on the given action."""
         # Initialize step variables
         done = False
@@ -742,8 +717,12 @@ class CustomEnv(gym.Env):
         
         # Apply action effects
         if valid_action:
-            #Determine reward and decrement budget
-            remaining_budget = self._apply_valid_action(action, remaining_budget)
+            # Deduct cost from budget
+            remaining_budget[0] = remaining_budget[0] - self.state['edge_costs'][action]
+    
+            # Mark edge as interdicted
+            self.state['edge_interdicted'][action] += 1
+            
             #Compute Rewards
             strategy_calculators = {"zero_sum": self._calculate_zero_sum_reward,
                                     "canalize": self._calculate_canalize_reward,
@@ -753,7 +732,8 @@ class CustomEnv(gym.Env):
             reward = calculator()
         else:
             #Determine penalty and decrement budget
-            reward, remaining_budget = self._apply_invalid_action(action, remaining_budget)
+            reward = self.PENALTY_VALUE
+            remaining_budget[0] = max(0, remaining_budget[0] - self.state['edge_costs'][action])
 
         # Check if episode is complete
         done = self._is_episode_complete(remaining_budget)
@@ -767,7 +747,7 @@ class CustomEnv(gym.Env):
         """Validate if the given action is legal."""
         ## Checks for all attacker strategies
         # Check if action is within action space
-        if action >= self.num_all_edges:  # Padded actions are invalid
+        if action >= self.num_both_edges:  # Padded actions are invalid
             return False
     
         # Check budget constraint
@@ -790,7 +770,7 @@ class CustomEnv(gym.Env):
         ## Attacker Strategy Specific Checks
         # Zero-Sum - Check target has previous flow
     #    if self.attacker_strategy == 'zero_sum':
-        edge = self.interdictable_edges[action]
+        edge = self.both_edges[action]
         if self.reference_flows[edge] == 0 and self.reference_flows[(edge[1],edge[0])] == 0:
             return False
         
@@ -806,55 +786,17 @@ class CustomEnv(gym.Env):
         
         return True
         
-    def _apply_valid_action(self, action, remaining_budget):
-        """Apply the effects of a valid action."""
-        # Deduct cost from budget
-        remaining_budget[0] = remaining_budget[0] - self.state['edge_costs'][action]
-    
-        # Mark edge as interdicted
-        self.state['edge_interdicted'][action] += 1
-    
-        return remaining_budget
-
-    def _apply_invalid_action(self, action, remaining_budget):
-        """Apply penalty for invalid action."""
-        penalty = self.PENALTY_VALUE
-        remaining_budget[0] = max(0, remaining_budget[0] - self.state['edge_costs'][action])
-        return penalty, remaining_budget
-
-    def _calculate_zero_sum_reward(self):
+    def _calculate_zero_sum_reward(self):                         
         """Calculate reward for zero-sum strategy (maximize disruption)."""
         objective_value, self.reference_flows = self._compute_objective_and_flows()
         reward = max(self.last_obj - objective_value, 0) / self.reference_budget
         if reward > 0:
             self.last_obj = objective_value   
-        elif reward ==0:
+        elif reward == 0:
             reward = self.PENALTY_VALUE
         return reward
 
-    def _calculate_stochastic_objective_and_flow(self, strategy_type="zero_sum", use_optimized=False):
-        """
-        Calculate stochastic objective and flows using Monte Carlo sampling.
-        
-        Parameters:
-        -----------
-        strategy_type : str
-            Type of attacker strategy ('zero_sum', 'canalize', 'isolate', 'divert')
-        use_optimized : bool
-            If True, uses optimized approach (group outcomes and solve once per unique state)
-            If False, uses legacy approach (solve for each sample)
-    
-        Returns:
-        --------
-        tuple: (mean_objective, mean_flows)
-        """
-    
-        if use_optimized:
-            return self._calculate_stochastic_optimized(strategy_type)
-        else:
-            return self._calculate_stochastic_legacy(strategy_type)
-
-    def _calculate_stochastic_optimized(self, strategy_type="zero_sum"):
+    def _calculate_stochastic_objective_and_flow(self, strategy_type="zero_sum"):
         """
         Optimized stochastic calculation: group by unique outcomes and weight by probability.
     
@@ -867,10 +809,11 @@ class CustomEnv(gym.Env):
         # Extract interdiction probabilities
         probs = self.state['edge_interdiction_probability'][:self.num_both_edges]
         interdicted = self.state['edge_interdicted'][:self.num_both_edges].astype(int)
+        total_samples = self.SAMPLE_SIZE
     
         # Sample interdiction outcomes
         outcome_samples = []
-        for _ in range(self.SAMPLE_SIZE):
+        for _ in range(total_samples):
             # For each edge, determine if interdiction succeeds based on probability
             
             # Create outcome tuple (which edges are successfully interdicted)
@@ -890,22 +833,26 @@ class CustomEnv(gym.Env):
         outcome_counts = Counter(outcome_samples)
         unique_outcomes = list(outcome_counts.keys())
     
- #       print(f"  Optimized stochastic: {len(unique_outcomes)} unique outcomes from {self.SAMPLE_SIZE} samples")
-    
         # Solve max flow once per unique outcome
         outcome_results = {}
         for outcome in unique_outcomes:
-            # Convert outcome to capacity dict
-            capacity_dict = self._create_capacity_dict_from_outcome(outcome)
+            # Convert outcome to capacity dict that maps each edge to remaining capacity after interdictions.
+            capacity_dict = {}
+    
+            for idx, edge in enumerate(self.both_edges):
+                base_capacity = self.state['edge_capacity'][idx]
+        
+                is_interdicted = outcome[idx]
+                capacity_dict[edge] = 0 if is_interdicted else base_capacity
         
             # Solve max flow for this outcome
-            obj, flows = self.solve_max_flow(capacity_dict, list(outcome))
+            obj, flows = self.solve_max_flow(capacity_dict)
         
             # Calculate strategy-specific objective
             if strategy_type == "zero_sum":
                 objective = obj
             elif strategy_type == "canalize":
-                objective = self._calculate_target_path_flow(flows, 'canalize_objective')
+                objective = self._calculate_target_path_flow(flows, 'canalize_objective') 
             elif strategy_type == "isolate":
                 objective = self._calculate_target_edge_flow(flows, 'isolate_objective')
             elif strategy_type == "divert":
@@ -921,7 +868,6 @@ class CustomEnv(gym.Env):
                 'count': outcome_counts[outcome]
             }
         # Compute weighted averages
-        total_samples = sum(outcome_counts.values())
         weighted_objective = sum(
             result['objective'] * result['count'] / total_samples
             for result in outcome_results.values()
@@ -935,104 +881,6 @@ class CustomEnv(gym.Env):
                 weighted_flows[edge] += flow * weight
     
         return weighted_objective, dict(weighted_flows)
-
-
-    def _calculate_stochastic_legacy(self, strategy_type="zero_sum"):
-        """
-        Legacy Calculate objective value under stochastic interdiction outcomes.
-        
-        Args:
-            strategy_type: One of 'zero_sum', 'canalize', 'isolate', or 'divert'
-        
-        Returns:
-            mean_objective: Mean objective across all Monte Carlo iterations
-        """
-        if self.multiple_interdiction_attempts:
-            edges_interdicted = (self.state['edge_interdicted'] > 0).astype(int)
-            success_probs = ((1 - self.state['edge_interdiction_probability']) ** 
-                            self.state['edge_interdicted'])
-            prob_array = edges_interdicted * success_probs
-        else:
-            prob_array = (self.state['edge_interdicted'] * 
-                         self.state['edge_interdiction_probability'])
-
-        non_zero_probs = prob_array[prob_array != 0]
-        if non_zero_probs.size == 0:
-            iterations = 1
-        else:
-            mean_prob = np.mean(non_zero_probs)
-            if mean_prob <= 0.5:
-                iterations = int(1 + (1000 - 1) * (mean_prob / 0.5))
-            else:
-                iterations = int(1000 - (1000 - 1) * ((mean_prob - 0.5) / 0.5))
-        
-        objectives = []
-        all_flows = []  # Store flows from each iteration
-
-    
-        for _ in range(iterations):
-            # Solve max flow for this iteration
-            max_flow_obj, flows = self.solve_max_flow()
-            all_flows.append(flows)  # Store the flows
-        
-            # Compute the objective based on strategy type
-            if strategy_type == 'zero_sum':
-                objective = max_flow_obj
-            
-            elif strategy_type == 'canalize':
-                objective = self._calculate_target_path_flow(flows, 'canalize_objective')
-            
-            elif strategy_type == 'isolate':
-                objective = self._calculate_target_edge_flow(flows, 'isolate_objective')
-            
-            elif strategy_type == 'divert':
-                from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
-                to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
-                
-                diverted_flow_from = self.reference_start_flows[0] - from_flow
-                diverted_flow_to = to_flow - self.reference_start_flows[1] 
-                objective = np.min([diverted_flow_from,diverted_flow_to])
-            
-            objectives.append(objective)
-
-        # Compute mean flows across all iterations
-        mean_flows = {}
-        if all_flows:
-            # Get all unique edges across all iterations
-            all_edges = set()
-            for flow_dict in all_flows:
-                all_edges.update(flow_dict.keys())
-        
-            # Compute mean for each edge
-            for edge in all_edges:
-                edge_flows = [flow_dict.get(edge, 0) for flow_dict in all_flows]
-                mean_flows[edge] = np.mean(edge_flows)
-        
-        # Return mean objective and mean flows
-        return np.mean(objectives), mean_flows
-
-    def _create_capacity_dict_from_outcome(self, interdiction_outcome):
-        """
-        Create capacity dictionary from interdiction outcome.
-    
-        Parameters:
-        -----------
-        interdiction_outcome : tuple or array
-            Interdiction state for each interdictable edge
-    
-        Returns:
-        --------
-        dict: Mapping from edge to remaining capacity after interdictions
-        """
-        capacity_dict = {}
-    
-        for idx, edge in enumerate(self.both_edges):
-            base_capacity = self.state['edge_capacity'][idx]
-        
-            is_interdicted = interdiction_outcome[idx]
-            capacity_dict[edge] = 0 if is_interdicted else base_capacity
-        
-        return capacity_dict
     
     def _compute_objective_and_flows(self, deterministic_mode=None):
         """Calculate the max flow objective and edge flows."""
@@ -1043,7 +891,7 @@ class CustomEnv(gym.Env):
             objective, flows = self.solve_max_flow()
         else:
             # Stochastic outcome calculation
-            objective, flows = self._calculate_stochastic_objective_and_flow('zero_sum', True)
+            objective, flows = self._calculate_stochastic_objective_and_flow('zero_sum')
     
         return objective, flows
 
@@ -1055,7 +903,7 @@ class CustomEnv(gym.Env):
             return target_path_flow, flows
         else:
             # Stochastic calculation - returns mean objective directly
-            objective, mean_flows = self._calculate_stochastic_objective_and_flow('canalize', True)
+            objective, mean_flows = self._calculate_stochastic_objective_and_flow('canalize')
             return objective, mean_flows
         
     def _calculate_canalize_reward(self):
@@ -1077,7 +925,7 @@ class CustomEnv(gym.Env):
             return target_node_flow, flows
         else:
             # Stochastic calculation - returns mean objective directly
-            objective, mean_flows = self._calculate_stochastic_objective_and_flow('isolate',True)
+            objective, mean_flows = self._calculate_stochastic_objective_and_flow('isolate')
             return objective, mean_flows
         
     def _calculate_isolate_reward(self):
@@ -1107,7 +955,7 @@ class CustomEnv(gym.Env):
             return objective, flows
         else:
             # Stochastic calculation - returns mean objectives directly
-            mean_objective, mean_flows = self._calculate_stochastic_objective_and_flow('divert',True)
+            mean_objective, mean_flows = self._calculate_stochastic_objective_and_flow('divert')
             # Return as tuple to maintain consistent interface with reward calculation
             return mean_objective, mean_flows
 
@@ -1127,7 +975,7 @@ class CustomEnv(gym.Env):
         objective = self.state[objective_key]
         target_flows = []
     
-        for idx, edge in enumerate(self.interdictable_edges):
+        for idx, edge in enumerate(self.both_edges):
             if objective[idx] == 1:
                 forward_flow = flows.get(edge, 0)
                 reverse_flow = flows.get((edge[1], edge[0]), 0)
@@ -1140,11 +988,11 @@ class CustomEnv(gym.Env):
         """Calculate total flow on edges marked in the objective."""
         objective = self.state[objective_key]
         # Get indices where objective is 1
-        target_indices = np.where(objective[:self.num_all_edges] == 1)[0]
+        target_indices = np.where(objective[:self.num_both_edges] == 1)[0]
         
         total_flow = 0
 
-        target_edges = [self.interdictable_edges[i] for i in target_indices]
+        target_edges = [self.both_edges[i] for i in target_indices]
     
         # Batch get flows
         flows_array = np.array([(flows.get(edge, 0) + flows.get((edge[1], edge[0]), 0)) for edge in target_edges])
@@ -1152,7 +1000,7 @@ class CustomEnv(gym.Env):
         # Return sum flow among target nodes
         return np.sum(flows_array) #np.sum(total_flow)
 
-    def _is_episode_complete(self, remaining_budget):
+    def _is_episode_complete(self, remaining_budget):                             #PICKUP HERE!!!!
         """Determine if the episode should end."""
         # Calculate minimum resources needed for next action
         if self.multiple_interdiction_attempts:
@@ -1187,7 +1035,7 @@ class CustomEnv(gym.Env):
         valid_indices = np.where(padding_mask == 1)[0]
     
         print(f"\nNumber of valid (non-padded) edges: {len(valid_indices)} / {self.max_num_edges}")
-        print(f"Actual number of edges in graph: {self.num_all_edges}")
+        print(f"Actual number of edges in graph: {self.num_both_edges}")
     
         # Budget information
         print(f"\n{'Budget Information':^80}")
@@ -1520,7 +1368,7 @@ class CustomEnv(gym.Env):
         """
         
         # Calculate minimum edge cost for depth estimation (only from real edges)
-        real_edge_costs = self.state['edge_costs'][:self.num_all_edges]
+        real_edge_costs = self.state['edge_costs'][:self.num_both_edges]
         self.min_edge_cost = min(real_edge_costs[real_edge_costs > 0], default=float('inf'))
         if self.min_edge_cost == float('inf'):
             self.min_edge_cost = 1  # Fallback
@@ -1528,7 +1376,7 @@ class CustomEnv(gym.Env):
         # Estimate total states
         max_budget = self.state['budget'][0]
         budget_levels = max_budget // self.min_edge_cost
-        estimated_states = self.num_all_edges ** budget_levels  # Use actual_num_edges, not max
+        estimated_states = self.num_both_edges ** budget_levels  # Use actual_num_edges, not max
         update_rate = max(estimated_states // 20, 1)
         
         # Memoization dictionary: state -> (max_reward, best_action_sequence)
