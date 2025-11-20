@@ -611,13 +611,13 @@ class CustomEnv(gym.Env):
     
         # Convert paths to objective arrays
         divert_from = np.zeros(self.max_num_edges, dtype=int)
-        for e, edge in enumerate(self.interdictable_edges):
+        for e, edge in enumerate(self.both_edges):
             if edge in from_path or (edge[1],edge[0]) in from_path:
                 divert_from[e] = 1
         # Padded entries remain 0
     
         divert_to = np.zeros(self.max_num_edges, dtype=int)
-        for e, edge in enumerate(self.interdictable_edges):
+        for e, edge in enumerate(self.both_edges):
             if edge in to_path or (edge[1],edge[0]) in to_path:
                 divert_to[e] = 1
         return {**base_state, 'divert_from_objective': divert_from, 'divert_to_objective': divert_to}
@@ -1000,7 +1000,7 @@ class CustomEnv(gym.Env):
         # Return sum flow among target nodes
         return np.sum(flows_array) #np.sum(total_flow)
 
-    def _is_episode_complete(self, remaining_budget):                             #PICKUP HERE!!!!
+    def _is_episode_complete(self, remaining_budget):
         """Determine if the episode should end."""
         # Calculate minimum resources needed for next action
         if self.multiple_interdiction_attempts:
@@ -1100,7 +1100,7 @@ class CustomEnv(gym.Env):
         print("=" * 80)
         # END Gymnasium Environment Methods
             
-    def solve_optimal_interdiction(self):
+    def solve_optimal_interdiction(self):                                                                 #PICKUP HERE!!!!
         if self.deterministic_outcomes == True: #Solve Deterministic Case with Wood's Max/Min Formulation
             if not hasattr(self, 'optimal_deterministic_model'):
                 # Initialize the Gurobi model
@@ -1405,7 +1405,7 @@ class CustomEnv(gym.Env):
         
             # Check if we've already solved this state
             if state_key in memo:
-                update_progress(self.num_all_edges**(budget_levels-depth))
+                update_progress(self.num_both_edges**(budget_levels-depth))
                 return memo[state_key]
 
             temp_state = self.state.copy()
@@ -1432,22 +1432,22 @@ class CustomEnv(gym.Env):
             if remaining_budget < self.min_edge_cost or depth >= 20:
                                
                 memo[state_key] = (final_objective, [])
-                update_progress(self.num_all_edges**(budget_levels-depth))
+                update_progress(self.num_both_edges**(budget_levels-depth))
                 return final_objective, []
        
             # Find all valid actions from current state
             valid_actions = []
-            for action in range(self.num_all_edges):
-                edge = self.interdictable_edges[action]
+            for action in range(self.num_both_edges):
+                edge = self.both_edges[action]
                 if self._validate_action(action, [remaining_budget], interdicted_state): # and (flows.get(edge, 0) != 0 or flows.get((edge[1],edge[0]), 0) != 0):
                     valid_actions.append(action)
                 else:
-                    update_progress(self.num_all_edges**(budget_levels-(depth+1)))
+                    update_progress(self.num_both_edges**(budget_levels-(depth+1)))
         
             # If no valid actions, evaluate terminal state
             if not valid_actions:
                 memo[state_key] = (final_objective, [])
-                update_progress(self.num_all_edges**(budget_levels-depth))
+                update_progress(self.num_both_edges**(budget_levels-depth))
                 return final_objective, []
         
             # Evaluate each possible action
@@ -1483,6 +1483,6 @@ class CustomEnv(gym.Env):
         if self.attacker_strategy == "zero_sum" or self.attacker_strategy == 'isolate':
             optimal_reward = -optimal_reward
         
-        optimal_actions = [self.interdictable_edges[idx] for idx in optimal_sequence]
+        optimal_actions = [self.both_edges[idx] for idx in optimal_sequence]
 
         return optimal_reward, optimal_actions
