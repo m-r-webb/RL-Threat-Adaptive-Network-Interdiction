@@ -423,7 +423,7 @@ class CustomEnv(gym.Env):
         
         #Sample interdiction probabilities based on deterministic setting
         if self.deterministic_outcomes:
-            edge_interdiction_probabilities = np.ones(self.max_num_edges, dtype=np.float32)
+            edge_interdiction_probabilities = np.ones(self.num_both_edges, dtype=np.float32)
         else:
             probs = self.base_spaces['edge_interdiction_probability'].sample()[:self.num_both_edges]
             # Round to 0.25 increments for consistency
@@ -1100,7 +1100,7 @@ class CustomEnv(gym.Env):
         print("=" * 80)
         # END Gymnasium Environment Methods
             
-    def solve_optimal_interdiction(self):                                                                 #PICKUP HERE!!!!
+    def solve_optimal_interdiction(self):
         if self.deterministic_outcomes == True: #Solve Deterministic Case with Wood's Max/Min Formulation
             if not hasattr(self, 'optimal_deterministic_model'):
                 # Initialize the Gurobi model
@@ -1108,46 +1108,50 @@ class CustomEnv(gym.Env):
                 
                 # Define Decision Variables
                 self.alpha = self.optimal_deterministic_model.addVars(self.nodes.keys(), vtype=grb.GRB.BINARY, name="alpha")
-                self.beta = self.optimal_deterministic_model.addVars(self.edges_with_sink_source, vtype=grb.GRB.BINARY, name="beta")
-                self.gamma = self.optimal_deterministic_model.addVars(self.interdictable_edges, vtype=grb.GRB.BINARY, name="gamma")
+                self.beta = self.optimal_deterministic_model.addVars(self.both_edges, vtype=grb.GRB.BINARY, name="beta")
+                self.gamma = self.optimal_deterministic_model.addVars(self.both_edges, vtype=grb.GRB.BINARY, name="gamma")
                 
                 # Define Constraints
                 self.optimal_deterministic_model.addConstrs(
-                    (self.alpha[e[0]] - self.alpha[e[1]] + self.beta[e] + 
-                     (self.gamma[e] if e in self.interdictable_edges else 0) >= 0 for e in self.edges_reset.keys()), name="flow_conservation")
+                    (self.alpha[e[0]] - self.alpha[e[1]] + self.beta[e] + self.gamma[e] >= 0 for e in self.both_edges),
+                    name="flow_conservation")
 
                 self.optimal_deterministic_model.addConstrs(
-                    (self.alpha[e[1]] - self.alpha[e[0]] + self.beta[e] + 
-                     (self.gamma[e] if e in self.interdictable_edges else 0) >= 0 for e in self.edges_reset.keys()),
+                    (self.alpha[e[1]] - self.alpha[e[0]] + self.beta[e] + self.gamma[e] >= 0 for e in self.both_edges),
                     name="flow_conservation_reverse")
 
-                self.optimal_deterministic_model.addConstr(self.alpha[self.super_sink_nodes[0]]-self.alpha[self.super_source_nodes[0]]+self.beta[(self.super_sink_nodes[0],self.super_source_nodes[0])] >=1,
-                                                          name = "sink-source")
+                self.optimal_deterministic_model.addConstr(
+                    self.alpha[self.super_sink_nodes[0]] - self.alpha[self.super_source_nodes[0]] >=1, name = "sink-source")
             
             # Update Constraints
             if hasattr(self, 'budget_constr'):
                 self.optimal_deterministic_model.remove(self.budget_constr)
 
             self.budget_constr = self.optimal_deterministic_model.addConstr(
-                grb.quicksum(self.edges_episode[e].interdiction_cost * self.gamma[e]
-                             for e in self.interdictable_edges) <= self.state['budget'][0],
-                name="budget"
-            )
+                grb.quicksum(self.edges_episode[e].interdiction_cost * self.gamma[e] for e in self.both_edges) <= self.state['budget'][0],
+                name="budget")
+
+            if hasattr(self, 'interdiction_success_constr'):
+                self.optimal_deterministic_model.remove(self.interdiction_success_constr)
+
+            self.interdiction_success_constr = self.optimal_deterministic_model.addConstrs(
+                (self.gamma[e] <= self.edges_episode[e].interdiction_probability for e in self.both_edges), name="flow_conservation_reverse")
 
             # Define Objective Value
-            self.optimal_deterministic_model.setObjective(grb.quicksum(edge.capacity * self.beta[edge_id] for edge_id, edge in self.edges_episode.items())+self.MAX_SOURCE_FLOW*self.beta[(self.super_sink_nodes[0],self.super_source_nodes[0])], grb.GRB.MINIMIZE)
+            self.optimal_deterministic_model.setObjective(
+                grb.quicksum(edge.capacity * self.beta[edge_id] for edge_id, edge in self.edges_episode.items()), grb.GRB.MINIMIZE)
 
             # Optimize
             self.optimal_deterministic_model.optimize()
 
             interdicted_edges = [
-                e for e in self.interdictable_edges 
+                e for e in self.both_edges 
                 if self.gamma[e].X > 0.99  # Account for floating point precision
             ]
 
             return self.optimal_deterministic_model.ObjVal, interdicted_edges
         
-        else:  #Solve Stochastic Case with Cormican's Formulation          
+        else:  #Solve Stochastic Case with Cormican's Formulation                                #PICKUP HERE!!!!      
             M = 100                       # Number of training episodes
             N = 700                   # Number of test episodes
             seed_list = [100, 200, 300]#, 400, 500]
