@@ -76,8 +76,8 @@ class CustomEnv(gym.Env):
                  budget_range=(0, 100), edge_capacity_range=(0, 100), 
                  edge_cost_range=(0, 10), training_budget_range=(5, 10), 
                  training_edge_capacity_range=(30, 60), training_edge_cost_range=(3, 5),
-                 max_interdiction_attempts=10, max_source_flow=180, 
-                 max_sink_need=60, penalty_value=-0.1, 
+                 max_interdiction_attempts=10, max_source_flow=5, 
+                 max_sink_need=5, penalty_value=-0.1, 
                  sample_size=1000, max_path_length = 6,
                  max_num_edges=500, 
                  max_num_nodes=250, old_routing="none"):
@@ -234,7 +234,7 @@ class CustomEnv(gym.Env):
         observation_dict = {**self.base_spaces, **self.strategy_spaces.get(self.attacker_strategy, {})}
         return spaces.Dict(observation_dict)
     
-    def solve_max_flow(self, capacity_dict=None, routing_assumption = "gurobi_default"):  
+    def solve_max_flow(self, capacity_dict=None, routing_assumption = "least_vulnerable"):  
         """
         Solve the Max Flow network problem, output objective value and edge flows.
     
@@ -411,9 +411,9 @@ class CustomEnv(gym.Env):
         raw_capacities = self.base_spaces['edge_capacity'].sample()[:self.num_both_edges]
         edge_capacities = ((raw_capacities / 100.0) * (self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[1]-self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[0]) + self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[0]).astype(int)
         if self.MAX_SOURCE_FLOW is not None:
-            edge_capacities[self.super_source_out_indices] = self.MAX_SOURCE_FLOW
+            edge_capacities[self.super_source_out_indices] = self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[0] * np.random.uniform(0.5, self.MAX_SOURCE_FLOW)
         if self.MAX_SINK_NEED is not None:
-            edge_capacities[self.super_sink_in_indices] = self.MAX_SINK_NEED
+            edge_capacities[self.super_sink_in_indices] = self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[0] * np.random.uniform(0.5, self.MAX_SINK_NEED)
         
         # Sample edge costs and interdiction probabilities
         raw_costs = self.base_spaces['edge_costs'].sample()[:self.num_both_edges]
@@ -1016,7 +1016,7 @@ class CustomEnv(gym.Env):
                 return True
         return False
 
-    def render(self, mode='human'):
+    def render(self, mode='human', indices=25):
         """
         Render the environment state, displaying only values where padding_mask == 1.
         """
@@ -1046,7 +1046,7 @@ class CustomEnv(gym.Env):
         print(f"{'Index':<8} {'Origin':<8} {'Dest':<8} {'Capacity':<12} {'Cost':<8} {'Int. Prob':<12} {'Interdicted':<12}")
         print("-" * 80)
     
-        for idx in valid_indices[:25]:  # Show first 25 valid edges
+        for idx in valid_indices[:indices]:  # Show first 25 valid edges
             capacity = self.state['edge_capacity'][idx]
             cost = self.state['edge_costs'][idx]
             prob = self.state['edge_interdiction_probability'][idx]
@@ -1056,8 +1056,8 @@ class CustomEnv(gym.Env):
         
             print(f"{idx:<8} {departure_node:<8} {arrival_node:<8} {capacity:<12} {cost:<8} {prob:<12.2f} {interdicted:<12}")
     
-        if len(valid_indices) > 25:
-            print(f"... ({len(valid_indices) - 25} more valid edges)")
+        if len(valid_indices) > indices:
+            print(f"... ({len(valid_indices) - indices} more valid edges)")
     
         # Strategy-specific objectives (if present)
         strategy_objectives = {
