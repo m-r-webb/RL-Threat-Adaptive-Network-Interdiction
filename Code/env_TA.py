@@ -11,13 +11,11 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import copy, random
-#import random
 from tqdm import tqdm
 import tensorflow as tf
 tf.get_logger().setLevel('ERROR')          # Optional: Suppress Python-
 
 from collections import defaultdict, Counter
-#from collections import Counter
 
 # Class representing Node Object
 class Node():
@@ -78,8 +76,8 @@ class CustomEnv(gym.Env):
                  budget_range=(0, 100), edge_capacity_range=(0, 100), 
                  edge_cost_range=(0, 10), training_budget_range=(5, 10), 
                  training_edge_capacity_range=(30, 60), training_edge_cost_range=(3, 5),
-                 max_interdiction_attempts=10, max_source_flow=125, 
-                 max_sink_need=40, penalty_value=-0.1, 
+                 max_interdiction_attempts=10, max_source_flow=180, 
+                 max_sink_need=60, penalty_value=-0.1, 
                  sample_size=1000, max_path_length = 6,
                  max_num_edges=500, 
                  max_num_nodes=250, old_routing="none"):
@@ -299,11 +297,11 @@ class CustomEnv(gym.Env):
         )
     
         # Super source and super sink flow conservation
-        self.maxflow_model.addConstr(self.flow_var[self.super_edge] - grb.quicksum(self.flow_var[e] for e in self.edge_groups[1]['out']) == 0,
+        self.maxflow_model.addConstr(self.flow_var[self.super_edge] - grb.quicksum(self.flow_var[e] for e in self.edge_groups[1]['out']) + grb.quicksum(self.flow_var[e] for e in self.edge_groups[1]['in'])== 0,
                                      name="super_source_conservation"
         )
     
-        self.maxflow_model.addConstr(grb.quicksum(self.flow_var[e] for e in self.edge_groups[self.super_sink_nodes[0]]['in']) -
+        self.maxflow_model.addConstr(grb.quicksum(self.flow_var[e] for e in self.edge_groups[self.super_sink_nodes[0]]['in']) -grb.quicksum(self.flow_var[e] for e in self.edge_groups[self.super_sink_nodes[0]]['out']) -
                                      self.flow_var[self.super_edge] == 0, name="super_sink_conservation"
         )
     
@@ -430,7 +428,6 @@ class CustomEnv(gym.Env):
             sample_rounded = np.round(probs * 4)
             edge_interdiction_probabilities = (sample_rounded.astype(float) / 4)
         edge_interdiction_probabilities[self.noninterdictable_indices]=0
-
     
         # Sample budget based on initial budget setting."""
         if self.initial_budget is not None:
@@ -1121,7 +1118,7 @@ class CustomEnv(gym.Env):
                     name="flow_conservation_reverse")
 
                 self.optimal_deterministic_model.addConstr(
-                    self.alpha[self.super_sink_nodes[0]] - self.alpha[self.super_source_nodes[0]] >=1, name = "sink-source")
+                    self.alpha[self.super_sink_nodes[0]] - self.alpha[self.super_source_nodes[0]] >= 1, name = "sink-source")
             
             # Update Constraints
             if hasattr(self, 'budget_constr'):
@@ -1135,7 +1132,8 @@ class CustomEnv(gym.Env):
                 self.optimal_deterministic_model.remove(self.interdiction_success_constr)
 
             self.interdiction_success_constr = self.optimal_deterministic_model.addConstrs(
-                (self.gamma[e] <= self.edges_episode[e].interdiction_probability for e in self.both_edges), name="flow_conservation_reverse")
+                (self.gamma[e] <= self.edges_episode[e].interdiction_probability for e in self.both_edges),
+                name="interdiction_success_upper_bound")
 
             # Define Objective Value
             self.optimal_deterministic_model.setObjective(
@@ -1151,11 +1149,11 @@ class CustomEnv(gym.Env):
 
             return self.optimal_deterministic_model.ObjVal, interdicted_edges
         
-        else:  #Solve Stochastic Case with Cormican's Formulation                                #PICKUP HERE!!!!      
+        else:  #Solve Stochastic Case with Cormican's Formulation      
             M = 100                       # Number of training episodes
             N = 700                   # Number of test episodes
             seed_list = [100, 200, 300]#, 400, 500]
-            best_objective_value = 100000
+            best_objective_value = 100000    # Big M Value
             best_interdicted_edges = []
             unique_interdicted_sets = []
 
@@ -1183,29 +1181,30 @@ class CustomEnv(gym.Env):
 
             return best_objective_value, best_interdicted_edges
 
-    def solve_stochastic_max_flow(self, n_scenarios = 50, seed = 173, interdicted_edges = []):
-        # Optimally Solve for Stochastic Solution using Model 1D and SAA
+    def solve_stochastic_max_flow(self, n_scenarios = 50, seed = 173, interdicted_edges = []):      
+        # Optimally Solve for Stochastic Solution using Model 1U and SAA
         if not hasattr(self, 'optimal_stochastic_model'):
             # Initializing the model
             self.optimal_stochastic_model = grb.Model("Stochastic Model", env=self.GUROBI_ENV)
 
             # Creating decision variables
-            self.stochastic_gamma = self.optimal_stochastic_model.addVars(self.interdictable_edges, vtype=grb.GRB.BINARY, name="gamma")
+            self.stochastic_gamma = self.optimal_stochastic_model.addVars(self.both_edges, vtype=grb.GRB.BINARY, name="gamma")
 
-            # Create Variable Lower Bounds
+            # Create Variable Lower and Upper Bounds
             self.optimal_stochastic_model.setAttr("LB", [self.stochastic_gamma[e] for e in interdicted_edges],1)
+            self.optimal_stochastic_model.setAttr("UB", [self.stochastic_gamma[e] for e in self.noninterdictable_edges],0)
             
              # Budget constraint
-            self.stochastic_budget_constr = self.optimal_stochastic_model.addConstr(grb.quicksum(
-                self.edges_episode[e].interdiction_cost * self.stochastic_gamma[e] 
-                for e in self.interdictable_edges) <= self.state['budget'][0], name="budget")
+            self.stochastic_budget_constr = self.optimal_stochastic_model.addConstr(
+                grb.quicksum(self.edges_episode[e].interdiction_cost * self.stochastic_gamma[e]
+                             for e in self.both_edges) <= self.state['budget'][0], name="budget")
 
             self.stochastic_old_state = self.state
             self.stochastic_old_interdicted_edges = interdicted_edges
 
         if self.stochastic_old_interdicted_edges != interdicted_edges:
             # Update Variable Lower Bounds
-            self.optimal_stochastic_model.setAttr("LB", [self.stochastic_gamma[e] for e in self.interdictable_edges],0)
+            self.optimal_stochastic_model.setAttr("LB", [self.stochastic_gamma[e] for e in self.both_edges],0)
             self.optimal_stochastic_model.setAttr("LB", [self.stochastic_gamma[e] for e in interdicted_edges],1)
             self.stochastic_old_interdicted_edges=interdicted_edges
         
@@ -1222,23 +1221,24 @@ class CustomEnv(gym.Env):
                 
             self.stochastic_alpha = self.optimal_stochastic_model.addVars([(i, s) for s in self.scenarios for i in self.nodes], 
                                                   vtype=grb.GRB.BINARY, name="alpha")
-            self.stochastic_beta = self.optimal_stochastic_model.addVars([(e, s) for s in self.scenarios for e in self.edges_with_sink_source],
+            self.stochastic_beta = self.optimal_stochastic_model.addVars([(e, s) for s in self.scenarios for e in self.both_edges],
                                                                           vtype=grb.GRB.BINARY, name="beta")
 
             if hasattr(self, 'stochastic_source_sink_constr'):
                 self.optimal_stochastic_model.remove(self.stochastic_source_sink_constr)
                 del self.stochastic_source_sink_constr 
 
-            self.stochastic_source_sink_constr = self.optimal_stochastic_model.addConstrs((self.stochastic_alpha[self.super_sink_nodes[0],s] - self.stochastic_alpha[self.super_source_nodes[0], s] +self.stochastic_beta[(self.super_sink_nodes[0],self.super_source_nodes[0]),s]>= 1 for s in self.scenarios), name="source_sink")
+            self.stochastic_source_sink_constr = self.optimal_stochastic_model.addConstrs(
+                (self.stochastic_alpha[self.super_sink_nodes[0],s] - self.stochastic_alpha[self.super_source_nodes[0], s] >= 1
+                for s in self.scenarios), name="source_sink")
 
             # Objective Function
-            self.optimal_stochastic_model.setObjective((1/n_scenarios)*grb.quicksum(self.edges_episode[e].capacity * self.stochastic_beta[e, s]
-                for s in self.scenarios
-                for e in self.edges_reset) + grb.quicksum(self.MAX_SOURCE_FLOW*self.stochastic_beta[(self.super_sink_nodes[0],self.super_source_nodes[0]),s] for s in self.scenarios), grb.GRB.MINIMIZE)
+            self.optimal_stochastic_model.setObjective((1/n_scenarios)*grb.quicksum(edge.capacity * self.stochastic_beta[edge_id, s]
+                for s in self.scenarios for edge_id, edge in self.edges_episode.items()), grb.GRB.MINIMIZE)
         
         # Scenario generation
-        scenario_outcomes = np.random.binomial(1, self.state["edge_interdiction_probability"], 
-                                               size=(n_scenarios, len(self.interdictable_edges))) #Generate a 1 for success and a 0 for failure
+        scenario_outcomes = np.random.binomial(1, self.state["edge_interdiction_probability"][:self.num_both_edges], 
+                                               size=(n_scenarios, len(self.both_edges))) #Generate a 1 for success and a 0 for failure
         
         if hasattr(self, 'stochastic_aabg_constr'):
             self.optimal_stochastic_model.remove(self.stochastic_aabg_constr)
@@ -1246,22 +1246,22 @@ class CustomEnv(gym.Env):
             self.optimal_stochastic_model.update()  # Force model synchronization
             del self.stochastic_aabg_constr, self.stochastic_aabg_reverse_constr
             
-        self.stochastic_aabg_constr = self.optimal_stochastic_model.addConstrs((self.stochastic_alpha[e[0],s] - self.stochastic_alpha[e[1], s]+self.stochastic_beta[e, s]+ (self.stochastic_gamma[e] * scenario_outcomes[s, self.edge_to_index[e]] if e in self.edge_to_index else 0)>=0 for s in self.scenarios for e in self.edges_reset.keys()), name='aabg')
-        self.stochastic_aabg_reverse_constr = self.optimal_stochastic_model.addConstrs((self.stochastic_alpha[e[1],s] - self.stochastic_alpha[e[0], s]+self.stochastic_beta[e, s]+ (self.stochastic_gamma[e] * scenario_outcomes[s, self.edge_to_index[e]] if e in self.edge_to_index else 0)>=0 for s in self.scenarios for e in self.edges_reset.keys()), name='aabg')
-
+        self.stochastic_aabg_constr = self.optimal_stochastic_model.addConstrs(
+            (self.stochastic_alpha[e[0],s] - self.stochastic_alpha[e[1], s] + self.stochastic_beta[e, s] + (self.stochastic_gamma[e] * scenario_outcomes[s, edge_id]) >= 0 for s in self.scenarios for edge_id, e in enumerate(self.both_edges)), name='aabg')
+        self.stochastic_aabg_reverse_constr = self.optimal_stochastic_model.addConstrs(
+            (self.stochastic_alpha[e[1],s] - self.stochastic_alpha[e[0], s] + self.stochastic_beta[e, s] + (self.stochastic_gamma[e] * scenario_outcomes[s, edge_id]) >= 0 for s in self.scenarios for edge_id, e in enumerate(self.both_edges)), name='aabg')
 
         # Solving
         self.optimal_stochastic_model.optimize()
 
         interdicted_edges = [
-            e for e in self.interdictable_edges
+            e for e in self.both_edges
             if self.stochastic_gamma[e].X > 0.5  # Tolerate minor numerical issues
         ]
 
         return(self.optimal_stochastic_model.objVal, interdicted_edges)
 
-
-    def solve_stochastic_max_flow_IM(self, n_scenarios = 50, seed = 173, interdicted_edges = [], interdicted_quantities =[]):
+    def solve_stochastic_max_flow_IM(self, n_scenarios = 50, seed = 173, interdicted_edges = [], interdicted_quantities =[]):     #PICKUP HERE!!!! 
         # Optimally Solve for Stochastic Solution using Model 1D and SAA
         if not hasattr(self, 'optimal_stochastic_model_IM'):
             # Initializing the model
@@ -1370,7 +1370,6 @@ class CustomEnv(gym.Env):
         Returns:
             tuple: (optimal_objective_value, optimal_interdiction_sequence)
         """
-        
         # Calculate minimum edge cost for depth estimation (only from real edges)
         real_edge_costs = self.state['edge_costs'][:self.num_both_edges]
         self.min_edge_cost = min(real_edge_costs[real_edge_costs > 0], default=float('inf'))
@@ -1474,7 +1473,6 @@ class CustomEnv(gym.Env):
         
             memo[state_key] = (best_reward, best_sequence)
             return best_reward, best_sequence
-
         
         # Start the backward induction from current state
         initial_budget = self.state['budget'][0]
@@ -1490,3 +1488,37 @@ class CustomEnv(gym.Env):
         optimal_actions = [self.both_edges[idx] for idx in optimal_sequence]
 
         return optimal_reward, optimal_actions
+
+    def load_network_from_csv(self, node_filename, edge_filename):
+        # Locate files (adjust paths as needed)
+        current_dir = os.getcwd()
+        node_data_path = os.path.join(current_dir, node_filename)
+        edge_data_path = os.path.join(current_dir, edge_filename)
+
+        # Read node and edge data
+        nodes_df = pd.read_csv(node_data_path)
+        edges_df = pd.read_csv(edge_data_path)
+
+        # Construct nodes dictionary
+        nodes = dict()
+        for _, row in nodes_df.iterrows():
+            nodes[row['node']] = Node(ID=row['node'], xpos=row['x_pos'], ypos=row['y_pos'], node_type=row['type'])
+
+        # Construct edges dictionary
+        edges = dict()
+        for _, row in edges_df.iterrows():
+            edge_id = (int(row['Origin']), int(row['Destination']))
+            edges[edge_id] = Edge(
+                ID=edge_id,
+                interdictable=row['Interdictable'],
+                capacity=row['Capacity'],
+                interdicted=row.get('Interdicted', 0),  # Optional column
+                interdiction_cost=row.get('InterdictionCost', 100),  # Optional column
+                interdiction_probability=row.get('InterdictionProbability', 0.0)  # Optional column
+            )
+
+        self.nodes = nodes
+        self.edges_reset = edges
+        self.edges_episode = copy.deepcopy(self.edges_reset)
+        self._setup_network_structure()
+        self._setup_spaces()
