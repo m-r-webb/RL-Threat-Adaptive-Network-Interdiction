@@ -234,7 +234,7 @@ class CustomEnv(gym.Env):
         observation_dict = {**self.base_spaces, **self.strategy_spaces.get(self.attacker_strategy, {})}
         return spaces.Dict(observation_dict)
     
-    def solve_max_flow(self, capacity_dict=None, routing_assumption = "least_vulnerable"):  
+    def solve_max_flow(self, capacity_dict=None, routing_assumption = "least_vulnerable"):
         """
         Solve the Max Flow network problem, output objective value and edge flows.
     
@@ -244,7 +244,7 @@ class CustomEnv(gym.Env):
             If provided, uses this capacity dictionary instead of current state.
             Useful for batch solving with different capacity configurations.
         routing_assumption : str
-            Routing optimization objective ('gurobi_default', 'canalize', etc.)
+            Routing optimization objective ('gurobi_default', 'consolidated', 'distributed','least_vulnerable')
     
         Returns:
         --------
@@ -372,24 +372,24 @@ class CustomEnv(gym.Env):
             self.maxflow_model.setObjective(self.flow_var[self.super_edge], grb.GRB.MAXIMIZE)
         else:
              # Primary: Maximize flow
-            self.maxflow_model.setObjectiveN(self.flow_var[self.super_edge], index=0, priority=3, weight=1.0, 
-                                             abstol=0.0, reltol=0.0, name="max_flow")
+            self.maxflow_model.ModelSense = grb.GRB.MAXIMIZE
+            self.maxflow_model.setObjectiveN(self.flow_var[self.super_edge], index=0, priority=3, weight=1.0, name="max_flow")
 
             if routing_assumption == "consolidated":
                 # Secondary: Minimize edges used
                 self.maxflow_model.setObjectiveN(grb.quicksum(self.edge_used[e] for e in self.all_both_edges), index=1, priority=1, weight=-1.0,
-                                                 abstol=0.0, reltol=0.0, name="min_edges")
+                                                 name="min_edges")
             elif routing_assumption == "distributed":
                 # Secondary: Maximize edges used
                 self.maxflow_model.setObjectiveN(grb.quicksum(self.edge_used[e] for e in self.all_both_edges), index=1, priority=2, weight=1.0,
-                                                 abstol=0.0, reltol=0.0, name="max_edges")
+                                                 name="max_edges")
             
             elif routing_assumption == "least_vulnerable":
                 # Secondary: Minimize vulnerability (weighted by interdiction probability)
                 self.maxflow_model.setObjectiveN(grb.quicksum(self.state["edge_interdiction_probability"][ind]*
                                                               (self.flow_var[e]+self.flow_var[(e[1],e[0])]) 
                                                               for ind, e in enumerate(self.both_edges)), index=1, priority=1,
-                                                 weight=-1.0, abstol=0.0, reltol=0.0, name="least_vulnerable")
+                                                 weight=-1.0, name="least_vulnerable")
             else:
                 raise ValueError(f"Unknown routing assumption: {routing_assumption}")
     
@@ -669,51 +669,76 @@ class CustomEnv(gym.Env):
             next_node = adj[current]
             max_flow_path.append((current, next_node))
             current = next_node
-
-        breakpoint = random.choice(max_flow_path[1:-2])
-
-        breakpoint_index = max_flow_path.index(breakpoint)
-
-        path_to_keep = max_flow_path[:breakpoint_index+1]
-        path_to_avoid = max_flow_path[breakpoint_index+1:]
         
-        ###MODIFY BELOW
-        path_edges = set(path_to_keep)
-        current_node = breakpoint[1]
-        visited = {1} | {edge[1] for edge in path_to_keep}
-        sink = self.super_sink_nodes[0]
+        # Track attempted breakpoints to avoid infinite loops
+        attempted_breakpoints = set()
+        max_attempts = len(max_flow_path[1:-2])
     
-        while current_node != sink:
-            valid_edges = []
-            for edge in self.edge_groups[current_node]['out']:
-                target = edge[1]
-                if (target not in visited and target >= current_node - 1 and 
-                    edge not in path_to_avoid):
-                
-                    # Check for valid future moves
-                    if target != sink:
-                        future_valid = any(
-                            e not in path_to_avoid and e[1] != current_node and e[1] >= e[0] - 1
-                            for e in self.edge_groups[target]['out']
-                        )
-                        if not future_valid:
-                            continue
-                
-                    valid_edges.append(edge)
+        while len(attempted_breakpoints) < max_attempts:
+            # Choose a random breakpoint that hasn't been tried yet
+            available_breakpoints = [bp for bp in max_flow_path[1:-2] if bp not in attempted_breakpoints]
         
-            if not valid_edges or len(visited)>self.MAX_PATH_LENGTH+len(path_to_keep):
-                # Restart if no valid path
-                current_node = breakpoint[1]
-                visited = {1} | {edge[1] for edge in path_to_keep}
-                path_edges = set(path_to_keep)
-                continue
+            if not available_breakpoints:
+                # If all breakpoints have been tried, fall back to original path
+                return set(max_flow_path)
         
-            selected_edge = random.choice(valid_edges)
-            path_edges.add(selected_edge)
-            visited.add(selected_edge[1])
-            current_node = selected_edge[1]
+            breakpoint = random.choice(available_breakpoints)
+            attempted_breakpoints.add(breakpoint)
+        
+            breakpoint_index = max_flow_path.index(breakpoint)
+            path_to_keep = max_flow_path[:breakpoint_index+1]
+            path_to_avoid = max_flow_path[breakpoint_index+1:]
+        
+            # Try to find alternative path from this breakpoint
+            path_edges = set(path_to_keep)
+            current_node = breakpoint[1]
+            visited = {1} | {edge[1] for edge in path_to_keep}
+            sink = self.super_sink_nodes[0]
+        
+            stuck_count = 0
+            max_stuck_attempts = 5  # Limit retries before choosing new breakpoint
+        
+            while current_node != sink:
+                valid_edges = []
+                for edge in self.edge_groups[current_node]['out']:
+                    target = edge[1]
+                    if (target not in visited and target >= current_node - 1 and 
+                        edge not in path_to_avoid):
+                
+                        # Check for valid future moves
+                        if target != sink:
+                            future_valid = any(
+                                e not in path_to_avoid and e[1] != current_node and e[1] >= e[0] - 1
+                                for e in self.edge_groups[target]['out']
+                            )
+                            if not future_valid:
+                                continue
+                
+                        valid_edges.append(edge)
+            
+                if not valid_edges or len(visited) > self.MAX_PATH_LENGTH + len(path_to_keep):
+                    stuck_count += 1
+                    if stuck_count >= max_stuck_attempts:
+                        # This breakpoint doesn't work, try a new one
+                        break
+                
+                    # Try restarting from the breakpoint
+                    current_node = breakpoint[1]
+                    visited = {1} | {edge[1] for edge in path_to_keep}
+                    path_edges = set(path_to_keep)
+                    continue
+        
+                selected_edge = random.choice(valid_edges)
+                path_edges.add(selected_edge)
+                visited.add(selected_edge[1])
+                current_node = selected_edge[1]
+        
+            # If we successfully reached the sink, return the alternative path
+            if current_node == sink:
+                return path_edges
     
-        return path_edges
+        # If no alternative path found after trying all breakpoints, return original
+        return set(max_flow_path)
     
     def step(self, action):                                                     
         """Execute one step in the environment based on the given action."""
