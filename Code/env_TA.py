@@ -602,21 +602,20 @@ class CustomEnv(gym.Env):
         # Find max flow path
         _, flows = self.solve_max_flow()
         from_path = self._extract_max_flow_path(flows)
-    
+        
         # Find alternative path avoiding max flow path
         to_path = self._find_alternative_path(from_path)
     
         # Convert paths to objective arrays
         divert_from = np.zeros(self.max_num_edges, dtype=int)
+        divert_to = np.zeros(self.max_num_edges, dtype=int)
+
         for e, edge in enumerate(self.both_edges):
             if edge in from_path or (edge[1],edge[0]) in from_path:
                 divert_from[e] = 1
-        # Padded entries remain 0
-    
-        divert_to = np.zeros(self.max_num_edges, dtype=int)
-        for e, edge in enumerate(self.both_edges):
             if edge in to_path or (edge[1],edge[0]) in to_path:
                 divert_to[e] = 1
+             # Padded entries remain 0
         return {**base_state, 'divert_from_objective': divert_from, 'divert_to_objective': divert_to}
 
     def _find_simple_path(self):
@@ -657,11 +656,31 @@ class CustomEnv(gym.Env):
     
         return from_path
 
-    def _find_alternative_path(self, avoid_edges):
+    def _find_alternative_path(self, max_flow_edges):
         """Find an alternative path avoiding specified edges."""
-        path_edges = set()
-        current_node = 1
-        visited = {1}
+        adj = {}
+        for u, v in max_flow_edges:
+            adj[u] = v
+
+        # Trace path from source (1) to sink (250)
+        max_flow_path = []
+        current = 1
+        while current != 250:
+            next_node = adj[current]
+            max_flow_path.append((current, next_node))
+            current = next_node
+
+        breakpoint = random.choice(max_flow_path[1:-2])
+
+        breakpoint_index = max_flow_path.index(breakpoint)
+
+        path_to_keep = max_flow_path[:breakpoint_index+1]
+        path_to_avoid = max_flow_path[breakpoint_index+1:]
+        
+        ###MODIFY BELOW
+        path_edges = set(path_to_keep)
+        current_node = breakpoint[1]
+        visited = {1} | {edge[1] for edge in path_to_keep}
         sink = self.super_sink_nodes[0]
     
         while current_node != sink:
@@ -669,12 +688,12 @@ class CustomEnv(gym.Env):
             for edge in self.edge_groups[current_node]['out']:
                 target = edge[1]
                 if (target not in visited and target >= current_node - 1 and 
-                    edge not in avoid_edges):
+                    edge not in path_to_avoid):
                 
                     # Check for valid future moves
                     if target != sink:
                         future_valid = any(
-                            e not in avoid_edges and e[1] != current_node and e[1] >= e[0] - 1
+                            e not in path_to_avoid and e[1] != current_node and e[1] >= e[0] - 1
                             for e in self.edge_groups[target]['out']
                         )
                         if not future_valid:
@@ -682,11 +701,11 @@ class CustomEnv(gym.Env):
                 
                     valid_edges.append(edge)
         
-            if not valid_edges or len(visited)>self.MAX_PATH_LENGTH:
+            if not valid_edges or len(visited)>self.MAX_PATH_LENGTH+len(path_to_keep):
                 # Restart if no valid path
-                current_node = 1
-                visited = {1}
-                path_edges = set()
+                current_node = breakpoint[1]
+                visited = {1} | {edge[1] for edge in path_to_keep}
+                path_edges = set(path_to_keep)
                 continue
         
             selected_edge = random.choice(valid_edges)
@@ -1078,6 +1097,11 @@ class CustomEnv(gym.Env):
                     objective_values = self.state[obj_key][valid_indices]
                     num_target_edges = np.sum(objective_values == 1)
                     print(f"{strategy_name.capitalize()}: {num_target_edges} target edges (out of {len(valid_indices)} valid)")
+
+                    # Print the actual edges with value 1
+                    target_edge_indices = valid_indices[objective_values == 1]
+                    target_edges = [self.both_edges[idx] for idx in target_edge_indices]
+                    print(f"  Target edges: {target_edges}")
     
         # Additional state fields (non-edge specific)
         print(f"\n{'Other State Information':^80}")
