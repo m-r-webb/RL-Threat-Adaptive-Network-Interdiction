@@ -115,6 +115,26 @@ class CustomEnv(gym.Env):
 
         # Setup observation and action spaces
         self._setup_spaces()
+
+    def _cache_flow_array(self):
+        """Fully vectorized cache using array indexing."""
+        num_edges = self.num_both_edges
+    
+        # Pre-allocate
+        flow_array = np.zeros(num_edges, dtype=np.float32)
+    
+        # Vectorized extraction using list comprehension (compiled to C internally)
+        edges = self.both_edges
+        flows = self.reference_flows
+    
+        # Batch get operations
+        forward_keys = edges
+        reverse_keys = [(e[1], e[0]) for e in edges]
+    
+        # Vectorized lookup and sum
+        flow_array = np.array([flows.get(fk, 0) + flows.get(rk, 0) for fk, rk in zip(forward_keys, reverse_keys)], dtype=np.float32)
+    
+        self.cached_flow_array = flow_array
     
     def _setup_network_structure(self):
         """Initialize network nodes and edges structure."""
@@ -469,8 +489,10 @@ class CustomEnv(gym.Env):
         self.last_obj = self.reference_obj
         self.reference_budget = remaining_budget[0]
 
+        self._cache_flow_array()
+        
         return self.state, {}
-
+    
     def _cleanup_models(self):
         """Clean up any existing Gurobi models to free resources."""
         models_to_cleanup = ['master_model', 'sub_model', 'optimal_stochastic_model', 'optimal_stochastic_model_IM']
@@ -771,6 +793,7 @@ class CustomEnv(gym.Env):
                                     "divert": self._calculate_divert_reward}
             calculator = strategy_calculators.get(self.attacker_strategy)
             reward = calculator()
+            self.cache_flow_array()
         else:
             #Determine penalty and decrement budget
             reward = self.PENALTY_VALUE
