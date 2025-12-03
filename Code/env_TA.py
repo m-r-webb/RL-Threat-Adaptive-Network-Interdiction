@@ -408,8 +408,13 @@ class CustomEnv(gym.Env):
                 # Secondary: Minimize vulnerability (weighted by interdiction probability)
                 self.maxflow_model.setObjectiveN(grb.quicksum((self.state["edge_interdiction_probability"][ind]+0.01)*  #add 0.01 to avoid unnecessary routing through zero arcs
                                                               (self.flow_var[e]+self.flow_var[(e[1],e[0])]) 
-                                                              for ind, e in enumerate(self.both_edges)), index=1, priority=1,
+                                                              for ind, e in enumerate(self.both_edges)), index=1, priority=2,
                                                  weight=-1.0, name="least_vulnerable")
+                # Tertiary: Maximize excess capacity along routes used (weighted by edge capacity)
+                self.maxflow_model.setObjectiveN(grb.quicksum(self.state["edge_capacity"][ind]*  
+                                                              (self.flow_var[e]+self.flow_var[(e[1],e[0])]) 
+                                                              for ind, e in enumerate(self.both_edges)), index=2, priority=1,
+                                                 weight=1.0, name="excess_capacity")
             else:
                 raise ValueError(f"Unknown routing assumption: {routing_assumption}")
     
@@ -1561,11 +1566,14 @@ class CustomEnv(gym.Env):
 
         return optimal_reward, optimal_actions
 
-    def load_network_from_state(self, state):
+    def load_network_from_state(self, seed, state):
         """Reset the environment to initial state and return observation."""
         # Clean up any existing models
         self._cleanup_models()
-        
+        super().reset(seed=seed)
+        if seed is not None:
+            self._set_random_seeds(seed)
+            
         network_params = {
             'capacities': state['edge_capacity'][:self.num_both_edges], 
             'costs': state['edge_costs'][:self.num_both_edges],          
@@ -1576,8 +1584,7 @@ class CustomEnv(gym.Env):
         # Create base state
         base_state = self._create_base_state(network_params)
 
-        # Add strategy-specific components
-        self.state = self._add_strategy_components(base_state)
+        self.state = state
 
         # Calculate reference objective value for the attacker's strategy
         if self.attacker_strategy == 'zero_sum':
@@ -1597,3 +1604,5 @@ class CustomEnv(gym.Env):
         self.reference_budget = state['budget'][0]
 
         self._cache_flow_array()
+
+        return self.state, {}
