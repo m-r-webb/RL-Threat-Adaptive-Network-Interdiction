@@ -410,8 +410,10 @@ class CustomEnv(gym.Env):
                                                               (self.flow_var[e]+self.flow_var[(e[1],e[0])]) 
                                                               for ind, e in enumerate(self.both_edges)), index=1, priority=2,
                                                  weight=-1.0, name="least_vulnerable")
+                
                 # Tertiary: Maximize excess capacity along routes used (weighted by edge capacity)
-                self.maxflow_model.setObjectiveN(grb.quicksum(self.state["edge_capacity"][ind]*  
+                self.maxflow_model.setObjectiveN(grb.quicksum(self.state["edge_capacity"][ind] *
+                                                              (self.edge_used[e]+self.edge_used[(e[1],e[0])]) -  
                                                               (self.flow_var[e]+self.flow_var[(e[1],e[0])]) 
                                                               for ind, e in enumerate(self.both_edges)), index=2, priority=1,
                                                  weight=1.0, name="excess_capacity")
