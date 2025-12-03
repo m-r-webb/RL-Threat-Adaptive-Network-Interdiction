@@ -406,7 +406,7 @@ class CustomEnv(gym.Env):
             
             elif routing_assumption == "least_vulnerable":
                 # Secondary: Minimize vulnerability (weighted by interdiction probability)
-                self.maxflow_model.setObjectiveN(grb.quicksum(self.state["edge_interdiction_probability"][ind]*
+                self.maxflow_model.setObjectiveN(grb.quicksum((self.state["edge_interdiction_probability"][ind]+0.01)*  #add 0.01 to avoid unnecessary routing through zero arcs
                                                               (self.flow_var[e]+self.flow_var[(e[1],e[0])]) 
                                                               for ind, e in enumerate(self.both_edges)), index=1, priority=1,
                                                  weight=-1.0, name="least_vulnerable")
