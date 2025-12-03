@@ -1,6 +1,6 @@
 # Train an RL agent with a Pointer Network
 ##Inputs
-graphName = "G4x5"
+graphName = "G5x5"
 
 # Type of agent to train (uncomment only one)
 #agent = "A2C"
@@ -8,31 +8,32 @@ graphName = "G4x5"
 agent = "MaskablePPO"
 #agent = "PPO"
 
+version = "V12_2" #V[Month]_[Day] 
 
-# Deterministic or Stochastic Outcomes?
-deterministicOutcomes = False
-multiple_interdiction_attempts=False
-attacker_strategy = "zero_sum"  # 'canalize'  'divert'    'isolate'   'zero_sum'
-
-if deterministicOutcomes:
-    deterministicLetter = "D"
-else:
-    deterministicLetter = "S"
-
-#G3x5
-version = "V3" #C: Canalize, D: Divert, I: Isolate, Z: Zero-Sum 
-
-# Model Name
-model_name = f"{graphName}_{deterministicLetter}_{agent}_{attacker_strategy}_{version}"
-print(model_name)
 # Initial Learning Rate
 initial_learning_rate = 0.0003  #0.0001
 
 # Time Steps to Train
-timesteps = 15000000
+timesteps = 5000000
 
 # Number of parallel cpus
 n_cpus = 144  # Number of environments
+
+env_params = {'deterministic_agent': False,
+              'multiple_interdiction_attempts': False,
+              'attacker_strategy': 'zero_sum',  # canalize   isolate   divert  zero_sum
+              'training_budget_range': (5, 10),  #G5x5: zero_sum/isolate: (5,10), canalize/divert: (8,16) G10x10: zero_sum/isolate: (15,30), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (15,25)
+              'max_path_length': 6,  #G5x5: 6,  G10x10: 13, UKR: 16
+             }
+
+if env_params['deterministic_agent']:
+    deterministicLetter = "D"
+else:
+    deterministicLetter = "S"
+
+# Model Name
+model_name = f"{graphName}_{deterministicLetter}_{agent}_{env_params['attacker_strategy']}_{version}"
+print(model_name)
 
 # Import all required packages
 import os
@@ -72,7 +73,6 @@ def linear_schedule(initial_value: float):
         return progress_remaining * initial_value
     return func
 
-
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
@@ -84,7 +84,6 @@ from sb3_contrib.ppo_mask import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 from typing import Dict, Any, Tuple
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-
 
 class PointerNetworkFeatureExtractor(BaseFeaturesExtractor):
     """
@@ -120,14 +119,14 @@ class PointerNetworkFeatureExtractor(BaseFeaturesExtractor):
         self.attacker_strategy = attacker_strategy
         
         # Edge feature processors
-        self.binary_embed = nn.Embedding(2, 8)
+        self.binary_embed = nn.Embedding(2, 4)
         self.max_nodes = 250  # From your max_num_nodes
-        self.node_embedding = nn.Embedding(self.max_nodes + 1, 6, padding_idx=0)  # +1 for padding        
+        self.node_embedding = nn.Embedding(self.max_nodes + 1, 4, padding_idx=0)  # +1 for padding        
         
         # Determine input dimension based on strategy
         base_continuous = 3  # edge_capacity, edge_costs, edge_prob
-        base_binary = 8  # edge_interdicted embedding
-        node_features = 12  # 6(dep) + 6(arr)
+        base_binary = 4 #8  # edge_interdicted embedding
+        node_features = 8 #12  # 6(dep) + 6(arr)
 
         if attacker_strategy == 'zero_sum':
             if self.multiple_interdiction_attempts:
@@ -247,24 +246,25 @@ class PointerNetwork(nn.Module):
     """
     Pointer Network implementation for edge selection with action masking
     """
-    def __init__(self, input_dim, hidden_dim, num_actions, num_layers=1):  # Add num_actions parameter
+    def __init__(self, input_dim, hidden_dim, num_actions, num_layers=1, bidirectional=True):
         super(PointerNetwork, self).__init__()
         
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        self.num_actions = num_actions  # Store total number of actions
+        self.num_actions = num_actions
         self.num_layers = num_layers
+        self.bidirectional = bidirectional
         
-        # Encoder LSTM (bidirectional)
+        # Encoder LSTM
         self.encoder = nn.LSTM(
             input_size=input_dim,
             hidden_size=hidden_dim,
             num_layers=num_layers,
             batch_first=True,
-            bidirectional=True  #Beta test with false someday to gauge benefit
+            bidirectional=bidirectional
         )
         
-        # Decoder LSTM (unidirectional)
+        # Decoder LSTM (always unidirectional)
         self.decoder = nn.LSTM(
             input_size=input_dim,
             hidden_size=hidden_dim,
@@ -273,13 +273,17 @@ class PointerNetwork(nn.Module):
         )
         
         # Attention mechanism components
-        self.W1 = nn.Linear(hidden_dim * 2, hidden_dim, bias=False)  # Encoder projection
-        self.W2 = nn.Linear(hidden_dim, hidden_dim, bias=False)      # Decoder projection
-        self.v = nn.Linear(hidden_dim, 1, bias=False)                # Attention vector
+        # FIXED: Account for bidirectional encoder output
+        encoder_output_dim = hidden_dim * 2 if bidirectional else hidden_dim
+        self.W1 = nn.Linear(encoder_output_dim, hidden_dim, bias=False)  # Encoder projection
+        self.W2 = nn.Linear(hidden_dim, hidden_dim, bias=False)           # Decoder projection
+        self.v = nn.Linear(hidden_dim, 1, bias=False)                     # Attention vector
         
         # Context vector for decoder initialization
-        self.h_context_proj = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.c_context_proj = nn.Linear(hidden_dim * 2, hidden_dim)
+        # FIXED: Input size depends on bidirectionality
+        context_input_dim = hidden_dim * 2 if bidirectional else hidden_dim
+        self.h_context_proj = nn.Linear(context_input_dim, hidden_dim)
+        self.c_context_proj = nn.Linear(context_input_dim, hidden_dim)
         
         # Learnable decoder input
         self.decoder_start_input = nn.Parameter(th.randn(1, 1, input_dim) * 0.1)
@@ -290,14 +294,11 @@ class PointerNetwork(nn.Module):
         """
         batch_size, seq_len, _ = inputs.shape
 
-        # Calculate actual sequence lengths from PADDING MASK (not action masks)
+        # Calculate actual sequence lengths from PADDING MASK
         if padding_mask is not None:
-            # Use padding mask to get actual sequence lengths
-            seq_lengths = padding_mask.sum(dim=1).cpu().long()  # [batch]
+            seq_lengths = padding_mask.sum(dim=1).cpu().long()
             seq_lengths = th.clamp(seq_lengths, min=1)
-
         else:
-            # If no mask, use full sequence length
             seq_lengths = th.full((batch_size,), seq_len, dtype=th.long, device='cpu')
     
         # Pack sequences to skip padded entries
@@ -308,7 +309,7 @@ class PointerNetwork(nn.Module):
             enforce_sorted=False
         )
     
-        # Encode with packed sequences - LSTM only processes actual entries
+        # Encode with packed sequences
         packed_encoder_outputs, (h_enc, c_enc) = self.encoder(packed_inputs)
     
         # Unpack back to padded format for attention computation
@@ -316,19 +317,25 @@ class PointerNetwork(nn.Module):
             packed_encoder_outputs,
             batch_first=True,
             total_length=seq_len
-        )  # [batch_size, seq_len, hidden_dim*2]
+        )  # [batch_size, seq_len, hidden_dim*2 if bidirectional else hidden_dim]
     
         # Initialize decoder state
-        h_forward = h_enc[-2, :, :]
-        h_backward = h_enc[-1, :, :]
-        h_combined = th.cat([h_forward, h_backward], dim=1)
-    
-        c_forward = c_enc[-2, :, :]
-        c_backward = c_enc[-1, :, :]
-        c_combined = th.cat([c_forward, c_backward], dim=1)
-    
-        h_dec = self.h_context_proj(h_combined).unsqueeze(0)
-        c_dec = self.c_context_proj(c_combined).unsqueeze(0)
+        if self.bidirectional:
+            # Combine forward and backward hidden states
+            h_forward = h_enc[-2, :, :]
+            h_backward = h_enc[-1, :, :]
+            h_combined = th.cat([h_forward, h_backward], dim=1)
+        
+            c_forward = c_enc[-2, :, :]
+            c_backward = c_enc[-1, :, :]
+            c_combined = th.cat([c_forward, c_backward], dim=1)
+        
+            h_dec = self.h_context_proj(h_combined).unsqueeze(0)
+            c_dec = self.c_context_proj(c_combined).unsqueeze(0)
+        else:
+            # Unidirectional: just use the last layer
+            h_dec = self.h_context_proj(h_enc[-1, :, :]).unsqueeze(0)
+            c_dec = self.c_context_proj(c_enc[-1, :, :]).unsqueeze(0)
     
         # Create decoder input
         decoder_input = self.decoder_start_input.expand(batch_size, -1, -1)
@@ -343,17 +350,15 @@ class PointerNetwork(nn.Module):
     
         # Compute attention scores
         encoder_proj = self.W1(encoder_outputs)  # [B, seq_len, hidden_dim]
-        decoder_proj = self.W2(decoder_output)  # [B, 1, hidden_dim]
+        decoder_proj = self.W2(decoder_output)    # [B, 1, hidden_dim]
         energy = th.tanh(encoder_proj + decoder_proj.expand(-1, seq_len, -1))
         attention_logits = self.v(energy).squeeze(-1)  # [B, seq_len]
 
-        # MASK PADDING POSITIONS BEFORE ADDING "DO NOTHING" ACTION
+        # MASK PADDING POSITIONS
         if padding_mask is not None:
-            # Ensure padding_mask matches attention_logits size
             if padding_mask.shape[1] != attention_logits.shape[1]:
                 padding_mask = padding_mask[:, :attention_logits.shape[1]]
         
-            # Set padded positions to very negative value
             mask_value = th.finfo(attention_logits.dtype).min
             attention_logits = th.where(
                 padding_mask.bool(), 
@@ -369,7 +374,7 @@ class PointerNetwork(nn.Module):
                                    dtype=attention_logits.dtype)
             attention_logits = th.cat([attention_logits, extra_logits], dim=1)
         
-        # Apply action masking if provided
+        # Apply action masking
         if action_masks is not None:
             if isinstance(action_masks, np.ndarray):
                 action_masks = th.from_numpy(action_masks).to(
@@ -392,16 +397,15 @@ class PointerNetwork(nn.Module):
             attention_logits = th.where(action_masks > 0, attention_logits, mask_value)
     
         return attention_logits
-
+        
 class MaskablePointerNetworkPolicy(MaskableActorCriticPolicy):
     """
     Maskable policy that uses Pointer Network for edge selection
     """
     def __init__(self, observation_space, action_space, lr_schedule,
-                 num_edges=25, edge_embedding_dim=128, hidden_dim=256,
+                 edge_embedding_dim=128, hidden_dim=256, 
                  net_arch=None, activation_fn=nn.ReLU, *args, **kwargs):
         
-        self.num_edges = num_edges
         self.edge_embedding_dim = edge_embedding_dim
         self.hidden_dim = hidden_dim
         self.action_space_size = action_space.n  # Get actual action space size
@@ -427,16 +431,17 @@ class MaskablePointerNetworkPolicy(MaskableActorCriticPolicy):
         self.pointer_network = PointerNetwork(
             input_dim=self.edge_embedding_dim,
             hidden_dim=self.hidden_dim,
-            num_actions=self.action_space_size,  # Pass the actual action space size
-            num_layers=1
+            num_actions=self.action_space_size,
+            num_layers=1,
+            bidirectional=True  # Explicitly set
         ).to(self.device)
         
         # Custom value network
         self.custom_value_net = nn.Sequential(
-            nn.Linear(self.edge_embedding_dim + 1, 256),
+            nn.Linear(self.edge_embedding_dim + 1, 128),
             nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
+#            nn.Linear(256, 128),
+#            nn.ReLU(),
             nn.Linear(128, 1)
         ).to(self.device)
     
@@ -455,7 +460,7 @@ class MaskablePointerNetworkPolicy(MaskableActorCriticPolicy):
         padding_mask = self.features_extractor._last_padding_mask  # retrieve mask
     
         attention_logits = self.pointer_network(edge_embeddings, budget, action_masks, padding_mask)
-        distribution = CategoricalDistribution(self.action_space_size)  # Use action_space_size instead of num_edges
+        distribution = CategoricalDistribution(self.action_space_size)  
         distribution = distribution.proba_distribution(action_logits=attention_logits)
     
         actions = distribution.get_actions(deterministic=deterministic)
@@ -474,7 +479,7 @@ class MaskablePointerNetworkPolicy(MaskableActorCriticPolicy):
         padding_mask = self.features_extractor._last_padding_mask
 
         attention_logits = self.pointer_network(edge_embeddings, budget, action_masks, padding_mask)
-        distribution = CategoricalDistribution(self.action_space_size)  # Use action_space_size instead of num_edges
+        distribution = CategoricalDistribution(self.action_space_size)  
         distribution = distribution.proba_distribution(action_logits=attention_logits)
     
         log_prob = distribution.log_prob(actions)
@@ -517,51 +522,62 @@ class MaskablePointerNetworkPolicy(MaskableActorCriticPolicy):
 # Add action mask method to your environment or create a wrapper
 def mask_fn(env):
     """
-    Function to generate action mask based on your validation logic
+    Fully vectorized function using cached flow information.
+    Maximum speed optimization.
     """
-    # Get current state
-    remaining_budget = env.state['budget']
+    remaining_budget = env.state['budget'][0]
+    edge_interdicted = env.state['edge_interdicted']
     
-    # Create action mask - size should match action space
     action_mask = np.ones(env.action_space.n, dtype=np.float32)
+    num_interdictable = min(env.num_both_edges, env.action_space.n)
     
-    # Mask interdictable edges (first 25 actions)
-    for action in range(min(env.num_interdictable_edges, env.action_space.n)):
-        if not env._validate_action(action, remaining_budget, env.state['edge_interdicted']):
-            action_mask[action] = 0.0
+    # All vectorized checks
+    valid_edges = np.arange(num_interdictable) < env.num_both_edges
+    sufficient_budget = (remaining_budget - env.state['edge_costs'][:num_interdictable]) >= -0.1
+    has_capacity = env.state['edge_capacity'][:num_interdictable] > 0
+    has_probability = env.state['edge_interdiction_probability'][:num_interdictable] > 0
     
-    # The "do nothing" action (if it exists) is typically always valid
-    # It should be at index env.num_interdictable_edges
-    # No additional masking needed for "do nothing" action
+    max_interdictions = env.MAX_INTERDICTION_ATTEMPTS if env.multiple_interdiction_attempts else 1
+    within_limit = (edge_interdicted[:num_interdictable] + 1) <= max_interdictions
+    
+    # Use cached flow array (FAST!)
+    has_flow = env.cached_flow_array[:num_interdictable] > 0
+    
+    # Strategy-specific checks
+    if env.attacker_strategy == 'canalize':
+        not_target = env.state['canalize_objective'][:num_interdictable] != 1
+        valid_actions = (valid_edges & sufficient_budget & has_capacity & 
+                        has_probability & within_limit & has_flow & not_target)
+    elif env.attacker_strategy == 'divert':
+        not_target = env.state['divert_to_objective'][:num_interdictable] != 1
+        valid_actions = (valid_edges & sufficient_budget & has_capacity & 
+                        has_probability & within_limit & has_flow & not_target)
+    else:
+        valid_actions = (valid_edges & sufficient_budget & has_capacity & 
+                        has_probability & within_limit & has_flow)
+    
+    action_mask[:num_interdictable] = valid_actions.astype(np.float32)
+    
     return action_mask
     
 # Modified environment setup with action masking
 def make_env():
-    env = ce.CustomEnv(nodes, edges, deterministic_agent=deterministicOutcomes,
-                       multiple_interdiction_attempts=multiple_interdiction_attempts,
-                       attacker_strategy=attacker_strategy)
+    env = ce.CustomEnv(nodes, edges, **env_params)
     # Wrap with ActionMasker
     env = ActionMasker(env, mask_fn)
     return env
-
-# Calculate the correct action space size
-if attacker_strategy == "zero_sum":
-    action_space_size = 25  # Only interdictable edges
-else:
-    action_space_size = 25 + 1  # Interdictable edges + "do nothing" action
 
 # Policy kwargs for your training setup
 policy_kwargs = dict(
     features_extractor_class=PointerNetworkFeatureExtractor,
     features_extractor_kwargs={
-        'edge_embedding_dim': 128,
-        'hidden_dim': 256,
-        'multiple_interdiction_attempts': multiple_interdiction_attempts,
-        'attacker_strategy': attacker_strategy
+        'edge_embedding_dim': 64,
+        'hidden_dim': 128,
+        'multiple_interdiction_attempts': env_params['multiple_interdiction_attempts'],
+        'attacker_strategy': env_params['attacker_strategy']
     },
-    num_edges=action_space_size,  # Use calculated size
-    edge_embedding_dim=128,
-    hidden_dim=256,
+    edge_embedding_dim=64,
+    hidden_dim=128,
     net_arch=[128, 128],
     activation_fn=nn.ReLU,
 )
@@ -576,9 +592,7 @@ if __name__ == "__main__":
     eval_env = DummyVecEnv([
         lambda: Monitor(
             ActionMasker(
-                ce.CustomEnv(nodes, edges, deterministic_agent=deterministicOutcomes,
-                           multiple_interdiction_attempts=multiple_interdiction_attempts,
-                           attacker_strategy=attacker_strategy),
+                ce.CustomEnv(nodes, edges, **env_params),
                 mask_fn
             )
         )
