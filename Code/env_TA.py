@@ -793,7 +793,7 @@ class CustomEnv(gym.Env):
                                     "divert": self._calculate_divert_reward}
             calculator = strategy_calculators.get(self.attacker_strategy)
             reward = calculator()
-            self.cache_flow_array()
+            self._cache_flow_array()
         else:
             #Determine penalty and decrement budget
             reward = self.PENALTY_VALUE
