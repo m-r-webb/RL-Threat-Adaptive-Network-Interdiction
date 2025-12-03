@@ -1561,36 +1561,39 @@ class CustomEnv(gym.Env):
 
         return optimal_reward, optimal_actions
 
-    def load_network_from_csv(self, node_filename, edge_filename):
-        # Locate files (adjust paths as needed)
-        current_dir = os.getcwd()
-        node_data_path = os.path.join(current_dir, node_filename)
-        edge_data_path = os.path.join(current_dir, edge_filename)
+    def load_network_from_state(self, state):
+        """Reset the environment to initial state and return observation."""
+        # Clean up any existing models
+        self._cleanup_models()
+        
+        network_params = {
+            'capacities': state['edge_capacity'][:self.num_both_edges], 
+            'costs': state['edge_costs'][:self.num_both_edges],          
+            'probabilities': state['edge_interdiction_probability'][:self.num_both_edges],
+            'budget': state['budget']
+        }
 
-        # Read node and edge data
-        nodes_df = pd.read_csv(node_data_path)
-        edges_df = pd.read_csv(edge_data_path)
+        # Create base state
+        base_state = self._create_base_state(network_params)
 
-        # Construct nodes dictionary
-        nodes = dict()
-        for _, row in nodes_df.iterrows():
-            nodes[row['node']] = Node(ID=row['node'], xpos=row['x_pos'], ypos=row['y_pos'], node_type=row['type'])
+        # Add strategy-specific components
+        self.state = self._add_strategy_components(base_state)
 
-        # Construct edges dictionary
-        edges = dict()
-        for _, row in edges_df.iterrows():
-            edge_id = (int(row['Origin']), int(row['Destination']))
-            edges[edge_id] = Edge(
-                ID=edge_id,
-                interdictable=row['Interdictable'],
-                capacity=row['Capacity'],
-                interdicted=row.get('Interdicted', 0),  # Optional column
-                interdiction_cost=row.get('InterdictionCost', 100),  # Optional column
-                interdiction_probability=row.get('InterdictionProbability', 0.0)  # Optional column
-            )
+        # Calculate reference objective value for the attacker's strategy
+        if self.attacker_strategy == 'zero_sum':
+            self.reference_obj, self.reference_flows = self._compute_objective_and_flows()
+        elif self.attacker_strategy == 'canalize':
+            self.reference_obj, self.reference_flows = self._calculate_canalize_objective_and_flows()
+        elif self.attacker_strategy == 'isolate':
+            self.reference_obj, self.reference_flows = self._calculate_isolate_objective_and_flows()
+        elif self.attacker_strategy == 'divert':
+            _, self.reference_flows = self.solve_max_flow()
+            from_flow = self._calculate_target_path_flow(self.reference_flows, 'divert_from_objective')
+            to_flow = self._calculate_target_path_flow(self.reference_flows, 'divert_to_objective')
+            self.reference_start_flows = (from_flow, to_flow)
+            self.reference_obj = 0
+        
+        self.last_obj = self.reference_obj
+        self.reference_budget = state['budget'][0]
 
-        self.nodes = nodes
-        self.edges_reset = edges
-        self.edges_episode = copy.deepcopy(self.edges_reset)
-        self._setup_network_structure()
-        self._setup_spaces()
+        self._cache_flow_array()
