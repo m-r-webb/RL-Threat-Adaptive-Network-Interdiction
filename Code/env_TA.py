@@ -397,11 +397,11 @@ class CustomEnv(gym.Env):
 
             if routing_assumption == "consolidated":
                 # Secondary: Minimize edges used
-                self.maxflow_model.setObjectiveN(grb.quicksum(self.edge_used[e] for e in self.all_both_edges), index=1, priority=1, weight=-1.0,
+                self.maxflow_model.setObjectiveN(grb.quicksum(self.edge_used[e] for e in self.all_both_edges), index=1, priority=1, weight=-1.0, abstol =0,
                                                  name="min_edges")
             elif routing_assumption == "distributed":
                 # Secondary: Maximize edges used
-                self.maxflow_model.setObjectiveN(grb.quicksum(self.edge_used[e] for e in self.all_both_edges), index=1, priority=2, weight=1.0,
+                self.maxflow_model.setObjectiveN(grb.quicksum(self.edge_used[e] for e in self.all_both_edges), index=1, priority=2, weight=1.0, abstol =0,
                                                  name="max_edges")
             
             elif routing_assumption == "least_vulnerable":
@@ -409,13 +409,13 @@ class CustomEnv(gym.Env):
                 self.maxflow_model.setObjectiveN(grb.quicksum((self.state["edge_interdiction_probability"][ind]+0.01)*  #add 0.01 to avoid unnecessary routing through zero arcs
                                                               (self.flow_var[e]+self.flow_var[(e[1],e[0])]) 
                                                               for ind, e in enumerate(self.both_edges)), index=1, priority=2,
-                                                 weight=-1.0, name="least_vulnerable")
+                                                 weight=-1.0, abstol =0, name="least_vulnerable")
                 
                 # Tertiary: Maximize excess capacity along routes used (weighted by edge capacity)
                 self.maxflow_model.setObjectiveN(grb.quicksum(self.state["edge_capacity"][ind] *
                                                               (self.flow_var[e]+self.flow_var[(e[1],e[0])]) 
                                                               for ind, e in enumerate(self.both_edges)), index=2, priority=1,
-                                                 weight=1.0, name="excess_capacity")
+                                                 weight=1.0, abstol =0, name="excess_capacity")
             else:
                 raise ValueError(f"Unknown routing assumption: {routing_assumption}")
     
