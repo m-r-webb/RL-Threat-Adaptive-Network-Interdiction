@@ -451,7 +451,7 @@ class CustomEnv(gym.Env):
         else:
             probs = self.base_spaces['edge_interdiction_probability'].sample()[:self.num_both_edges]
             # Round to 0.25 increments for consistency
-            sample_rounded = np.round(probs * 20)
+            sample_rounded = np.round(probs * 20) #Trying replacing 4 with 20 to reduce symmetrical answers
             edge_interdiction_probabilities = (sample_rounded.astype(float) / 20)
         edge_interdiction_probabilities[self.noninterdictable_indices]=0
     
@@ -496,6 +496,10 @@ class CustomEnv(gym.Env):
         self.reference_budget = remaining_budget[0]
 
         self._cache_flow_array()
+        
+        self.num_interdictable = min(self.num_both_edges, self.action_space.n)
+        self.has_probability = self.state['edge_interdiction_probability'][:self.num_interdictable] > 0
+        self.has_capacity = self.state['edge_capacity'][:self.num_interdictable] > 0
         
         return self.state, {}
     
@@ -840,9 +844,9 @@ class CustomEnv(gym.Env):
         ## Attacker Strategy Specific Checks
         # Zero-Sum - Check target has previous flow
     #    if self.attacker_strategy == 'zero_sum':
-   #     edge = self.both_edges[action]
-   #     if self.reference_flows[edge] == 0 and self.reference_flows[(edge[1],edge[0])] == 0:
-   #         return False
+        edge = self.both_edges[action]
+        if self.reference_flows[edge] == 0 and self.reference_flows[(edge[1],edge[0])] == 0:
+            return False
         
         # Canalization - Check attacker does not target canalization path
         if self.attacker_strategy == 'canalize':
@@ -1458,7 +1462,7 @@ class CustomEnv(gym.Env):
         max_budget = self.state['budget'][0]
         budget_levels = max_budget // self.min_edge_cost
         estimated_states = self.num_both_edges ** budget_levels  # Use actual_num_edges, not max
-        update_rate = max(estimated_states // 20, 1)
+        update_rate = max(200, 1)
         
         # Memoization dictionary: state -> (max_reward, best_action_sequence)
         memo = {}
@@ -1517,16 +1521,19 @@ class CustomEnv(gym.Env):
                 return final_objective, []
        
             # Find all valid actions from current state
-            valid_actions = []
-            for action in range(self.num_both_edges):
-                edge = self.both_edges[action]
-                if self._validate_action(action, [remaining_budget], interdicted_state): # and (flows.get(edge, 0) != 0 or flows.get((edge[1],edge[0]), 0) != 0):
-                    valid_actions.append(action)
-                else:
-                    update_progress(self.num_both_edges**(budget_levels-(depth+1)))
+            action_mask = self.mask_fn()
+            valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
+            num_invalid_actions = np.where(action_mask[:self.num_both_edges] == 0)[0].shape[0]
+            update_progress((self.num_both_edges**(budget_levels-(depth+1)))*num_invalid_actions)
+#            for action in range(self.num_both_edges):
+#                edge = self.both_edges[action]
+#                if self._validate_action(action, [remaining_budget], interdicted_state): # and (flows.get(edge, 0) != 0 or flows.get((edge[1],edge[0]), 0) != 0):
+#                    valid_actions.append(action)
+#                else:
+#                    update_progress(self.num_both_edges**(budget_levels-(depth+1)))
         
             # If no valid actions, evaluate terminal state
-            if not valid_actions:
+            if len(valid_actions)==0:
                 memo[state_key] = (final_objective, [])
                 update_progress(self.num_both_edges**(budget_levels-depth))
                 return final_objective, []
@@ -1567,7 +1574,7 @@ class CustomEnv(gym.Env):
 
         return optimal_reward, optimal_actions
 
-    def load_network_from_state(self, seed, state, iso_state_add = None):
+    def load_network_from_state(self, seed, state):
         """Reset the environment to initial state and return observation."""
         # Clean up any existing models
         self._cleanup_models()
@@ -1586,8 +1593,6 @@ class CustomEnv(gym.Env):
         base_state = self._create_base_state(network_params)
 
         self.state = state
-        if iso_state_add is not None:
-            self.state = {**self.state, 'isolate_objective': iso_state_add}
 
         # Calculate reference objective value for the attacker's strategy
         if self.attacker_strategy == 'zero_sum':
@@ -1608,4 +1613,48 @@ class CustomEnv(gym.Env):
 
         self._cache_flow_array()
 
+        self.num_interdictable = min(self.num_both_edges, self.action_space.n)
+        self.has_probability = self.state['edge_interdiction_probability'][:self.num_interdictable] > 0
+        self.has_capacity = self.state['edge_capacity'][:self.num_interdictable] > 0
+
         return self.state, {}
+
+    def mask_fn(self):
+        """
+        Fully vectorized function using cached flow information.
+        Maximum speed optimization.
+        """
+        remaining_budget = self.state['budget'][0]
+        edge_interdicted = self.state['edge_interdicted']
+    
+        action_mask = np.ones(self.action_space.n, dtype=np.float32)
+        #num_interdictable = min(self.num_both_edges, self.action_space.n)
+    
+        # All vectorized checks
+        #valid_edges = np.arange(num_interdictable) < self.num_both_edges
+        sufficient_budget = (remaining_budget - self.state['edge_costs'][:self.num_interdictable]) >= -0.1
+        #has_capacity = self.state['edge_capacity'][:self.num_interdictable] > 0
+        #has_probability = self.state['edge_interdiction_probability'][:self.num_interdictable] > 0
+    
+        max_interdictions = self.MAX_INTERDICTION_ATTEMPTS if self.multiple_interdiction_attempts else 1
+        within_limit = (edge_interdicted[:self.num_interdictable] + 1) <= max_interdictions
+    
+        # Use cached flow array (FAST!)
+        #has_flow = self.cached_flow_array[:self.num_interdictable] > 0
+    
+        # Strategy-specific checks
+        if self.attacker_strategy == 'canalize':
+            not_target = self.state['canalize_objective'][:self.num_interdictable] != 1
+            valid_actions = (valid_edges & sufficient_budget & has_capacity & 
+                             has_probability & within_limit & has_flow & not_target)
+        elif self.attacker_strategy == 'divert':
+            not_target = self.state['divert_to_objective'][:self.num_interdictable] != 1
+            valid_actions = (valid_edges & sufficient_budget & has_capacity & 
+                             has_probability & within_limit & has_flow & not_target)
+        else:
+            valid_actions = (#valid_edges & has_flow &
+                sufficient_budget & self.has_capacity & self.has_probability & within_limit)
+    
+        action_mask[:self.num_interdictable] = valid_actions.astype(np.float32)
+    
+        return action_mask
