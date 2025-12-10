@@ -451,8 +451,8 @@ class CustomEnv(gym.Env):
         else:
             probs = self.base_spaces['edge_interdiction_probability'].sample()[:self.num_both_edges]
             # Round to 0.25 increments for consistency
-            sample_rounded = np.round(probs * 4)
-            edge_interdiction_probabilities = (sample_rounded.astype(float) / 4)
+            sample_rounded = np.round(probs * 20)
+            edge_interdiction_probabilities = (sample_rounded.astype(float) / 20)
         edge_interdiction_probabilities[self.noninterdictable_indices]=0
     
         # Sample budget based on initial budget setting."""
@@ -840,9 +840,9 @@ class CustomEnv(gym.Env):
         ## Attacker Strategy Specific Checks
         # Zero-Sum - Check target has previous flow
     #    if self.attacker_strategy == 'zero_sum':
-        edge = self.both_edges[action]
-        if self.reference_flows[edge] == 0 and self.reference_flows[(edge[1],edge[0])] == 0:
-            return False
+   #     edge = self.both_edges[action]
+   #     if self.reference_flows[edge] == 0 and self.reference_flows[(edge[1],edge[0])] == 0:
+   #         return False
         
         # Canalization - Check attacker does not target canalization path
         if self.attacker_strategy == 'canalize':
@@ -1567,7 +1567,7 @@ class CustomEnv(gym.Env):
 
         return optimal_reward, optimal_actions
 
-    def load_network_from_state(self, seed, state):
+    def load_network_from_state(self, seed, state, iso_state_add = None):
         """Reset the environment to initial state and return observation."""
         # Clean up any existing models
         self._cleanup_models()
@@ -1586,6 +1586,8 @@ class CustomEnv(gym.Env):
         base_state = self._create_base_state(network_params)
 
         self.state = state
+        if iso_state_add is not None:
+            self.state = {**self.state, 'isolate_objective': iso_state_add}
 
         # Calculate reference objective value for the attacker's strategy
         if self.attacker_strategy == 'zero_sum':
