@@ -1673,7 +1673,7 @@ class CustomEnv(gym.Env):
         # All vectorized checks
         sufficient_budget = (remaining_budget - self.state['edge_costs'][:self.num_interdictable]) >= -0.1
         #has_capacity = self.state['edge_capacity'][:self.num_interdictable] > 0
-        #has_probability = self.state['edge_interdiction_probability'][:self.num_interdictable] > 0
+        has_probability = self.state['edge_interdiction_probability'][:self.num_interdictable] > 0
     
         max_interdictions = self.MAX_INTERDICTION_ATTEMPTS if self.multiple_interdiction_attempts else 1
         within_limit = (edge_interdicted[:self.num_interdictable] + 1) <= max_interdictions
@@ -1682,27 +1682,29 @@ class CustomEnv(gym.Env):
         if self.attacker_strategy == 'isolate':
             # Get edges on paths from isolate objectives to sources
             on_path_to_source = self.get_edges_on_paths_to_source(start_nodes = self.state['isolate_objective'])
-            valid_actions = (sufficient_budget & #has_capacity & has_probability & 
+#            has_flow = self.cached_flow_array[:self.num_interdictable] > 0
+            valid_actions = (sufficient_budget & #has_capacity & 
+                             has_probability & 
                              on_path_to_source &
                             # has_flow &
                              within_limit)
         
-        if self.attacker_strategy == 'canalize':
+        elif self.attacker_strategy == 'canalize':
             has_flow = self.cached_flow_array[:self.num_interdictable] > 0
             not_target = self.state['canalize_objective'][:self.num_interdictable] != 1
             valid_actions = (sufficient_budget & #has_capacity & 
-                             #has_probability & 
+                             has_probability & 
                              within_limit & has_flow & not_target)
         elif self.attacker_strategy == 'divert':
             has_flow = self.cached_flow_array[:self.num_interdictable] > 0
             not_target = self.state['divert_to_objective'][:self.num_interdictable] != 1
             valid_actions = (sufficient_budget & #has_capacity & 
-                             #has_probability & 
+                             has_probability & 
                              within_limit & has_flow & not_target)
         else:
             has_flow = self.cached_flow_array[:self.num_interdictable] > 0
             valid_actions = (has_flow & sufficient_budget & #self.has_capacity & 
-                             #self.has_probability & 
+                             self.has_probability & 
                              within_limit)
     
         action_mask[:self.num_interdictable] = valid_actions.astype(np.float32)
