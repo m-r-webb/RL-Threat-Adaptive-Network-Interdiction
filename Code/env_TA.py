@@ -1800,6 +1800,10 @@ class _RemoteEnvWorker:
 
             # 1) check local cache
             if key in memo_local:
+                # ADDED: Count volume for cached hit
+                vol = int(self.num_both_edges ** max(0, self.budget_levels - d))
+                local_counter += vol
+                maybe_flush_progress()
                 return memo_local[key]
 
             # 2) check centralized memo
@@ -1809,6 +1813,10 @@ class _RemoteEnvWorker:
                 shared_val = None
             if shared_val is not None:
                 memo_local[key] = shared_val
+                # ADDED: Count volume for cached hit
+                vol = int(self.num_both_edges ** max(0, self.budget_levels - d))
+                local_counter += vol
+                maybe_flush_progress()
                 return shared_val
 
             # save/restore small pieces of state
@@ -1839,7 +1847,9 @@ class _RemoteEnvWorker:
             # base case
             if rem_budget < self.min_edge_cost or d >= self.max_depth_inner:
                 memo_local[key] = (final_objective, [])
-                local_counter += 1
+                # Count the volume of the skipped subtree (leaves)
+                volume = int(self.num_both_edges ** max(0, self.budget_levels - d))
+                local_counter += volume
                 maybe_flush_progress()
                 # publish to central memo (best-effort, async)
                 if self.memo_actor is not None:
@@ -1865,7 +1875,7 @@ class _RemoteEnvWorker:
 
             if len(valid_actions) == 0:
                 memo_local[key] = (final_objective, [])
-                local_counter += 1
+                # No increment here; the invalid logic above covered the entire subtree volume
                 maybe_flush_progress()
                 if self.memo_actor is not None:
                     try:
@@ -1886,10 +1896,8 @@ class _RemoteEnvWorker:
                     best_seq = [action] + fut_seq
 
             memo_local[key] = (best_reward, best_seq)
-            # record that we processed a state (memo insertion)
-            local_counter += 1
-            maybe_flush_progress()
-
+            # Do NOT increment local_counter here for internal nodes
+            
             # publish result to central memo (best-effort, async)
             if self.memo_actor is not None:
                 try:
@@ -1997,6 +2005,13 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
 
         # 1) local cache
         if key in memo_root:
+            # ADDED: Count volume for cached hit
+            if progress_actor is not None:
+                vol = int(self.num_both_edges ** max(0, budget_levels_local - depth))
+                try:
+                    progress_actor.increment.remote(vol)
+                except Exception:
+                    pass
             return memo_root[key]
 
         # 2) central memo
@@ -2006,6 +2021,13 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
             shared_val = None
         if shared_val is not None:
             memo_root[key] = shared_val
+            # ADDED: Count volume for cached hit
+            if progress_actor is not None:
+                vol = int(self.num_both_edges ** max(0, budget_levels_local - depth))
+                try:
+                    progress_actor.increment.remote(vol)
+                except Exception:
+                    pass
             return shared_val
 
         # save & restore small state pieces
@@ -2036,6 +2058,14 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
         # base case
         if remaining_budget < self.min_edge_cost or depth >= 20:
             memo_root[key] = (final_objective, [])
+            # Report progress for the skipped subtree
+            if progress_actor is not None:
+                vol = int(self.num_both_edges ** max(0, budget_levels_local - depth))
+                try:
+                    progress_actor.increment.remote(vol)
+                except Exception:
+                    pass
+            
             try:
                 memo_actor.set.remote(key, memo_root[key])
             except Exception:
@@ -2045,15 +2075,9 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
         # valid actions
         action_mask = self.mask_fn()
         valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
-        if len(valid_actions) == 0:
-            memo_root[key] = (final_objective, [])
-            try:
-                memo_actor.set.remote(key, memo_root[key])
-            except Exception:
-                pass
-            return final_objective, []
 
         # Count invalid actions and report progress similarly to original solver
+        # MOVED UP: Must happen before early return check
         num_invalid_actions = self.num_both_edges - len(valid_actions)
         if num_invalid_actions > 0 and progress_actor is not None:
             try:
@@ -2061,6 +2085,14 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
                 progress_actor.increment.remote(num_invalid_actions * est_per_invalid)
             except Exception:
                 pass
+
+        if len(valid_actions) == 0:
+            memo_root[key] = (final_objective, [])
+            try:
+                memo_actor.set.remote(key, memo_root[key])
+            except Exception:
+                pass
+            return final_objective, []
 
         # If at delegation depth, hand off each action-subtree to workers in parallel
         if depth + 1 >= worker_depth:
