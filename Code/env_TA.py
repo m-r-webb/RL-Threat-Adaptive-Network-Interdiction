@@ -4,6 +4,8 @@
 import os
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Disable oneDNN messages
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'   # Suppress most logs (including CUDA errors)
+os.environ["RAY_DISABLE_USAGE_STATS"] = "1"
+os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
 
 import pandas as pd
 import gurobipy as grb                # Gurobi optimization library for solving mathematical models
@@ -16,6 +18,15 @@ import tensorflow as tf
 tf.get_logger().setLevel('ERROR')          # Optional: Suppress Python-
 
 from collections import defaultdict, Counter
+
+# Reduce native logging noise (best-effort; affects Python loggers)
+import logging
+logging.getLogger("ray").setLevel(logging.WARNING)
+logging.getLogger("raylet").setLevel(logging.WARNING)
+
+import ray
+ray.init(address=None, ignore_reinit_error=True, logging_level=logging.WARNING)
+
 
 # Class representing Node Object
 class Node():
@@ -204,7 +215,7 @@ class CustomEnv(gym.Env):
     def _setup_spaces(self):
         """Setup observation and action spaces based on environment configuration."""
         # Calculate space dimensions
-        self.num_both_edges = len(self.both_edges)
+        self.num_both_edges = np.int64(len(self.both_edges))
         
         # Create base spaces
         self.base_spaces = self._create_base_spaces()
@@ -380,7 +391,7 @@ class CustomEnv(gym.Env):
 
         self.reverse_cons = self.maxflow_model.addConstrs((
             self.flow_var[(e[1],e[0])] <= capacity_dict.get(e, 0) * self.edge_used[(e[1],e[0])] 
-            for idx, e in enumerate(self.both_edges)), name="flow_capacity_reverse")
+            for idx, e in enumerate(self.both_edges)), name="flow_capacity_reverse")        
         
     def _set_routing_objectives(self, routing_assumption):
         """Set model objectives based on routing assumption."""
@@ -397,11 +408,11 @@ class CustomEnv(gym.Env):
 
             if routing_assumption == "consolidated":
                 # Secondary: Minimize edges used
-                self.maxflow_model.setObjectiveN(grb.quicksum(self.edge_used[e] for e in self.all_both_edges), index=1, priority=1, weight=-1.0, abstol =0,
+                self.maxflow_model.setObjectiveN(grb.quicksum(self.edge_used[e] for e in self.all_both_edges), index=1, priority=1, weight=-1.0,
                                                  name="min_edges")
             elif routing_assumption == "distributed":
                 # Secondary: Maximize edges used
-                self.maxflow_model.setObjectiveN(grb.quicksum(self.edge_used[e] for e in self.all_both_edges), index=1, priority=2, weight=1.0, abstol =0,
+                self.maxflow_model.setObjectiveN(grb.quicksum(self.edge_used[e] for e in self.all_both_edges), index=1, priority=2, weight=1.0,
                                                  name="max_edges")
             
             elif routing_assumption == "least_vulnerable":
@@ -1444,7 +1455,7 @@ class CustomEnv(gym.Env):
 
         return (self.optimal_stochastic_model_IM.objVal, interdicted_edges, interdicted_quantities)
 
-    def solve_backward_induction(self, verbose=False):
+    def solve_backward_induction_OLD(self, verbose=False):  #REMOVE _OLD
         """
         Solve the optimal interdiction strategy for attacker using backward induction.
         This method finds the optimal interdictions for a particular attacker strategy.
@@ -1463,17 +1474,11 @@ class CustomEnv(gym.Env):
         budget_levels = max_budget // self.min_edge_cost
         estimated_states = self.num_both_edges ** budget_levels  # Use actual_num_edges, not max
         update_rate = max(200, 1)
-        
-        # Memoization dictionary: state -> (max_reward, best_action_sequence)
         memo = {}
 
         states_processed = 0
         pbar = tqdm(total=estimated_states, desc="DP States", unit=" states", disable=not verbose)
 
-        # Initialize the dynamic programming table
-        def state_to_key(interdicted_state):
-            return tuple(interdicted_state)
-        
         def update_progress(num_states_processed):
             # Update progress every 100 states
             nonlocal states_processed
@@ -1486,20 +1491,20 @@ class CustomEnv(gym.Env):
         
         def dp_solve(remaining_budget, interdicted_state, depth=0):
             """Dynamic programming recursive function for backward induction."""           
-            state_key = state_to_key(interdicted_state)
+            # Initialize the dynamic programming table
+            state_key = interdicted_state[:self.num_both_edges].tobytes() #tuple(interdicted_state[:self.num_both_edges])
         
             # Check if we've already solved this state
             if state_key in memo:
                 update_progress(self.num_both_edges**(budget_levels-depth))
                 return memo[state_key]
 
-            temp_state = self.state.copy()
-            temp_state['edge_interdicted'] = interdicted_state.copy()
-            temp_state['budget'] = np.array([remaining_budget])
-                
-            old_state = self.state
-            self.state = temp_state
-
+            old_budget = self.state['budget'][0]
+            old_interdicted = self.state['edge_interdicted'].copy()  # Only copy this array
+    
+            self.state['budget'][0] = remaining_budget
+            self.state['edge_interdicted'][:] = interdicted_state            
+            
             if self.attacker_strategy == "zero_sum":
                 final_objective, self.reference_flows = self._compute_objective_and_flows()
                 final_objective = -final_objective
@@ -1511,7 +1516,9 @@ class CustomEnv(gym.Env):
             elif self.attacker_strategy == 'divert':
                 final_objective, self.reference_flows = self._calculate_divert_objective_and_flows()
                 
-            self.state = old_state
+            #self.state = old_state
+            self.state['budget'][0] = old_budget
+            self.state['edge_interdicted'][:] = old_interdicted
             
             # Base case: no more budget or maximum depth reached
             if remaining_budget < self.min_edge_cost or depth >= 20:
@@ -1525,12 +1532,6 @@ class CustomEnv(gym.Env):
             valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
             num_invalid_actions = np.where(action_mask[:self.num_both_edges] == 0)[0].shape[0]
             update_progress((self.num_both_edges**(budget_levels-(depth+1)))*num_invalid_actions)
-#            for action in range(self.num_both_edges):
-#                edge = self.both_edges[action]
-#                if self._validate_action(action, [remaining_budget], interdicted_state): # and (flows.get(edge, 0) != 0 or flows.get((edge[1],edge[0]), 0) != 0):
-#                    valid_actions.append(action)
-#                else:
-#                    update_progress(self.num_both_edges**(budget_levels-(depth+1)))
         
             # If no valid actions, evaluate terminal state
             if len(valid_actions)==0:
@@ -1619,6 +1620,46 @@ class CustomEnv(gym.Env):
 
         return self.state, {}
 
+    def get_edges_on_paths_to_source(self, start_nodes=None):
+        """
+        Determine which edges have non-zero flow in self.cached_flow_array and lie along a path from the isolate_objective nodes to a source node.
+        Uses backward BFS from target nodes through edges with non-zero flow to reach source nodes.
+        Returns:
+            np.ndarray: Boolean array of shape (self.numbothedges,) where True indicates the edge has non-zero flow and is on a path from an isolate_objective node to a source.
+        """
+        if start_nodes is None:
+            start_nodes = self.state['isolate_objective']
+            
+        origin_nodes = set()
+        destination_nodes = set()
+        for idx in np.where(start_nodes[:self.num_both_edges]==1)[0]:
+            edge = self.both_edges[idx]
+            origin_nodes.add(edge[0])
+            destination_nodes.add(edge[1])
+        target_nodes = origin_nodes.intersection(destination_nodes)
+
+        visited_nodes = set(target_nodes)
+        incoming_edge_indices = set()
+
+        while target_nodes:
+            arrival_in_targets = np.isin(self.edge_arrivals, list(target_nodes))
+            has_flow = (self.cached_flow_array[:self.num_both_edges]) > 1e-6
+            valid_edge_indices = np.where(arrival_in_targets & has_flow)[0]
+            incoming_edge_indices.update(valid_edge_indices)
+            # Get new target nodes (departure nodes of incoming edges)
+            new_target_nodes = set([self.both_edges[idx][0] for idx in valid_edge_indices])
+    
+            # Remove already visited nodes
+            target_nodes = new_target_nodes - visited_nodes
+    
+            # Add newly discovered nodes to visited set
+            visited_nodes.update(target_nodes)
+    
+#        incoming_edges_with_flow = [self.both_edges[idx] for idx in incoming_edge_indices]
+        action_mask = np.zeros(self.num_both_edges, dtype=bool)
+        action_mask[list(incoming_edge_indices)] = True
+        return(action_mask)
+    
     def mask_fn(self):
         """
         Fully vectorized function using cached flow information.
@@ -1628,33 +1669,482 @@ class CustomEnv(gym.Env):
         edge_interdicted = self.state['edge_interdicted']
     
         action_mask = np.ones(self.action_space.n, dtype=np.float32)
-        #num_interdictable = min(self.num_both_edges, self.action_space.n)
     
         # All vectorized checks
-        #valid_edges = np.arange(num_interdictable) < self.num_both_edges
         sufficient_budget = (remaining_budget - self.state['edge_costs'][:self.num_interdictable]) >= -0.1
         #has_capacity = self.state['edge_capacity'][:self.num_interdictable] > 0
         #has_probability = self.state['edge_interdiction_probability'][:self.num_interdictable] > 0
     
         max_interdictions = self.MAX_INTERDICTION_ATTEMPTS if self.multiple_interdiction_attempts else 1
         within_limit = (edge_interdicted[:self.num_interdictable] + 1) <= max_interdictions
-    
-        # Use cached flow array (FAST!)
-        #has_flow = self.cached_flow_array[:self.num_interdictable] > 0
-    
+        
         # Strategy-specific checks
+        if self.attacker_strategy == 'isolate':
+            # Get edges on paths from isolate objectives to sources
+            on_path_to_source = self.get_edges_on_paths_to_source(start_nodes = self.state['isolate_objective'])
+            valid_actions = (sufficient_budget & #has_capacity & has_probability & 
+                             on_path_to_source &
+                            # has_flow &
+                             within_limit)
+        
         if self.attacker_strategy == 'canalize':
+            has_flow = self.cached_flow_array[:self.num_interdictable] > 0
             not_target = self.state['canalize_objective'][:self.num_interdictable] != 1
-            valid_actions = (valid_edges & sufficient_budget & has_capacity & 
-                             has_probability & within_limit & has_flow & not_target)
+            valid_actions = (sufficient_budget & #has_capacity & 
+                             #has_probability & 
+                             within_limit & has_flow & not_target)
         elif self.attacker_strategy == 'divert':
+            has_flow = self.cached_flow_array[:self.num_interdictable] > 0
             not_target = self.state['divert_to_objective'][:self.num_interdictable] != 1
-            valid_actions = (valid_edges & sufficient_budget & has_capacity & 
-                             has_probability & within_limit & has_flow & not_target)
+            valid_actions = (sufficient_budget & #has_capacity & 
+                             #has_probability & 
+                             within_limit & has_flow & not_target)
         else:
-            valid_actions = (#valid_edges & has_flow &
-                sufficient_budget & self.has_capacity & self.has_probability & within_limit)
+            has_flow = self.cached_flow_array[:self.num_interdictable] > 0
+            valid_actions = (has_flow & sufficient_budget & #self.has_capacity & 
+                             #self.has_probability & 
+                             within_limit)
     
         action_mask[:self.num_interdictable] = valid_actions.astype(np.float32)
     
         return action_mask
+
+@ray.remote
+class _ProgressActor:
+    def __init__(self):
+        self.count = 0
+    def increment(self, n: int = 1):
+        self.count += int(n)
+    def get_count(self):
+        return self.count
+    def reset(self):
+        self.count = 0
+
+# New: centralized memo actor (shared between driver + workers)
+@ray.remote
+class _SharedMemoActor:
+    def __init__(self):
+        self.store = {}
+    def get(self, key):
+        return self.store.get(key, None)
+    def set(self, key, value):
+        self.store[key] = value
+    def contains(self, key):
+        return key in self.store
+    def size(self):
+        return len(self.store)
+    def get_bulk(self, keys):
+        return {k: self.store.get(k, None) for k in keys}
+
+@ray.remote
+class _RemoteEnvWorker:
+    def __init__(self, nodes, edges, seed, state_snapshot, attacker_strategy, min_edge_cost, num_both_edges,
+                 deterministic_outcomes, multiple_interdiction_attempts, progress_actor=None, memo_actor=None,
+                 budget_levels=1, progress_granularity=50, max_depth_inner=20):
+        """
+        Worker now accepts a progress_actor handle, a shared memo_actor handle,
+        and budget_levels so it can estimate progress for invalid actions.
+        """
+        import importlib, copy, numpy as np, ray as _ray
+        env_mod = importlib.import_module("env_TA")
+        CustomEnv = getattr(env_mod, "CustomEnv")
+
+        # Instantiate env with the same key flags so internals (num_both_edges, spaces, models) are set up
+        self.env = CustomEnv(nodes, edges,
+                             deterministic_agent=deterministic_outcomes,
+                             multiple_interdiction_attempts=multiple_interdiction_attempts,
+                             attacker_strategy=attacker_strategy)
+
+        # Make a deep, writable copy of the state snapshot to avoid read-only numpy arrays
+        state_copy = copy.deepcopy(state_snapshot)
+        if isinstance(state_copy, dict):
+            for k, v in list(state_copy.items()):
+                if isinstance(v, np.ndarray):
+                    try:
+                        v = v.copy()
+                        v.setflags(write=True)
+                        state_copy[k] = v
+                    except Exception:
+                        state_copy[k] = np.array(v, copy=True)
+
+        # Restore state on the worker
+        self.env.load_network_from_state(seed, state_copy)
+
+        self.attacker_strategy = attacker_strategy
+        self.min_edge_cost = min_edge_cost
+        self.num_both_edges = num_both_edges
+        self.max_depth_inner = max_depth_inner
+        self.progress_actor = progress_actor
+        self.memo_actor = memo_actor
+        self.progress_granularity = int(progress_granularity)
+        self.budget_levels = int(budget_levels)
+
+    def evaluate_subtree(self, remaining_budget, interdicted_state, depth):
+        import numpy as np, ray as _ray
+        memo_local = {}
+        local_counter = 0
+
+        def maybe_flush_progress():
+            nonlocal local_counter
+            if self.progress_actor is not None and local_counter >= self.progress_granularity:
+                try:
+                    # report and reset local counter (best-effort)
+                    self.progress_actor.increment.remote(local_counter)
+                except Exception:
+                    pass
+                local_counter = 0
+
+        def dp_local(rem_budget, inter_state, d):
+            nonlocal local_counter
+            key = inter_state[:self.num_both_edges].tobytes()
+
+            # 1) check local cache
+            if key in memo_local:
+                return memo_local[key]
+
+            # 2) check centralized memo
+            try:
+                shared_val = _ray.get(self.memo_actor.get.remote(key)) if self.memo_actor is not None else None
+            except Exception:
+                shared_val = None
+            if shared_val is not None:
+                memo_local[key] = shared_val
+                return shared_val
+
+            # save/restore small pieces of state
+            old_budget = self.env.state['budget'][0]
+            old_interdicted = self.env.state['edge_interdicted'].copy()
+
+            self.env.state['budget'][0] = rem_budget
+            self.env.state['edge_interdicted'][:] = inter_state
+
+            # terminal objective
+            if self.attacker_strategy == "zero_sum":
+                final_objective, _ = self.env._compute_objective_and_flows()
+                final_objective = -final_objective
+            elif self.attacker_strategy == 'canalize':
+                final_objective, _ = self.env._calculate_canalize_objective_and_flows()
+            elif self.attacker_strategy == 'isolate':
+                final_objective, _ = self.env._calculate_isolate_objective_and_flows()
+                final_objective = -final_objective
+            elif self.attacker_strategy == 'divert':
+                final_objective, _ = self.env._calculate_divert_objective_and_flows()
+            else:
+                final_objective = -float('inf')
+
+            # restore
+            self.env.state['budget'][0] = old_budget
+            self.env.state['edge_interdicted'][:] = old_interdicted
+
+            # base case
+            if rem_budget < self.min_edge_cost or d >= self.max_depth_inner:
+                memo_local[key] = (final_objective, [])
+                local_counter += 1
+                maybe_flush_progress()
+                # publish to central memo (best-effort, async)
+                if self.memo_actor is not None:
+                    try:
+                        self.memo_actor.set.remote(key, memo_local[key])
+                    except Exception:
+                        pass
+                return final_objective, []
+
+            action_mask = self.env.mask_fn()
+            valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
+
+            # Report the discovery of invalid actions as progress using estimated subtree sizes
+            num_invalid = self.num_both_edges - len(valid_actions)
+            if num_invalid > 0 and self.progress_actor is not None:
+                try:
+                    # estimated states pruned by each invalid action
+                    est_per_invalid = int(self.num_both_edges ** max(0, self.budget_levels - (d + 1)))
+                    local_counter += num_invalid * est_per_invalid
+                    maybe_flush_progress()
+                except Exception:
+                    pass
+
+            if len(valid_actions) == 0:
+                memo_local[key] = (final_objective, [])
+                local_counter += 1
+                maybe_flush_progress()
+                if self.memo_actor is not None:
+                    try:
+                        self.memo_actor.set.remote(key, memo_local[key])
+                    except Exception:
+                        pass
+                return final_objective, []
+
+            best_reward = -float('inf')
+            best_seq = []
+            for action in valid_actions:
+                new_state = inter_state.copy()
+                new_state[action] += 1
+                new_budget = rem_budget - self.env.state['edge_costs'][action]
+                fut_reward, fut_seq = dp_local(new_budget, new_state, d + 1)
+                if fut_reward > best_reward:
+                    best_reward = fut_reward
+                    best_seq = [action] + fut_seq
+
+            memo_local[key] = (best_reward, best_seq)
+            # record that we processed a state (memo insertion)
+            local_counter += 1
+            maybe_flush_progress()
+
+            # publish result to central memo (best-effort, async)
+            if self.memo_actor is not None:
+                try:
+                    self.memo_actor.set.remote(key, memo_local[key])
+                except Exception:
+                    pass
+
+            return best_reward, best_seq
+
+        result = dp_local(remaining_budget, interdicted_state.copy(), depth)
+        # flush any remaining progress
+        if self.progress_actor is not None and local_counter > 0:
+            try:
+                self.progress_actor.increment.remote(local_counter)
+            except Exception:
+                pass
+        return result
+
+# New parallel entrypoint (keeps your old function untouched)
+def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=1, ray_address=None):
+    """
+    Parallelized backward induction using Ray.
+    - n_workers: number of Ray actors to create
+    - worker_depth: depth at which subtrees are handed to workers
+    """
+    # init ray if not already
+    if not ray.is_initialized():
+        ray.init(address=ray_address, ignore_reinit_error=True)
+
+    # precompute min edge cost etc (same as original)
+    real_edge_costs = self.state['edge_costs'][:self.num_both_edges]
+    self.min_edge_cost = min(real_edge_costs[real_edge_costs > 0], default=float('inf'))
+    if self.min_edge_cost == float('inf'):
+        self.min_edge_cost = 1
+
+    # snapshot state to send to workers
+    import copy, numpy as np, ray as _ray
+    state_snapshot = copy.deepcopy(self.state)
+    seed = getattr(self, 'seed', None)
+
+    # create a progress actor, shared memo actor and workers
+    progress_actor = _ProgressActor.remote()
+    memo_actor = _SharedMemoActor.remote()
+    # compute budget_levels for worker estimates
+    max_budget = self.state['budget'][0]
+    budget_levels = max_budget // self.min_edge_cost if self.min_edge_cost > 0 else 1
+
+    workers = [
+        _RemoteEnvWorker.remote(
+            self.nodes,
+            self.edges_reset,
+            seed,
+            state_snapshot,
+            self.attacker_strategy,
+            self.min_edge_cost,
+            self.num_both_edges,
+            self.deterministic_outcomes,
+            self.multiple_interdiction_attempts,
+            progress_actor=progress_actor,
+            memo_actor=memo_actor,
+            budget_levels=budget_levels,
+            progress_granularity=100,
+            max_depth_inner=20
+        )
+        for _ in range(n_workers)
+    ]
+
+    # Estimate total DP states for progress bar
+    budget_levels_local = budget_levels
+    estimated_states = (self.num_both_edges ** budget_levels_local) if budget_levels_local > 0 else 1
+
+    # Setup tqdm progress bar and polling thread
+    from tqdm import tqdm
+    import threading, time
+    stop_event = threading.Event()
+    pbar = tqdm(total=estimated_states, desc="DP States (parallel)", unit=" states", disable=not verbose)
+    last_reported = 0
+
+    def poll_progress():
+        nonlocal last_reported
+        while not stop_event.is_set():
+            try:
+                current = _ray.get(progress_actor.get_count.remote(), timeout=1)
+            except Exception:
+                current = last_reported
+            delta = current - last_reported
+            if delta > 0:
+                pbar.update(delta)
+                last_reported = current
+            time.sleep(0.5)
+
+    poll_thread = threading.Thread(target=poll_progress, daemon=True)
+    poll_thread.start()
+
+    # --- DP root function (local recursion + delegation to workers), consults central memo ---
+    memo_root = {}
+
+    def dp_root(remaining_budget, interdicted_state, depth=0):
+        """
+        Recursive DP on driver. When depth hits worker_depth delegate each action-subtree
+        to a worker.evaluate_subtree; otherwise recurse locally. Uses the shared memo_actor.
+        """
+        import ray as _ray
+        key = interdicted_state[:self.num_both_edges].tobytes()
+
+        # 1) local cache
+        if key in memo_root:
+            return memo_root[key]
+
+        # 2) central memo
+        try:
+            shared_val = _ray.get(memo_actor.get.remote(key))
+        except Exception:
+            shared_val = None
+        if shared_val is not None:
+            memo_root[key] = shared_val
+            return shared_val
+
+        # save & restore small state pieces
+        old_budget = self.state['budget'][0]
+        old_interdicted = self.state['edge_interdicted'].copy()
+
+        self.state['budget'][0] = remaining_budget
+        self.state['edge_interdicted'][:] = interdicted_state
+
+        # compute terminal objective for this node
+        if self.attacker_strategy == "zero_sum":
+            final_objective, self.reference_flows = self._compute_objective_and_flows()
+            final_objective = -final_objective
+        elif self.attacker_strategy == 'canalize':
+            final_objective, self.reference_flows = self._calculate_canalize_objective_and_flows()
+        elif self.attacker_strategy == 'isolate':
+            final_objective, self.reference_flows = self._calculate_isolate_objective_and_flows()
+            final_objective = -final_objective
+        elif self.attacker_strategy == 'divert':
+            final_objective, self.reference_flows = self._calculate_divert_objective_and_flows()
+        else:
+            final_objective = -float('inf')
+
+        # restore
+        self.state['budget'][0] = old_budget
+        self.state['edge_interdicted'][:] = old_interdicted
+
+        # base case
+        if remaining_budget < self.min_edge_cost or depth >= 20:
+            memo_root[key] = (final_objective, [])
+            try:
+                memo_actor.set.remote(key, memo_root[key])
+            except Exception:
+                pass
+            return final_objective, []
+
+        # valid actions
+        action_mask = self.mask_fn()
+        valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
+        if len(valid_actions) == 0:
+            memo_root[key] = (final_objective, [])
+            try:
+                memo_actor.set.remote(key, memo_root[key])
+            except Exception:
+                pass
+            return final_objective, []
+
+        # Count invalid actions and report progress similarly to original solver
+        num_invalid_actions = self.num_both_edges - len(valid_actions)
+        if num_invalid_actions > 0 and progress_actor is not None:
+            try:
+                est_per_invalid = int(self.num_both_edges ** max(0, budget_levels_local - (depth + 1)))
+                progress_actor.increment.remote(num_invalid_actions * est_per_invalid)
+            except Exception:
+                pass
+
+        # If at delegation depth, hand off each action-subtree to workers in parallel
+        if depth + 1 >= worker_depth:
+            tasks = []
+            for i, action in enumerate(valid_actions):
+                new_state = interdicted_state.copy()
+                new_state[action] += 1
+                new_budget = remaining_budget - self.state['edge_costs'][action]
+                worker = workers[i % len(workers)]
+                tasks.append((action, worker.evaluate_subtree.remote(new_budget, new_state, depth + 1)))
+
+            # collect results
+            results = _ray.get([t[1] for t in tasks])
+            best_reward = -float('inf')
+            best_seq = []
+            for (action, res) in zip([t[0] for t in tasks], results):
+                fut_reward, fut_seq = res
+                if fut_reward > best_reward:
+                    best_reward = fut_reward
+                    best_seq = [action] + fut_seq
+
+            memo_root[key] = (best_reward, best_seq)
+            try:
+                memo_actor.set.remote(key, memo_root[key])
+            except Exception:
+                pass
+            return best_reward, best_seq
+
+        # otherwise evaluate locally
+        best_reward = -float('inf')
+        best_seq = []
+        for action in valid_actions:
+            new_state = interdicted_state.copy()
+            new_state[action] += 1
+            new_budget = remaining_budget - self.state['edge_costs'][action]
+            fut_reward, fut_seq = dp_root(new_budget, new_state, depth + 1)
+            if fut_reward > best_reward:
+                best_reward = fut_reward
+                best_seq = [action] + fut_seq
+
+        memo_root[key] = (best_reward, best_seq)
+        try:
+            memo_actor.set.remote(key, memo_root[key])
+        except Exception:
+            pass
+        return best_reward, best_seq
+    # --- end dp_root ---
+
+    # Start root solve
+    initial_budget = self.state['budget'][0]
+    initial_interdicted_state = self.state['edge_interdicted'].copy()
+
+    optimal_reward, optimal_sequence = dp_root(initial_budget, initial_interdicted_state, depth=0)
+
+    # stop polling and finalize progress bar
+    stop_event.set()
+    poll_thread.join(timeout=2)
+    try:
+        final = ray.get(progress_actor.get_count.remote())
+        pbar.update(final - last_reported)
+    except Exception:
+        pass
+    pbar.close()
+
+    # cleanup actors
+    for w in workers:
+        try:
+            ray.kill(w)
+        except Exception:
+            pass
+    try:
+        ray.kill(progress_actor)
+    except Exception:
+        pass
+
+    if self.attacker_strategy in ("zero_sum", "isolate"):
+        optimal_reward = -optimal_reward
+
+    optimal_actions = [self.both_edges[idx] for idx in optimal_sequence]
+    return optimal_reward, optimal_actions
+
+# Attach the new method to CustomEnv class (if needed)
+try:
+    CustomEnv.solve_backward_induction_ray = solve_backward_induction_ray
+except Exception:
+    pass
+
