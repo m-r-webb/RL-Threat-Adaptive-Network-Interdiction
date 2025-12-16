@@ -270,22 +270,23 @@ class CustomEnv(gym.Env):
         observation_dict = {**self.base_spaces, **self.strategy_spaces.get(self.attacker_strategy, {})}
         return spaces.Dict(observation_dict)
     
-    def solve_max_flow(self, capacity_dict=None, routing_assumption = "least_vulnerable"):
+    def solve_max_flow(self, capacity_dict=None, routing_assumption='zero_sum'):
         """
-        Solve the Max Flow network problem, output objective value and edge flows.
+        Solve the Max Flow network problem with strategy-specific objectives.
     
         Parameters:
         -----------
         capacity_dict : dict, optional
             If provided, uses this capacity dictionary instead of current state.
             Useful for batch solving with different capacity configurations.
-        routing_assumption : str
-            Routing optimization objective ('gurobi_default', 'consolidated', 'distributed','least_vulnerable')
+        routing_assumption : ignored
+            Kept for backward compatibility.
     
         Returns:
         --------
         tuple: (objective_value, flow_dict)
         """
+                
         # Initialize model on first call
         if not hasattr(self, 'maxflow_model'):
             self._initialize_maxflow_model()
@@ -298,16 +299,24 @@ class CustomEnv(gym.Env):
             # Use current state (legacy path)
             self._update_capacity_constraints()
 
-        # Update objectives based on routing assumption
-        if self.old_routing != routing_assumption:
-            self._set_routing_objectives(routing_assumption)
+        # Update objectives if needed (e.g. start of new episode or model re-init)
+        if (not getattr(self, 'strategy_objectives_setup', False)) or (self.old_routing_assumption==routing_assumption):
+            self._set_strategy_objectives(routing_assumption)
+            self.strategy_objectives_setup = True
+            self.old_routing_assumption = routing_assumption
             
         # Solve and return results
         self.maxflow_model.params.Seed = 1
         self.maxflow_model.optimize()
-        flow_results = {e: round(var.X) for e, var in self.flow_var.items()}
         
-        return round(self.maxflow_model.ObjVal), flow_results 
+        if self.maxflow_model.Status == grb.GRB.OPTIMAL:
+            obj_val = round(self.maxflow_model.ObjVal)
+            flow_results = {e: round(var.X) for e, var in self.flow_var.items()}
+        else:
+            obj_val = 0
+            flow_results = {e: 0 for e in self.flow_var.keys()}
+        
+        return obj_val, flow_results 
 
     def _initialize_maxflow_model(self):
         """Initialize the Gurobi max flow model with variables and constraints."""
@@ -322,7 +331,8 @@ class CustomEnv(gym.Env):
         self.flow_var = self.maxflow_model.addVars(self.mf_all_both_edges, vtype=grb.GRB.CONTINUOUS, lb=0, name="flow_var")
 
         # Add Edge Usage variables
-        self.edge_used = self.maxflow_model.addVars(self.all_both_edges, vtype=grb.GRB.BINARY, name="edge_used")
+        # CHANGE: vtype=grb.GRB.BINARY -> vtype=grb.GRB.CONTINUOUS for speed
+        self.edge_used = self.maxflow_model.addVars(self.all_both_edges, vtype=grb.GRB.CONTINUOUS, name="edge_used")
 
         ##CONSTRAINTS
         # Flow conservation for intermediate nodes
@@ -398,51 +408,102 @@ class CustomEnv(gym.Env):
             self.flow_var[(e[1],e[0])] <= capacity_dict.get(e, 0) * self.edge_used[(e[1],e[0])] 
             for idx, e in enumerate(self.both_edges)), name="flow_capacity_reverse")        
         
-    def _set_routing_objectives(self, routing_assumption):
-        """Set model objectives based on routing assumption."""
+    def _set_strategy_objectives(self, routing_assumption):
+        """Set hierarchical objectives based on attacker strategy."""
         # Clear existing objectives
         self.maxflow_model.NumObj = 0
+        self.maxflow_model.ModelSense = grb.GRB.MAXIMIZE
         self.maxflow_model.update()
         
-        if routing_assumption == "gurobi_default":
-            self.maxflow_model.setObjective(self.flow_var[self.super_edge], grb.GRB.MAXIMIZE)
-        else:
-             # Primary: Maximize flow
-            self.maxflow_model.ModelSense = grb.GRB.MAXIMIZE
-            self.maxflow_model.setObjectiveN(self.flow_var[self.super_edge], index=0, priority=3, weight=1.0, name="max_flow")
+        # Clean up previous auxiliary variables/constraints
+        if hasattr(self, 'aux_vars'):
+            for v in self.aux_vars: 
+                try: self.maxflow_model.remove(v)
+                except: pass
+            self.aux_vars = []
+        if hasattr(self, 'aux_constrs'):
+            for c in self.aux_constrs: 
+                try: self.maxflow_model.remove(c)
+                except: pass
+            self.aux_constrs = []
+        
+        self.aux_vars = []
+        self.aux_constrs = []
+        
+        # 1. Primary Objective: Maximize Total Flow (Always Priority 10)
+        self.maxflow_model.setObjectiveN(self.flow_var[self.super_edge], index=0, priority=10, weight=1.0, name="max_flow")
 
-            if routing_assumption == "consolidated":
-                # Secondary: Minimize edges used
-                self.maxflow_model.setObjectiveN(grb.quicksum(self.edge_used[e] for e in self.all_both_edges), index=1, priority=1, weight=-1.0,
-                                                 name="min_edges")
-            elif routing_assumption == "distributed":
-                # Secondary: Maximize edges used
-                self.maxflow_model.setObjectiveN(grb.quicksum(self.edge_used[e] for e in self.all_both_edges), index=1, priority=2, weight=1.0,
-                                                 name="max_edges")
+        if routing_assumption == "zero_sum":
+            # No secondary objectives
+            pass
+
+        elif routing_assumption == "isolate":
+            # Secondary: Maximize flow to isolated edges (Priority 5)
+            target_indices = np.where(self.state['isolate_objective'][:self.num_both_edges] == 1)[0]
+            target_edges = [self.both_edges[i] for i in target_indices]
             
-            elif routing_assumption == "least_vulnerable":
-                # Secondary: Minimize vulnerability (weighted by interdiction probability)
-                self.maxflow_model.setObjectiveN(grb.quicksum((self.state["edge_interdiction_probability"][ind]+0.01)*  #add 0.01 to avoid unnecessary routing through zero arcs
-                                                              (self.flow_var[e]+self.flow_var[(e[1],e[0])]) 
-                                                              for ind, e in enumerate(self.both_edges)), index=1, priority=2,
-                                                 weight=-1.0, abstol =0, name="least_vulnerable")
+            if target_edges:
+                expr = grb.quicksum(self.flow_var[e] + self.flow_var[(e[1], e[0])] for e in target_edges)
+                self.maxflow_model.setObjectiveN(expr, index=1, priority=5, weight=1.0, name="max_isolate_flow")
+
+        elif routing_assumption == "canalize":
+            # Secondary: Maximize minimum flow along canalized edges (Priority 5)
+            target_indices = np.where(self.state['canalize_objective'][:self.num_both_edges] == 1)[0]
+            target_edges = [self.both_edges[i] for i in target_indices]
+            
+            if target_edges:
+                # Aux variable z representing min flow
+                z = self.maxflow_model.addVar(vtype=grb.GRB.CONTINUOUS, name="min_canalize_flow")
+                self.aux_vars.append(z)
                 
-                # Tertiary: Maximize excess capacity along routes used (weighted by edge capacity)
-                self.maxflow_model.setObjectiveN(grb.quicksum(self.state["edge_capacity"][ind] *
-                                                              (self.flow_var[e]+self.flow_var[(e[1],e[0])]) 
-                                                              for ind, e in enumerate(self.both_edges)), index=2, priority=1,
-                                                 weight=1.0, abstol =0, name="excess_capacity")
-            else:
-                raise ValueError(f"Unknown routing assumption: {routing_assumption}")
-    
-        self.old_routing = routing_assumption
+                # Constraints: z <= flow_e
+                constrs = self.maxflow_model.addConstrs(
+                    (z <= self.flow_var[e] + self.flow_var[(e[1], e[0])] for e in target_edges),
+                    name="min_flow_constr"
+                )
+                self.aux_constrs.extend(constrs.values())
+                
+                self.maxflow_model.setObjectiveN(z, index=1, priority=5, weight=1.0, name="max_min_canalize")
+
+        elif routing_assumption == "divert":
+            # Secondary: Maximize min flow on 'divert_from' (Priority 5)
+            # Tertiary: Minimize flow on 'divert_to' (Priority 1)
+            
+            # Divert From
+            from_indices = np.where(self.state['divert_from_objective'][:self.num_both_edges] == 1)[0]
+            from_edges = [self.both_edges[i] for i in from_indices]
+            
+            if from_edges:
+                z_from = self.maxflow_model.addVar(vtype=grb.GRB.CONTINUOUS, name="min_divert_from_flow")
+                self.aux_vars.append(z_from)
+                
+                constrs = self.maxflow_model.addConstrs(
+                    (z_from <= self.flow_var[e] + self.flow_var[(e[1], e[0])] for e in from_edges),
+                    name="min_from_constr"
+                )
+                self.aux_constrs.extend(constrs.values())
+                
+                self.maxflow_model.setObjectiveN(z_from, index=1, priority=5, weight=1.0, name="max_min_divert_from")
+            
+            # Divert To
+            to_indices = np.where(self.state['divert_to_objective'][:self.num_both_edges] == 1)[0]
+            to_edges = [self.both_edges[i] for i in to_indices]
+            
+            if to_edges:
+                expr_to = grb.quicksum(self.flow_var[e] + self.flow_var[(e[1], e[0])] for e in to_edges)
+                # Minimize -> weight = -1.0
+                self.maxflow_model.setObjectiveN(expr_to, index=2, priority=1, weight=-1.0, name="min_divert_to_sum")
+
+        self.maxflow_model.update()
     
     # BEGIN Gymnasium Environment Methods        
     def reset(self, seed=None, options=None):
         """Reset the environment to initial state and return observation."""
         # Clean up any existing models
         self._cleanup_models()
-
+        self.strategy_objectives_setup = False # Force objective reset on next solve
+        self.old_routing_assumption = False
+        
         # Call parent reset and set random seeds
         super().reset(seed=seed)
         if seed is not None:
@@ -502,7 +563,7 @@ class CustomEnv(gym.Env):
         elif self.attacker_strategy == 'isolate':
             self.reference_obj, self.reference_flows = self._calculate_isolate_objective_and_flows()
         elif self.attacker_strategy == 'divert':
-            _, self.reference_flows = self.solve_max_flow()
+            _, self.reference_flows = self.solve_max_flow(routing_assumption = 'divert')
             from_flow = self._calculate_target_path_flow(self.reference_flows, 'divert_from_objective')
             to_flow = self._calculate_target_path_flow(self.reference_flows, 'divert_to_objective')
             self.reference_start_flows = (from_flow, to_flow)
@@ -936,12 +997,12 @@ class CustomEnv(gym.Env):
                 capacity_dict[edge] = 0 if is_interdicted else base_capacity
         
             # Solve max flow for this outcome
-            obj, flows = self.solve_max_flow(capacity_dict)
+            obj, flows = self.solve_max_flow(capacity_dict, routing_assumption = strategy_type)
         
             # Calculate strategy-specific objective
             if strategy_type == "zero_sum":
                 objective = obj
-            elif strategy_type == "canalize":
+            elif strategy_type == "canalize":                
                 objective = self._calculate_target_path_flow(flows, 'canalize_objective') 
             elif strategy_type == "isolate":
                 objective = self._calculate_target_edge_flow(flows, 'isolate_objective')
@@ -988,7 +1049,7 @@ class CustomEnv(gym.Env):
     def _calculate_canalize_objective_and_flows(self):
         """Calculate objective for canalize strategy (flow through specific path)."""
         if self.deterministic_outcomes:
-            _, flows = self.solve_max_flow()
+            _, flows = self.solve_max_flow(routing_assumption = 'canalize')
             target_path_flow = self._calculate_target_path_flow(flows, 'canalize_objective')
             return target_path_flow, flows
         else:
@@ -1010,7 +1071,7 @@ class CustomEnv(gym.Env):
     def _calculate_isolate_objective_and_flows(self):
         """Calculate objective for isolate strategy (reduce flow on specific edges)."""
         if self.deterministic_outcomes:
-            _, flows = self.solve_max_flow()
+            _, flows = self.solve_max_flow(routing_assumption = 'isolate')
             target_node_flow = self._calculate_target_edge_flow(flows, 'isolate_objective')
             return target_node_flow, flows
         else:
@@ -1035,7 +1096,7 @@ class CustomEnv(gym.Env):
             mode = self.deterministic_outcomes
 
         if mode:
-            _, flows = self.solve_max_flow()
+            _, flows = self.solve_max_flow(routing_assumption = 'divert')
             from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
             to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
             diverted_flow_from = self.reference_start_flows[0] - from_flow
@@ -1608,7 +1669,7 @@ class CustomEnv(gym.Env):
         elif self.attacker_strategy == 'isolate':
             self.reference_obj, self.reference_flows = self._calculate_isolate_objective_and_flows()
         elif self.attacker_strategy == 'divert':
-            _, self.reference_flows = self.solve_max_flow()
+            _, self.reference_flows = self.solve_max_flow(routing_assumption = 'divert')
             from_flow = self._calculate_target_path_flow(self.reference_flows, 'divert_from_objective')
             to_flow = self._calculate_target_path_flow(self.reference_flows, 'divert_to_objective')
             self.reference_start_flows = (from_flow, to_flow)
@@ -2281,3 +2342,4 @@ try:
     CustomEnv.solve_backward_induction_ray = solve_backward_induction_ray
 except Exception:
     pass
+
