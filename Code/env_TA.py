@@ -1752,7 +1752,8 @@ class _RemoteEnvWorker:
         Worker now accepts a progress_actor handle, a shared memo_actor handle,
         and budget_levels so it can estimate progress for invalid actions.
         """
-        import importlib, copy, numpy as np, ray as _ray
+        import importlib, copy, numpy as np, ray as _ray, time
+        from collections import defaultdict
         env_mod = importlib.import_module("env_TA")
         CustomEnv = getattr(env_mod, "CustomEnv")
 
@@ -1785,9 +1786,16 @@ class _RemoteEnvWorker:
         self.memo_actor = memo_actor
         self.progress_granularity = int(progress_granularity)
         self.budget_levels = int(budget_levels)
+        
+        # Performance stats
+        self.stats = defaultdict(float)
+        self.counts = defaultdict(int)
+
+    def get_stats(self):
+        return dict(self.stats), dict(self.counts)
 
     def evaluate_subtree(self, remaining_budget, interdicted_state, depth):
-        import numpy as np, ray as _ray
+        import numpy as np, ray as _ray, time
         memo_local = {}
         local_counter = 0
 
@@ -1814,10 +1822,14 @@ class _RemoteEnvWorker:
                 return memo_local[key]
 
             # 2) check centralized memo
+            t_start = time.perf_counter()
             try:
                 shared_val = _ray.get(self.memo_actor.get.remote(key)) if self.memo_actor is not None else None
             except Exception:
                 shared_val = None
+            self.stats['memo_get_time'] += time.perf_counter() - t_start
+            self.counts['memo_get_count'] += 1
+
             if shared_val is not None:
                 memo_local[key] = shared_val
                 # ADDED: Count volume for cached hit
@@ -1834,6 +1846,7 @@ class _RemoteEnvWorker:
             self.env.state['edge_interdicted'][:] = inter_state
 
             # terminal objective
+            t_start = time.perf_counter()
             if self.attacker_strategy == "zero_sum":
                 final_objective, _ = self.env._compute_objective_and_flows()
                 final_objective = -final_objective
@@ -1846,6 +1859,8 @@ class _RemoteEnvWorker:
                 final_objective, _ = self.env._calculate_divert_objective_and_flows()
             else:
                 final_objective = -float('inf')
+            self.stats['gurobi_solve_time'] += time.perf_counter() - t_start
+            self.counts['gurobi_solve_count'] += 1
 
             # restore
             self.env.state['budget'][0] = old_budget
@@ -1924,17 +1939,15 @@ class _RemoteEnvWorker:
         return result
 
 # New parallel entrypoint (keeps your old function untouched)
-def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=1, ray_address=None):
+def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=None, ray_address=None):
     """
-    Parallelized backward induction using Ray.
-    - n_workers: number of Ray actors to create
-    - worker_depth: depth at which subtrees are handed to workers
+    Parallelized backward induction using Ray with Adaptive Frontier Expansion.
     """
     # init ray if not already
     if not ray.is_initialized():
         ray.init(address=ray_address, ignore_reinit_error=True)
 
-    # precompute min edge cost etc (same as original)
+    # precompute min edge cost etc
     real_edge_costs = self.state['edge_costs'][:self.num_both_edges]
     self.min_edge_cost = min(real_edge_costs[real_edge_costs > 0], default=float('inf'))
     if self.min_edge_cost == float('inf'):
@@ -1945,10 +1958,10 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
     state_snapshot = copy.deepcopy(self.state)
     seed = getattr(self, 'seed', None)
 
-    # create a progress actor, shared memo actor and workers
+    # create actors
     progress_actor = _ProgressActor.remote()
     memo_actor = _SharedMemoActor.remote()
-    # compute budget_levels for worker estimates
+    
     max_budget = self.state['budget'][0]
     budget_levels = max_budget // self.min_edge_cost if self.min_edge_cost > 0 else 1
 
@@ -1972,15 +1985,14 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
         for _ in range(n_workers)
     ]
 
-    # Estimate total DP states for progress bar
+    # Setup progress bar
     budget_levels_local = budget_levels
     estimated_states = (self.num_both_edges ** budget_levels_local) if budget_levels_local > 0 else 1
-
-    # Setup tqdm progress bar and polling thread
+    
     from tqdm import tqdm
     import threading, time
     stop_event = threading.Event()
-    pbar = tqdm(total=estimated_states, desc="DP States (parallel)", unit=" states", disable=not verbose)
+    pbar = tqdm(total=estimated_states, desc="DP States (Adaptive)", unit=" states", disable=not verbose)
     last_reported = 0
 
     def poll_progress():
@@ -1999,162 +2011,226 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
     poll_thread = threading.Thread(target=poll_progress, daemon=True)
     poll_thread.start()
 
-    # --- DP root function (local recursion + delegation to workers), consults central memo ---
-    memo_root = {}
+    # --- Adaptive Frontier Expansion ---
+    
+    # Capture num_both_edges for use inside inner class
+    num_edges_limit = int(self.num_both_edges)
 
-    def dp_root(remaining_budget, interdicted_state, depth=0):
-        """
-        Recursive DP on driver. When depth hits worker_depth delegate each action-subtree
-        to a worker.evaluate_subtree; otherwise recurse locally. Uses the shared memo_actor.
-        """
-        import ray as _ray
-        key = interdicted_state[:self.num_both_edges].tobytes()
+    class TreeNode:
+        def __init__(self, budget, state, depth, parent=None, action_from_parent=None):
+            self.budget = budget
+            self.state = state
+            self.depth = depth
+            self.parent = parent
+            self.action_from_parent = action_from_parent
+            self.children = [] # List of TreeNodes
+            self.is_terminal = False
+            self.value = None
+            self.best_sequence = []
+            self.key = state[:num_edges_limit].tobytes()
 
-        # 1) local cache
-        if key in memo_root:
-            # ADDED: Count volume for cached hit
-            if progress_actor is not None:
-                vol = int(self.num_both_edges ** max(0, budget_levels_local - depth))
-                try:
-                    progress_actor.increment.remote(vol)
-                except Exception:
-                    pass
-            return memo_root[key]
+    # Root node
+    root_node = TreeNode(
+        self.state['budget'][0], 
+        self.state['edge_interdicted'].copy(), 
+        0
+    )
+    
+    # Frontier of nodes that need processing (either expansion or solving)
+    frontier = [root_node]
+    
+    # Target number of tasks to generate (e.g., 4x workers ensures good balancing)
+    # TWEAK THIS: Higher = more small tasks (better balancing, more overhead)
+    TARGET_TASKS = n_workers * 10 
+    
+    # Local memoization for the driver expansion phase
+    memo_driver = {}
 
-        # 2) central memo
-        try:
-            shared_val = _ray.get(memo_actor.get.remote(key))
-        except Exception:
-            shared_val = None
-        if shared_val is not None:
-            memo_root[key] = shared_val
-            # ADDED: Count volume for cached hit
-            if progress_actor is not None:
-                vol = int(self.num_both_edges ** max(0, budget_levels_local - depth))
-                try:
-                    progress_actor.increment.remote(vol)
-                except Exception:
-                    pass
-            return shared_val
+    # 1. Expansion Phase
+    # We pop nodes and expand them until we have enough tasks or run out of nodes
+    tasks_to_solve = [] # Nodes ready to be sent to workers
+    
+    while frontier:
+        # If we have enough tasks, stop expanding and move remaining frontier to solve list
+        if len(frontier) + len(tasks_to_solve) >= TARGET_TASKS:
+            tasks_to_solve.extend(frontier)
+            frontier = []
+            break
+        
+        node = frontier.pop(0)
+        
+        # --- PROGRESS REPORTING FIX ---
+        # Calculate potential subtree volume for this node
+        remaining_depth = max(0, budget_levels_local - node.depth)
+        node_volume = int(self.num_both_edges ** remaining_depth)
 
-        # save & restore small state pieces
+        # Check memo (driver side)
+        if node.key in memo_driver:
+            node.value, node.best_sequence = memo_driver[node.key]
+            node.is_terminal = True
+            # Driver pruned this whole subtree -> Report progress
+            progress_actor.increment.remote(node_volume)
+            continue
+
+        # Check base cases
+        if node.budget < self.min_edge_cost or node.depth >= 20:
+            node.is_terminal = True
+            tasks_to_solve.append(node)
+            # Sent to worker -> Worker will report progress
+            continue
+
+        # Temporarily set state to generate mask
         old_budget = self.state['budget'][0]
         old_interdicted = self.state['edge_interdicted'].copy()
-
-        self.state['budget'][0] = remaining_budget
-        self.state['edge_interdicted'][:] = interdicted_state
-
-        # compute terminal objective for this node
-        if self.attacker_strategy == "zero_sum":
-            final_objective, self.reference_flows = self._compute_objective_and_flows()
-            final_objective = -final_objective
-        elif self.attacker_strategy == 'canalize':
-            final_objective, self.reference_flows = self._calculate_canalize_objective_and_flows()
-        elif self.attacker_strategy == 'isolate':
-            final_objective, self.reference_flows = self._calculate_isolate_objective_and_flows()
-            final_objective = -final_objective
-        elif self.attacker_strategy == 'divert':
-            final_objective, self.reference_flows = self._calculate_divert_objective_and_flows()
-        else:
-            final_objective = -float('inf')
-
-        # restore
+        self.state['budget'][0] = node.budget
+        self.state['edge_interdicted'][:] = node.state
+        
+        action_mask = self.mask_fn()
+        valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
+        
+        # Restore state
         self.state['budget'][0] = old_budget
         self.state['edge_interdicted'][:] = old_interdicted
 
-        # base case
-        if remaining_budget < self.min_edge_cost or depth >= 20:
-            memo_root[key] = (final_objective, [])
-            # Report progress for the skipped subtree
-            if progress_actor is not None:
-                vol = int(self.num_both_edges ** max(0, budget_levels_local - depth))
-                try:
-                    progress_actor.increment.remote(vol)
-                except Exception:
-                    pass
-            
-            try:
-                memo_actor.set.remote(key, memo_root[key])
-            except Exception:
-                pass
-            return final_objective, []
-
-        # valid actions
-        action_mask = self.mask_fn()
-        valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
-
-        # Count invalid actions and report progress similarly to original solver
-        # MOVED UP: Must happen before early return check
-        num_invalid_actions = self.num_both_edges - len(valid_actions)
-        if num_invalid_actions > 0 and progress_actor is not None:
-            try:
-                est_per_invalid = float(self.num_both_edges ** max(0, budget_levels_local - (depth + 1)))
-                progress_actor.increment.remote(num_invalid_actions * est_per_invalid)
-            except Exception:
-                pass
-
         if len(valid_actions) == 0:
-            memo_root[key] = (final_objective, [])
-            try:
-                memo_actor.set.remote(key, memo_root[key])
-            except Exception:
-                pass
-            return final_objective, []
+            node.is_terminal = True
+            tasks_to_solve.append(node)
+            # Sent to worker -> Worker will report progress
+            continue
+        
+        # --- PROGRESS REPORTING FIX ---
+        # If we expand this node, we are responsible for reporting the volume of the branches we DON'T take.
+        num_invalid = self.num_both_edges - len(valid_actions)
+        if num_invalid > 0:
+            child_remaining_depth = max(0, budget_levels_local - (node.depth + 1))
+            child_volume = int(self.num_both_edges ** child_remaining_depth)
+            pruned_volume = num_invalid * child_volume
+            progress_actor.increment.remote(pruned_volume)
 
-        # If at delegation depth, hand off each action-subtree to workers in parallel
-        if depth + 1 >= worker_depth:
-            tasks = []
-            for i, action in enumerate(valid_actions):
-                new_state = interdicted_state.copy()
-                new_state[action] += 1
-                new_budget = remaining_budget - self.state['edge_costs'][action]
-                worker = workers[i % len(workers)]
-                tasks.append((action, worker.evaluate_subtree.remote(new_budget, new_state, depth + 1)))
-
-            # collect results
-            results = _ray.get([t[1] for t in tasks])
-            best_reward = -float('inf')
-            best_seq = []
-            for (action, res) in zip([t[0] for t in tasks], results):
-                fut_reward, fut_seq = res
-                if fut_reward > best_reward:
-                    best_reward = fut_reward
-                    best_seq = [action] + fut_seq
-
-            memo_root[key] = (best_reward, best_seq)
-            try:
-                memo_actor.set.remote(key, memo_root[key])
-            except Exception:
-                pass
-            return best_reward, best_seq
-
-        # otherwise evaluate locally
-        best_reward = -float('inf')
-        best_seq = []
+        # Expand children
         for action in valid_actions:
-            new_state = interdicted_state.copy()
+            new_state = node.state.copy()
             new_state[action] += 1
-            new_budget = remaining_budget - self.state['edge_costs'][action]
-            fut_reward, fut_seq = dp_root(new_budget, new_state, depth + 1)
-            if fut_reward > best_reward:
-                best_reward = fut_reward
-                best_seq = [action] + fut_seq
+            new_budget = node.budget - self.state['edge_costs'][action]
+            
+            child = TreeNode(new_budget, new_state, node.depth + 1, parent=node, action_from_parent=action)
+            node.children.append(child)
+            frontier.append(child)
 
-        memo_root[key] = (best_reward, best_seq)
-        try:
-            memo_actor.set.remote(key, memo_root[key])
-        except Exception:
-            pass
-        return best_reward, best_seq
-    # --- end dp_root ---
+    # 2. Execution Phase (Dynamic Load Balancing)
+    # tasks_to_solve contains the leaves of our expanded tree.
+    # We send these to workers.
+    
+    # Prepare tasks
+    # Format: (node_obj, budget, state, depth)
+    pending_tasks = list(tasks_to_solve)
+    
+    idle_workers = list(workers)
+    running_futures = {} # future -> (worker, node)
+    
+    while pending_tasks or running_futures:
+        while idle_workers and pending_tasks:
+            worker = idle_workers.pop()
+            node = pending_tasks.pop(0)
+            
+            if node.value is not None:
+                idle_workers.append(worker)
+                continue
+                
+            future = worker.evaluate_subtree.remote(node.budget, node.state, node.depth)
+            running_futures[future] = (worker, node)
+        
+        if running_futures:
+            done_ids, _ = _ray.wait(list(running_futures.keys()), num_returns=1)
+            for done_id in done_ids:
+                worker, node = running_futures.pop(done_id)
+                try:
+                    val, seq = _ray.get(done_id)
+                    node.value = val
+                    node.best_sequence = seq
+                    
+                    # Cache result in driver memo
+                    memo_driver[node.key] = (val, seq)
+                except Exception as e:
+                    print(f"Task failed: {e}")
+                    node.value = -float('inf') # Treat as failure
+                
+                idle_workers.append(worker)
 
-    # Start root solve
-    initial_budget = self.state['budget'][0]
-    initial_interdicted_state = self.state['edge_interdicted'].copy()
+    # 3. Aggregation Phase (Bottom-Up)
+    # We need to propagate values from leaves up to root.
+    # Since we built a tree, we can do a post-order traversal or just iterate by depth reverse.
+    
+    # Collect all nodes in the tree
+    all_nodes = []
+    q = [root_node]
+    while q:
+        curr = q.pop(0)
+        all_nodes.append(curr)
+        q.extend(curr.children)
+        
+    # Sort by depth descending (deepest first)
+    all_nodes.sort(key=lambda x: x.depth, reverse=True)
+    
+    for node in all_nodes:
+        if node.children:
+            # This is an internal node in our expanded tree.
+            # Its value is the max of its children.
+            best_val = -float('inf')
+            best_seq = []
+            
+            for child in node.children:
+                # Child value should be set by now (either from worker or recursion)
+                if child.value is None:
+                    # Should not happen if logic is correct
+                    continue
+                    
+                if child.value > best_val:
+                    best_val = child.value
+                    best_seq = [child.action_from_parent] + child.best_sequence
+            
+            node.value = best_val
+            node.best_sequence = best_seq
+            
+            # Cache
+            memo_driver[node.key] = (best_val, best_seq)
+        
+        elif node.value is None:
+            # Leaf node that wasn't solved?
+            # This implies it was terminal/invalid and didn't get sent to worker?
+            # We need to compute terminal value locally if it wasn't sent.
+            
+            # Temporarily set state
+            old_budget = self.state['budget'][0]
+            old_interdicted = self.state['edge_interdicted'].copy()
+            self.state['budget'][0] = node.budget
+            self.state['edge_interdicted'][:] = node.state
+            
+            if self.attacker_strategy == "zero_sum":
+                val, _ = self._compute_objective_and_flows()
+                val = -val
+            elif self.attacker_strategy == 'canalize':
+                val, _ = self._calculate_canalize_objective_and_flows()
+            elif self.attacker_strategy == 'isolate':
+                val, _ = self._calculate_isolate_objective_and_flows()
+                val = -val
+            elif self.attacker_strategy == 'divert':
+                val, _ = self._calculate_divert_objective_and_flows()
+            else:
+                val = -float('inf')
+            
+            self.state['budget'][0] = old_budget
+            self.state['edge_interdicted'][:] = old_interdicted
+            
+            node.value = val
+            node.best_sequence = []
+            memo_driver[node.key] = (val, [])
 
-    optimal_reward, optimal_sequence = dp_root(initial_budget, initial_interdicted_state, depth=0)
+    # Final result
+    optimal_reward = root_node.value
+    optimal_sequence = root_node.best_sequence
 
-    # stop polling and finalize progress bar
+    # Cleanup
     stop_event.set()
     poll_thread.join(timeout=2)
     try:
@@ -2164,16 +2240,35 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
         pass
     pbar.close()
 
-    # cleanup actors
+    # Stats
+    print("\n" + "="*50)
+    print("WORKER PERFORMANCE STATS")
+    print("="*50)
+    total_gurobi_time = 0
+    total_gurobi_count = 0
+    
+    all_stats = ray.get([w.get_stats.remote() for w in workers])
+    for i, (stats, counts) in enumerate(all_stats):
+        print(f"\nWorker {i}:")
+        for k, v in stats.items():
+            count = counts.get(k.replace('_time', '_count'), 0)
+            avg = v / count if count > 0 else 0
+            print(f"  {k:<20}: {v:.4f}s (Count: {count}, Avg: {avg:.6f}s)")
+            if 'gurobi' in k:
+                total_gurobi_time += v
+                total_gurobi_count += count
+
+    print("-" * 50)
+    print(f"Total Gurobi Time: {total_gurobi_time:.4f}s ({total_gurobi_count} calls)")
+    print("="*50 + "\n")
+
     for w in workers:
-        try:
-            ray.kill(w)
-        except Exception:
-            pass
-    try:
-        ray.kill(progress_actor)
-    except Exception:
-        pass
+        try: ray.kill(w)
+        except: pass
+    try: ray.kill(progress_actor)
+    except: pass
+    try: ray.kill(memo_actor)
+    except: pass
 
     if self.attacker_strategy in ("zero_sum", "isolate"):
         optimal_reward = -optimal_reward
@@ -2186,4 +2281,3 @@ try:
     CustomEnv.solve_backward_induction_ray = solve_backward_induction_ray
 except Exception:
     pass
-
