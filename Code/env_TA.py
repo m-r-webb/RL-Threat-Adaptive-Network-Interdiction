@@ -25,7 +25,12 @@ logging.getLogger("ray").setLevel(logging.WARNING)
 logging.getLogger("raylet").setLevel(logging.WARNING)
 
 import ray
-ray.init(address=None, ignore_reinit_error=True, logging_level=logging.WARNING)
+ray.init(
+    address=None, 
+    ignore_reinit_error=True, 
+    logging_level=logging.WARNING,
+    _temp_dir='/tmp/ray'  # Add this parameter with a short path
+)
 
 
 # Class representing Node Object
@@ -2083,7 +2088,7 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
         num_invalid_actions = self.num_both_edges - len(valid_actions)
         if num_invalid_actions > 0 and progress_actor is not None:
             try:
-                est_per_invalid = int(self.num_both_edges ** max(0, budget_levels_local - (depth + 1)))
+                est_per_invalid = float(self.num_both_edges ** max(0, budget_levels_local - (depth + 1)))
                 progress_actor.increment.remote(num_invalid_actions * est_per_invalid)
             except Exception:
                 pass
