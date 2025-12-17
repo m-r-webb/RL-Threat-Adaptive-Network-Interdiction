@@ -123,6 +123,7 @@ class CustomEnv(gym.Env):
         self.max_num_nodes = max_num_nodes
         self.old_routing = old_routing
         self.outcome_memo_actor = outcome_memo_actor
+        self.local_outcome_cache = {} # Add local cache here
 
         self.num_stochastic_scenarios = None
         self.num_stochastic_scenarios_IM = None
@@ -986,39 +987,42 @@ class CustomEnv(gym.Env):
         unique_outcomes = list(outcome_counts.keys())
 
         # --- MEMOIZATION START ---
-        cached_results = {}
-        missing_outcomes = []
+        outcomes_needed_from_central = []
         
-        if self.outcome_memo_actor:
-            # Create composite keys: (outcome_tuple, strategy_type)
-            keys = [(out, strategy_type) for out in unique_outcomes]
-            
+        # 1. Check Local Cache
+        for outcome in unique_outcomes:
+            if (outcome, strategy_type) not in self.local_outcome_cache:
+                outcomes_needed_from_central.append(outcome)
+        
+        # 2. Check Central Cache (only for what wasn't in local)
+        outcomes_to_solve = []
+        if outcomes_needed_from_central and self.outcome_memo_actor:
+            keys = [(out, strategy_type) for out in outcomes_needed_from_central]
             # Batch fetch from Ray
             results = ray.get(self.outcome_memo_actor.get_batch.remote(keys))
             
-            for outcome, res in zip(unique_outcomes, results):
+            for outcome, res in zip(outcomes_needed_from_central, results):
                 if res is not None:
-                    cached_results[outcome] = res
+                    # Update local cache immediately
+                    self.local_outcome_cache[(outcome, strategy_type)] = res
                 else:
-                    missing_outcomes.append(outcome)
+                    outcomes_to_solve.append(outcome)
         else:
-            missing_outcomes = unique_outcomes
+            outcomes_to_solve = outcomes_needed_from_central
         # --- MEMOIZATION END ---
-        
-        # Solve max flow for missing outcomes
-        new_results = {}
-        for outcome in missing_outcomes:
-            # Convert outcome to capacity dict that maps each edge to remaining capacity after interdictions.
+
+        # 3. Solve Max Flow for truly missing outcomes
+        new_results_for_central = {}
+        for outcome in outcomes_to_solve:
+            # Convert outcome to capacity dict
             capacity_dict = {}
-    
             for idx, edge in enumerate(self.both_edges):
                 base_capacity = self.state['edge_capacity'][idx]
-        
                 is_interdicted = outcome[idx]
                 capacity_dict[edge] = 0 if is_interdicted else base_capacity
         
-            # Solve max flow for this outcome
-            obj, flows = self.solve_max_flow(capacity_dict, routing_assumption = strategy_type)
+            # Solve max flow
+            obj, flows = self.solve_max_flow(capacity_dict, routing_assumption=strategy_type)
         
             # Calculate strategy-specific objective
             if strategy_type == "zero_sum":
@@ -1038,26 +1042,27 @@ class CustomEnv(gym.Env):
                 'objective': objective,
                 'flows': flows
             }
-            new_results[outcome] = res
-            cached_results[outcome] = res
-
-        # --- UPDATE CACHE ---
-        if self.outcome_memo_actor and new_results:
-            keys = [(out, strategy_type) for out in new_results.keys()]
-            vals = list(new_results.values())
-            # Fire and forget (async)
+            
+            # Update local cache
+            self.local_outcome_cache[(outcome, strategy_type)] = res
+            # Queue for central update
+            new_results_for_central[outcome] = res
+            
+        # 4. Update Central Cache (Async / Fire-and-forget)
+        if self.outcome_memo_actor and new_results_for_central:
+            keys = [(out, strategy_type) for out in new_results_for_central.keys()]
+            vals = list(new_results_for_central.values())
             self.outcome_memo_actor.set_batch.remote(keys, vals)
-        # --------------------
 
-        # Compute weighted averages
-        weighted_objective = sum(
-            result['objective'] * outcome_counts[outcome] / total_samples
-            for outcome, result in cached_results.items()
-        )
-    
+        # 5. Compute weighted averages using Local Cache (which is now fully populated)
+        weighted_objective = 0.0
         weighted_flows = defaultdict(float)
-        for outcome, result in cached_results.items():
-            weight = outcome_counts[outcome] / total_samples
+        
+        for outcome, count in outcome_counts.items():
+            result = self.local_outcome_cache[(outcome, strategy_type)]
+            weight = count / total_samples
+            
+            weighted_objective += result['objective'] * weight
             for edge, flow in result['flows'].items():
                 weighted_flows[edge] += flow * weight
     
@@ -1920,15 +1925,26 @@ class _RemoteEnvWorker:
         memo_local = {}
         local_counter = 0
 
+        #Time-based throttling variables
+        last_report_time = time.time()
+        report_interval = 0.5  # Max 2 reports per second per worker
+
         def maybe_flush_progress():
-            nonlocal local_counter
+            nonlocal local_counter, last_report_time
+            # 1. Check if we have enough accumulated progress (batch size)
             if self.progress_actor is not None and local_counter >= self.progress_granularity:
-                try:
-                    # report and reset local counter (best-effort)
-                    self.progress_actor.increment.remote(local_counter)
-                except Exception:
-                    pass
-                local_counter = 0
+                # 2. Check if enough time has passed (throttle)
+                now = time.time()
+                if (now - last_report_time) > report_interval:
+                    try:
+                        # report and reset local counter (best-effort)
+                        self.progress_actor.increment.remote(local_counter)
+                        local_counter = 0
+                        last_report_time = now
+                    except Exception:
+                        pass
+                # If time hasn't passed, we keep accumulating local_counter.
+                # This efficiently batches "bursty" progress (like cache hits).
 
         def dp_local(rem_budget, inter_state, d):
             nonlocal local_counter
@@ -2105,7 +2121,7 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
             progress_actor=progress_actor,
             memo_actor=memo_actor,
             budget_levels=budget_levels,
-            progress_granularity=100,
+            progress_granularity=2000,
             max_depth_inner=20,
             outcome_memo_actor=outcome_memo_actor # Pass the new actor
         )
