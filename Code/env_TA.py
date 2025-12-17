@@ -96,7 +96,7 @@ class CustomEnv(gym.Env):
                  max_sink_need=5, penalty_value=-0.1, 
                  sample_size=1000, max_path_length = 6,
                  max_num_edges=500, 
-                 max_num_nodes=250, old_routing="none"):
+                 max_num_nodes=250, old_routing="none", outcome_memo_actor=None):
         super(CustomEnv, self).__init__()
 
         #Setup core environment attributes
@@ -122,6 +122,7 @@ class CustomEnv(gym.Env):
         self.max_num_edges = max_num_edges
         self.max_num_nodes = max_num_nodes
         self.old_routing = old_routing
+        self.outcome_memo_actor = outcome_memo_actor
 
         self.num_stochastic_scenarios = None
         self.num_stochastic_scenarios_IM = None
@@ -983,10 +984,30 @@ class CustomEnv(gym.Env):
         # Count unique outcomes and their frequencies
         outcome_counts = Counter(outcome_samples)
         unique_outcomes = list(outcome_counts.keys())
-    
-        # Solve max flow once per unique outcome
-        outcome_results = {}
-        for outcome in unique_outcomes:
+
+        # --- MEMOIZATION START ---
+        cached_results = {}
+        missing_outcomes = []
+        
+        if self.outcome_memo_actor:
+            # Create composite keys: (outcome_tuple, strategy_type)
+            keys = [(out, strategy_type) for out in unique_outcomes]
+            
+            # Batch fetch from Ray
+            results = ray.get(self.outcome_memo_actor.get_batch.remote(keys))
+            
+            for outcome, res in zip(unique_outcomes, results):
+                if res is not None:
+                    cached_results[outcome] = res
+                else:
+                    missing_outcomes.append(outcome)
+        else:
+            missing_outcomes = unique_outcomes
+        # --- MEMOIZATION END ---
+        
+        # Solve max flow for missing outcomes
+        new_results = {}
+        for outcome in missing_outcomes:
             # Convert outcome to capacity dict that maps each edge to remaining capacity after interdictions.
             capacity_dict = {}
     
@@ -1013,21 +1034,30 @@ class CustomEnv(gym.Env):
                 diverted_flow_to = to_flow - self.reference_start_flows[1]
                 objective = np.min([diverted_flow_from, diverted_flow_to])
         
-            outcome_results[outcome] = {
+            res = {
                 'objective': objective,
-                'flows': flows,
-                'count': outcome_counts[outcome]
+                'flows': flows
             }
+            new_results[outcome] = res
+            cached_results[outcome] = res
+
+        # --- UPDATE CACHE ---
+        if self.outcome_memo_actor and new_results:
+            keys = [(out, strategy_type) for out in new_results.keys()]
+            vals = list(new_results.values())
+            # Fire and forget (async)
+            self.outcome_memo_actor.set_batch.remote(keys, vals)
+        # --------------------
+
         # Compute weighted averages
         weighted_objective = sum(
-            result['objective'] * result['count'] / total_samples
-            for result in outcome_results.values()
+            result['objective'] * outcome_counts[outcome] / total_samples
+            for outcome, result in cached_results.items()
         )
     
-        # Compute weighted average flows
         weighted_flows = defaultdict(float)
-        for outcome, result in outcome_results.items():
-            weight = result['count'] / total_samples
+        for outcome, result in cached_results.items():
+            weight = outcome_counts[outcome] / total_samples
             for edge, flow in result['flows'].items():
                 weighted_flows[edge] += flow * weight
     
@@ -1798,23 +1828,45 @@ class _ProgressActor:
 @ray.remote
 class _SharedMemoActor:
     def __init__(self):
-        self.store = {}
+        self.memo = {}
+    
     def get(self, key):
-        return self.store.get(key, None)
+        return self.memo.get(key)
+    
     def set(self, key, value):
-        self.store[key] = value
-    def contains(self, key):
-        return key in self.store
+        self.memo[key] = value
+        
     def size(self):
-        return len(self.store)
-    def get_bulk(self, keys):
-        return {k: self.store.get(k, None) for k in keys}
+        return len(self.memo)
+
+# ADD THIS NEW ACTOR CLASS
+@ray.remote
+class SharedOutcomeMemoActor:
+    """
+    Centralized cache for stochastic max-flow outcomes.
+    Stores: (outcome_tuple, strategy) -> {'objective': val, 'flows': dict}
+    """
+    def __init__(self):
+        self.cache = {}
+
+    def get_batch(self, keys):
+        return [self.cache.get(k) for k in keys]
+
+    def set_batch(self, keys, values):
+        for k, v in zip(keys, values):
+            self.cache[k] = v
+            
+    def size(self):
+        return len(self.cache)
+    
+    def clear(self):
+        self.cache.clear()
 
 @ray.remote
 class _RemoteEnvWorker:
     def __init__(self, nodes, edges, seed, state_snapshot, attacker_strategy, min_edge_cost, num_both_edges,
                  deterministic_outcomes, multiple_interdiction_attempts, progress_actor=None, memo_actor=None,
-                 budget_levels=1, progress_granularity=50, max_depth_inner=20):
+                 budget_levels=1, progress_granularity=50, max_depth_inner=20, outcome_memo_actor=None):
         """
         Worker now accepts a progress_actor handle, a shared memo_actor handle,
         and budget_levels so it can estimate progress for invalid actions.
@@ -1825,10 +1877,12 @@ class _RemoteEnvWorker:
         CustomEnv = getattr(env_mod, "CustomEnv")
 
         # Instantiate env with the same key flags so internals (num_both_edges, spaces, models) are set up
+        # Pass the outcome_memo_actor to the environment
         self.env = CustomEnv(nodes, edges,
                              deterministic_agent=deterministic_outcomes,
                              multiple_interdiction_attempts=multiple_interdiction_attempts,
-                             attacker_strategy=attacker_strategy)
+                             attacker_strategy=attacker_strategy,
+                             outcome_memo_actor=outcome_memo_actor)
 
         # Make a deep, writable copy of the state snapshot to avoid read-only numpy arrays
         state_copy = copy.deepcopy(state_snapshot)
@@ -2028,6 +2082,11 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
     # create actors
     progress_actor = _ProgressActor.remote()
     memo_actor = _SharedMemoActor.remote()
+
+    # Create outcome memoization actor ONLY if stochastic
+    outcome_memo_actor = None
+    if not self.deterministic_outcomes:
+        outcome_memo_actor = SharedOutcomeMemoActor.remote()
     
     max_budget = self.state['budget'][0]
     budget_levels = max_budget // self.min_edge_cost if self.min_edge_cost > 0 else 1
@@ -2047,7 +2106,8 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
             memo_actor=memo_actor,
             budget_levels=budget_levels,
             progress_granularity=100,
-            max_depth_inner=20
+            max_depth_inner=20,
+            outcome_memo_actor=outcome_memo_actor # Pass the new actor
         )
         for _ in range(n_workers)
     ]
