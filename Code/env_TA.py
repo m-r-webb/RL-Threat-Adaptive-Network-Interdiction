@@ -29,7 +29,7 @@ ray.init(
     address=None, 
     ignore_reinit_error=True, 
     logging_level=logging.WARNING,
-    _temp_dir='/tmp/ray'  # Add this parameter with a short path
+    _temp_dir=os.environ.get('RAY_TMPDIR', '/tmp/r'), # Add this parameter with a short path
 )
 
 
@@ -1870,7 +1870,7 @@ class SharedOutcomeMemoActor:
 @ray.remote
 class _RemoteEnvWorker:
     def __init__(self, nodes, edges, seed, state_snapshot, attacker_strategy, min_edge_cost, num_both_edges,
-                 deterministic_outcomes, multiple_interdiction_attempts, progress_actor=None, memo_actor=None,
+                 deterministic_outcomes, multiple_interdiction_attempts, progress_actor=None, memo_actors=None,
                  budget_levels=1, progress_granularity=50, max_depth_inner=20, outcome_memo_actor=None):
         """
         Worker now accepts a progress_actor handle, a shared memo_actor handle,
@@ -1909,7 +1909,11 @@ class _RemoteEnvWorker:
         self.num_both_edges = num_both_edges
         self.max_depth_inner = max_depth_inner
         self.progress_actor = progress_actor
-        self.memo_actor = memo_actor
+        
+        # Handle Sharded Memo Actors
+        self.memo_actors = memo_actors
+        self.num_memo_shards = len(memo_actors) if memo_actors else 0
+        
         self.progress_granularity = int(progress_granularity)
         self.budget_levels = int(budget_levels)
         
@@ -1921,7 +1925,7 @@ class _RemoteEnvWorker:
         return dict(self.stats), dict(self.counts)
 
     def evaluate_subtree(self, remaining_budget, interdicted_state, depth):
-        import numpy as np, ray as _ray, time
+        import numpy as np, ray as _ray, time, zlib # Added zlib for stable hashing
         memo_local = {}
         local_counter = 0
 
@@ -1958,12 +1962,21 @@ class _RemoteEnvWorker:
                 maybe_flush_progress()
                 return memo_local[key]
 
-            # 2) check centralized memo
+            # 2) check centralized memo (SHARDED)
             t_start = time.perf_counter()
-            try:
-                shared_val = _ray.get(self.memo_actor.get.remote(key)) if self.memo_actor is not None else None
-            except Exception:
-                shared_val = None
+            shared_val = None
+            target_actor = None
+            
+            if self.num_memo_shards > 0:
+                # Deterministic sharding based on key content using zlib.adler32 (fast & stable)
+                shard_idx = zlib.adler32(key) % self.num_memo_shards
+                target_actor = self.memo_actors[shard_idx]
+                
+                try:
+                    shared_val = _ray.get(target_actor.get.remote(key))
+                except Exception:
+                    shared_val = None
+            
             self.stats['memo_get_time'] += time.perf_counter() - t_start
             self.counts['memo_get_count'] += 1
 
@@ -2011,9 +2024,9 @@ class _RemoteEnvWorker:
                 local_counter += volume
                 maybe_flush_progress()
                 # publish to central memo (best-effort, async)
-                if self.memo_actor is not None:
+                if target_actor is not None:
                     try:
-                        self.memo_actor.set.remote(key, memo_local[key])
+                        target_actor.set.remote(key, memo_local[key])
                     except Exception:
                         pass
                 return final_objective, []
@@ -2036,9 +2049,9 @@ class _RemoteEnvWorker:
                 memo_local[key] = (final_objective, [])
                 # No increment here; the invalid logic above covered the entire subtree volume
                 maybe_flush_progress()
-                if self.memo_actor is not None:
+                if target_actor is not None:
                     try:
-                        self.memo_actor.set.remote(key, memo_local[key])
+                        target_actor.set.remote(key, memo_local[key])
                     except Exception:
                         pass
                 return final_objective, []
@@ -2058,9 +2071,9 @@ class _RemoteEnvWorker:
             # Do NOT increment local_counter here for internal nodes
             
             # publish result to central memo (best-effort, async)
-            if self.memo_actor is not None:
+            if target_actor is not None:
                 try:
-                    self.memo_actor.set.remote(key, memo_local[key])
+                    target_actor.set.remote(key, memo_local[key])
                 except Exception:
                     pass
 
@@ -2097,7 +2110,11 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
 
     # create actors
     progress_actor = _ProgressActor.remote()
-    memo_actor = _SharedMemoActor.remote()
+    # SHARDED MEMOIZATION
+    # Create multiple memo actors to reduce lock contention
+    # Using n_workers shards ensures high throughput
+    num_memo_shards = max(1, n_workers) 
+    memo_actors = [_SharedMemoActor.remote() for _ in range(num_memo_shards)]
 
     # Create outcome memoization actor ONLY if stochastic
     outcome_memo_actor = None
@@ -2119,11 +2136,11 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
             self.deterministic_outcomes,
             self.multiple_interdiction_attempts,
             progress_actor=progress_actor,
-            memo_actor=memo_actor,
+            memo_actors=memo_actors, # Pass list of actors
             budget_levels=budget_levels,
             progress_granularity=2000,
             max_depth_inner=20,
-            outcome_memo_actor=outcome_memo_actor # Pass the new actor
+            outcome_memo_actor=outcome_memo_actor 
         )
         for _ in range(n_workers)
     ]
@@ -2410,8 +2427,11 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
         except: pass
     try: ray.kill(progress_actor)
     except: pass
-    try: ray.kill(memo_actor)
-    except: pass
+    
+    # Kill all memo actors
+    for ma in memo_actors:
+        try: ray.kill(ma)
+        except: pass
 
     if self.attacker_strategy in ("zero_sum", "isolate"):
         optimal_reward = -optimal_reward
