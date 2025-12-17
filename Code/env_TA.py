@@ -1726,7 +1726,7 @@ class CustomEnv(gym.Env):
         action_mask[list(incoming_edge_indices)] = True
         return(action_mask)
     
-    def mask_fn(self):
+    def mask_fn(self, depth=1):
         """
         Fully vectorized function using cached flow information.
         Maximum speed optimization.
@@ -1764,9 +1764,15 @@ class CustomEnv(gym.Env):
         elif self.attacker_strategy == 'divert':
             has_flow = self.cached_flow_array[:self.num_interdictable] > 0
             not_target = self.state['divert_to_objective'][:self.num_interdictable] != 1
-            valid_actions = (sufficient_budget & #has_capacity & 
-                             has_probability & 
-                             within_limit & has_flow & not_target)
+            if depth == 0:
+                is_target = self.state['divert_from_objective'][:self.num_interdictable] == 1
+                valid_actions = (sufficient_budget & #has_capacity & 
+                                 has_probability & is_target &
+                                 within_limit & has_flow & not_target)
+            else:
+                valid_actions = (sufficient_budget & #has_capacity & 
+                                 has_probability & 
+                                 within_limit & has_flow & not_target)
         else:
             has_flow = self.cached_flow_array[:self.num_interdictable] > 0
             valid_actions = (has_flow & sufficient_budget & #self.has_capacity & 
@@ -2146,7 +2152,7 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
         self.state['budget'][0] = node.budget
         self.state['edge_interdicted'][:] = node.state
         
-        action_mask = self.mask_fn()
+        action_mask = self.mask_fn(depth = node.depth)
         valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
         
         # Restore state
@@ -2302,26 +2308,26 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
     pbar.close()
 
     # Stats
-    print("\n" + "="*50)
-    print("WORKER PERFORMANCE STATS")
-    print("="*50)
+#    print("\n" + "="*50)
+ #   print("WORKER PERFORMANCE STATS")
+  #  print("="*50)
     total_gurobi_time = 0
     total_gurobi_count = 0
     
     all_stats = ray.get([w.get_stats.remote() for w in workers])
     for i, (stats, counts) in enumerate(all_stats):
-        print(f"\nWorker {i}:")
+ #       print(f"\nWorker {i}:")
         for k, v in stats.items():
             count = counts.get(k.replace('_time', '_count'), 0)
             avg = v / count if count > 0 else 0
-            print(f"  {k:<20}: {v:.4f}s (Count: {count}, Avg: {avg:.6f}s)")
+  #          print(f"  {k:<20}: {v:.4f}s (Count: {count}, Avg: {avg:.6f}s)")
             if 'gurobi' in k:
                 total_gurobi_time += v
                 total_gurobi_count += count
 
-    print("-" * 50)
-    print(f"Total Gurobi Time: {total_gurobi_time:.4f}s ({total_gurobi_count} calls)")
-    print("="*50 + "\n")
+#    print("-" * 50)
+ #   print(f"Total Gurobi Time: {total_gurobi_time:.4f}s ({total_gurobi_count} calls)")
+  #  print("="*50 + "\n")
 
     for w in workers:
         try: ray.kill(w)
