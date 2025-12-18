@@ -281,8 +281,8 @@ class CustomEnv(gym.Env):
         capacity_dict : dict, optional
             If provided, uses this capacity dictionary instead of current state.
             Useful for batch solving with different capacity configurations.
-        routing_assumption : ignored
-            Kept for backward compatibility.
+        routing_assumption : 'zero_sum', 'isolate', 'canalize', 'divert'
+            Determines secondary routing of defender over the network to thwart attacker's strategy
     
         Returns:
         --------
@@ -302,7 +302,7 @@ class CustomEnv(gym.Env):
             self._update_capacity_constraints()
 
         # Update objectives if needed (e.g. start of new episode or model re-init)
-        if (not getattr(self, 'strategy_objectives_setup', False)) or (self.old_routing_assumption==routing_assumption):
+        if (not getattr(self, 'strategy_objectives_setup', False)) or (self.old_routing_assumption!=routing_assumption):
             self._set_strategy_objectives(routing_assumption)
             self.strategy_objectives_setup = True
             self.old_routing_assumption = routing_assumption
@@ -505,6 +505,9 @@ class CustomEnv(gym.Env):
         self._cleanup_models()
         self.strategy_objectives_setup = False # Force objective reset on next solve
         self.old_routing_assumption = False
+
+        # Clear local outcome cache on reset because capacities/objectives change
+        self.local_outcome_cache = {}
         
         # Call parent reset and set random seeds
         super().reset(seed=seed)
@@ -1680,6 +1683,10 @@ class CustomEnv(gym.Env):
         """Reset the environment to initial state and return observation."""
         # Clean up any existing models
         self._cleanup_models()
+
+        # Clear local outcome cache when loading new state
+        self.local_outcome_cache = {}
+        
         super().reset(seed=seed)
         if seed is not None:
             self._set_random_seeds(seed)
