@@ -23,20 +23,31 @@ import seaborn as sns
 
 from stable_baselines3.common.vec_env import DummyVecEnv
 
+import ray
+if not ray.is_initialized():
+    ray.init(
+        address=None, 
+        ignore_reinit_error=True, 
+        logging_level='INFO',
+        include_dashboard=False,
+        num_cpus=45,
+        _temp_dir=os.environ.get('RAY_TMPDIR'), # Add this parameter with a short path
+    )
+
 # Import custom environment .py file
 import env_TA as ce #modified for curriculum learning
 
 #User Determined Settings
-graphName = "UKR"
+graphName = "G10x10"
 env_params = {'deterministic_agent': False,
               'multiple_interdiction_attempts': False,
-              'attacker_strategy': 'isolate',  # canalize   isolate   divert  zero_sum
-              'training_budget_range': (10, 10),  #G5x5: zero_sum/isolate: (5,10), canalize/divert: (8,16) G10x10: zero_sum/isolate: (15,30), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (15,25)
-              'max_path_length': 16,  #G5x5: 6,  G10x10: 13, UKR: 16
+              'attacker_strategy': 'zero_sum',  # canalize   isolate   divert  zero_sum
+              'training_budget_range': (15, 30),  #G5x5: zero_sum/isolate: (5,10), canalize/divert: (8,16) G10x10: zero_sum/isolate: (15,30), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (15,25)
+              'max_path_length': 13,  #G5x5: 6,  G10x10: 13, UKR: 16
              }
 
 # Number of scenarios to generate
-num_of_scenarios = 2 
+num_of_scenarios = 500 
 save_interval = 1  # Save every 10 episodes
 current_dir = os.getcwd()
 
@@ -56,7 +67,7 @@ def save_partial_results(save_path, completed_episodes, obj_vals, interdictions,
         pickle.dump(results, f)
 
 # Construct the path to the data files
-save_filename = f"{graphName}_{env_params['attacker_strategy']}_solution_v12_18.pkl"
+save_filename = f"{graphName}_{env_params['attacker_strategy']}_solution_v12_19.pkl"
 save_path = os.path.join(current_dir, '..', 'Solutions', save_filename)
 print(save_filename)
 
@@ -80,11 +91,11 @@ for episode in range(num_of_scenarios):
     if env_params['attacker_strategy'] == "zero_sum":
         start_time = time.perf_counter()
         #optimal_obj_val, optimal_interdiction_edges = env.solve_optimal_interdiction()
-        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = 46)
+        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = 40)
         end_time = time.perf_counter()
     else:
         start_time = time.perf_counter()
-        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=True, n_workers = 46)
+        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = 40)
         end_time = time.perf_counter()
     
     solve_time = end_time - start_time

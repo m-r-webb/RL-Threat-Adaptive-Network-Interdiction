@@ -2,8 +2,8 @@
 
 # Import all required packages
 import os
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Disable oneDNN messages
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'   # Suppress most logs (including CUDA errors)
+#os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Disable oneDNN messages
+#os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'   # Suppress most logs (including CUDA errors)
 os.environ["RAY_DISABLE_USAGE_STATS"] = "1"
 os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
 
@@ -13,6 +13,10 @@ os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
 os.environ['NUMEXPR_NUM_THREADS'] = '1'
 
+#os.environ.get('TMPDIR') 
+#os.getenv('TMPDIR')
+#print(TMPDIR)
+
 import pandas as pd
 import gurobipy as grb                # Gurobi optimization library for solving mathematical models
 import gymnasium as gym
@@ -20,26 +24,17 @@ from gymnasium import spaces
 import numpy as np
 import copy, random
 from tqdm import tqdm
-import tensorflow as tf
-tf.get_logger().setLevel('ERROR')          # Optional: Suppress Python-
+#import tensorflow as tf
+#tf.get_logger().setLevel('ERROR')          # Optional: Suppress Python-
 
 from collections import defaultdict, Counter
+
+import ray
 
 # Reduce native logging noise (best-effort; affects Python loggers)
 import logging
 logging.getLogger("ray").setLevel(logging.WARNING)
 logging.getLogger("raylet").setLevel(logging.WARNING)
-
-import ray
-if not ray.is_initialized():
-    ray.init(
-        address=None, 
-        ignore_reinit_error=True, 
-        logging_level='DEBUG',
-        include_dashboard=False,
-        _temp_dir=os.environ.get('RAY_TMPDIR', '/tmp/r'), # Add this parameter with a short path
-    )
-
 
 # Class representing Node Object
 class Node():
