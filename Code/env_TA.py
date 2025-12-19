@@ -7,6 +7,12 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'   # Suppress most logs (including CUDA 
 os.environ["RAY_DISABLE_USAGE_STATS"] = "1"
 os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
 
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS'] = '1'
+
 import pandas as pd
 import gurobipy as grb                # Gurobi optimization library for solving mathematical models
 import gymnasium as gym
@@ -25,12 +31,14 @@ logging.getLogger("ray").setLevel(logging.WARNING)
 logging.getLogger("raylet").setLevel(logging.WARNING)
 
 import ray
-ray.init(
-    address=None, 
-    ignore_reinit_error=True, 
-    logging_level=logging.WARNING,
-    _temp_dir=os.environ.get('RAY_TMPDIR', '/tmp/r'), # Add this parameter with a short path
-)
+if not ray.is_initialized():
+    ray.init(
+        address=None, 
+        ignore_reinit_error=True, 
+        logging_level='DEBUG',
+        include_dashboard=False,
+        _temp_dir=os.environ.get('RAY_TMPDIR', '/tmp/r'), # Add this parameter with a short path
+    )
 
 
 # Class representing Node Object
@@ -2120,7 +2128,7 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
     # SHARDED MEMOIZATION
     # Create multiple memo actors to reduce lock contention
     # Using n_workers shards ensures high throughput
-    num_memo_shards = max(1, n_workers) 
+    num_memo_shards = min(2, n_workers) 
     memo_actors = [_SharedMemoActor.remote() for _ in range(num_memo_shards)]
 
     # Create outcome memoization actor ONLY if stochastic
