@@ -511,6 +511,10 @@ class CustomEnv(gym.Env):
 
         # Clear local outcome cache on reset because capacities/objectives change
         self.local_outcome_cache = {}
+
+        # Clear centralized outcome cache if it exists
+        if self.outcome_memo_actor:
+            self.outcome_memo_actor.clear.remote()
         
         # Call parent reset and set random seeds
         super().reset(seed=seed)
