@@ -1365,23 +1365,41 @@ class CustomEnv(gym.Env):
             for seed in seed_list:
                 if self.multiple_interdiction_attempts:
                     objective_value, interdicted_edges, interdicted_quantities = self.solve_stochastic_max_flow_IM(n_scenarios=M, seed=seed)
+                    
+                    # Create dense vector for key (values > 1 allowed)
+                    interdiction_vector = np.zeros(len(self.both_edges), dtype=int)
+                    for edge, qty in zip(interdicted_edges, interdicted_quantities):
+                        if edge in self.edge_to_index:
+                            interdiction_vector[self.edge_to_index[edge]] = qty
+                    interdicted_key = tuple(interdiction_vector)
+                    
                 else:
                     objective_value, interdicted_edges = self.solve_stochastic_max_flow(n_scenarios=M, seed=seed)
-                # Convert interdicted_edges to a frozenset for hashability
-                interdicted_set = frozenset(interdicted_edges)
+                    
+                    # Create dense vector for key (binary)
+                    interdiction_vector = np.zeros(len(self.both_edges), dtype=int)
+                    for edge in interdicted_edges:
+                        if edge in self.edge_to_index:
+                            interdiction_vector[self.edge_to_index[edge]] = 1
+                    interdicted_key = tuple(interdiction_vector)
                     
                 # Check if the set of interdicted edges is unique
-                if interdicted_set not in unique_interdicted_sets:
-                    unique_interdicted_sets.append(interdicted_set)       
+                if interdicted_key not in unique_interdicted_sets:
+                    unique_interdicted_sets.append(interdicted_key)       
 
                     if self.multiple_interdiction_attempts:
                         objective_value, interdicted_edges, interdicted_quantities = self.solve_stochastic_max_flow_IM(n_scenarios=N, interdicted_edges=interdicted_edges, interdicted_quantities=interdicted_quantities)
+                        # Expand for return value
+                        current_solution = []
+                        for e, k in zip(interdicted_edges, interdicted_quantities):
+                            current_solution.extend([e] * k)
                     else:
                         objective_value, interdicted_edges = self.solve_stochastic_max_flow(n_scenarios=N, interdicted_edges=interdicted_edges)
+                        current_solution = interdicted_edges
 
                     if objective_value < best_objective_value:
                         best_objective_value = objective_value
-                        best_interdicted_edges = interdicted_edges
+                        best_interdicted_edges = current_solution
 
             return best_objective_value, best_interdicted_edges
 
@@ -1467,13 +1485,15 @@ class CustomEnv(gym.Env):
 
     def solve_stochastic_max_flow_IM(self, n_scenarios = 50, seed = 173, interdicted_edges = [], interdicted_quantities =[]):     #PICKUP HERE!!!! 
         # Optimally Solve for Stochastic Solution using Model 1D and SAA
+        max_attempts = self.MAX_INTERDICTION_ATTEMPTS if self.multiple_interdiction_attempts else 1
+
         if not hasattr(self, 'optimal_stochastic_model_IM'):
             # Initializing the model
             self.optimal_stochastic_model_IM = grb.Model("Stochastic Model_IM", env=self.GUROBI_ENV)
 
             # Creating decision variables
             # Create composite keys: (edge_tuple, k)
-            gamma_indices = [(e, k) for e in self.interdictable_edges for k in range(1, 9)]
+            gamma_indices = [(e, k) for e in self.interdictable_edges for k in range(1, max_attempts + 1)]
             self.stochastic_gamma_IM = self.optimal_stochastic_model_IM.addVars(gamma_indices, vtype=grb.GRB.BINARY, name="g_IM")
             self.optimal_stochastic_model_IM.update()
 
@@ -1482,12 +1502,12 @@ class CustomEnv(gym.Env):
 
             # Gamma constraint
             self.stochastic_gamma_constr_IM = self.optimal_stochastic_model_IM.addConstrs((grb.quicksum(
-                self.stochastic_gamma_IM[e,k] for k in range(1,9)) <= 1 for e in self.interdictable_edges), name="gamma_constr_IM")
+                self.stochastic_gamma_IM[e,k] for k in range(1, max_attempts + 1)) <= 1 for e in self.interdictable_edges), name="gamma_constr_IM")
             
              # Budget constraint
             self.stochastic_budget_constr_IM = self.optimal_stochastic_model_IM.addConstr(grb.quicksum(
                 self.edges_episode[e].interdiction_cost * k * self.stochastic_gamma_IM[e,k] 
-                for e in self.interdictable_edges for k in range(1,9)) <= self.state['budget'][0], name="budget_IM")
+                for e in self.interdictable_edges for k in range(1, max_attempts + 1)) <= self.state['budget'][0], name="budget_IM")
 
             self.stochastic_old_state_IM = self.state
             self.stochastic_old_interdicted_edges_IM = interdicted_edges
@@ -1495,7 +1515,7 @@ class CustomEnv(gym.Env):
 
         if self.stochastic_old_interdicted_edges_IM != interdicted_edges or self.stochastic_old_interdicted_quantities_IM != interdicted_quantities:
             # Update Variable Lower Bounds
-            self.optimal_stochastic_model_IM.setAttr("LB", [self.stochastic_gamma_IM[e,k] for e in self.interdictable_edges for k in range(1,9)],0)
+            self.optimal_stochastic_model_IM.setAttr("LB", [self.stochastic_gamma_IM[e,k] for e in self.interdictable_edges for k in range(1, max_attempts + 1)],0)
             self.optimal_stochastic_model_IM.setAttr("LB", [self.stochastic_gamma_IM[e,k] for e, k in zip(interdicted_edges, interdicted_quantities)],1)
             self.stochastic_old_interdicted_edges_IM=interdicted_edges
         
@@ -1528,10 +1548,11 @@ class CustomEnv(gym.Env):
         
         # Scenario generation 
         # Compute base probability and ensure it's an array
-        p_base = np.full(len(self.interdictable_edges), self.state["edge_interdiction_probability"])
+        interdictable_indices = [self.edge_to_index[e] for e in self.interdictable_edges]
+        p_base = self.state["edge_interdiction_probability"][interdictable_indices]
 
-        # Create k values (1 to 8)
-        k_vals = np.arange(1, 9)
+        # Create k values (1 to max_attempts)
+        k_vals = np.arange(1, max_attempts + 1)
 
         # Calculate success probabilities: 1 - (1-p)^k for each edge and k
         probs = 1 - (1 - p_base[:, np.newaxis]) ** k_vals
@@ -1539,6 +1560,8 @@ class CustomEnv(gym.Env):
         # Generate scenario outcomes
         scenario_outcomes = np.random.binomial(1, probs, size=(n_scenarios, len(self.interdictable_edges), len(k_vals)))
         
+        interdictable_edge_map = {e: i for i, e in enumerate(self.interdictable_edges)}
+
         if hasattr(self, 'stochastic_aabg_constr_IM'):
             self.optimal_stochastic_model_IM.remove(self.stochastic_aabg_constr_IM)
             self.optimal_stochastic_model_IM.remove(self.stochastic_aabg_reverse_constr_IM)
@@ -1546,8 +1569,8 @@ class CustomEnv(gym.Env):
             self.optimal_stochastic_model_IM.update()  # Force model synchronization
             del self.stochastic_aabg_constr_IM, self.stochastic_aabg_reverse_constr_IM
             
-        self.stochastic_aabg_constr_IM = self.optimal_stochastic_model_IM.addConstrs((self.stochastic_alpha_IM[e[0],s] - self.stochastic_alpha_IM[e[1], s]+self.stochastic_beta_IM[e, s]+ (grb.quicksum(self.stochastic_gamma_IM[e,k] * scenario_outcomes[s, self.edge_to_index[e],k-1] for k in k_vals) if e in self.edge_to_index else 0) >= 0 for s in self.scenarios_IM for e in self.edges_reset.keys()), name='aabg_IM')
-        self.stochastic_aabg_reverse_constr_IM = self.optimal_stochastic_model_IM.addConstrs((self.stochastic_alpha_IM[e[1],s] - self.stochastic_alpha_IM[e[0], s]+self.stochastic_beta_IM[e, s]+ (grb.quicksum(self.stochastic_gamma_IM[e,k] * scenario_outcomes[s, self.edge_to_index[e],k-1] for k in k_vals) if e in self.edge_to_index else 0) >= 0 for s in self.scenarios_IM for e in self.edges_reset.keys()), name='aabg_IM')
+        self.stochastic_aabg_constr_IM = self.optimal_stochastic_model_IM.addConstrs((self.stochastic_alpha_IM[e[0],s] - self.stochastic_alpha_IM[e[1], s]+self.stochastic_beta_IM[e, s]+ (grb.quicksum(self.stochastic_gamma_IM[e,k] * scenario_outcomes[s, interdictable_edge_map[e], k-1] for k in k_vals) if e in interdictable_edge_map else 0) >= 0 for s in self.scenarios_IM for e in self.edges_reset.keys()), name='aabg_IM')
+        self.stochastic_aabg_reverse_constr_IM = self.optimal_stochastic_model_IM.addConstrs((self.stochastic_alpha_IM[e[1],s] - self.stochastic_alpha_IM[e[0], s]+self.stochastic_beta_IM[e, s]+ (grb.quicksum(self.stochastic_gamma_IM[e,k] * scenario_outcomes[s, interdictable_edge_map[e], k-1] for k in k_vals) if e in interdictable_edge_map else 0) >= 0 for s in self.scenarios_IM for e in self.edges_reset.keys()), name='aabg_IM')
 
         # Solving
         self.optimal_stochastic_model_IM.optimize()
@@ -1555,7 +1578,7 @@ class CustomEnv(gym.Env):
         # Extract interdiction decisions with k-values
         interdiction_decisions = []
         for e in self.interdictable_edges:
-            for k in range(1, 9):
+            for k in range(1, max_attempts + 1):
                 if self.stochastic_gamma_IM[e, k].X > 0.5:
                     interdiction_decisions.append((e, k))
                     break  # Only one k per edge possible
@@ -2033,10 +2056,6 @@ class _RemoteEnvWorker:
                 final_objective = -float('inf')
             self.stats['gurobi_solve_time'] += time.perf_counter() - t_start
             self.counts['gurobi_solve_count'] += 1
-
-            # restore
-            self.env.state['budget'][0] = old_budget
-            self.env.state['edge_interdicted'][:] = old_interdicted
 
             # base case
             if rem_budget < self.min_edge_cost or d >= self.max_depth_inner:
