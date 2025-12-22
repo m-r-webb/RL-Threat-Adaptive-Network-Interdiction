@@ -1865,8 +1865,9 @@ class SharedOutcomeMemoActor:
     Centralized cache for stochastic max-flow outcomes.
     Stores: (outcome_tuple, strategy) -> {'objective': val, 'flows': dict}
     """
-    def __init__(self):
+    def __init__(self): #, max_size=200000):
         self.cache = {}
+      #  self.max_size = max_size
 
     def get_batch(self, keys):
         return [self.cache.get(k) for k in keys]
@@ -1874,6 +1875,13 @@ class SharedOutcomeMemoActor:
     def set_batch(self, keys, values):
         for k, v in zip(keys, values):
             self.cache[k] = v
+        
+        # Simple eviction if too large (random eviction is fast)
+      #  if len(self.cache) > self.max_size:
+            # Remove ~20% of items to avoid frequent clearing
+       #     keys_to_remove = list(self.cache.keys())[:int(self.max_size * 0.2)]
+        #    for k in keys_to_remove:
+         #       del self.cache[k]
             
     def size(self):
         return len(self.cache)
@@ -2032,6 +2040,10 @@ class _RemoteEnvWorker:
 
             # base case
             if rem_budget < self.min_edge_cost or d >= self.max_depth_inner:
+                # restore
+                self.env.state['budget'][0] = old_budget
+                self.env.state['edge_interdicted'][:] = old_interdicted
+
                 memo_local[key] = (final_objective, [])
                 # Count the volume of the skipped subtree (leaves)
                 volume = int(self.num_both_edges ** max(0, self.budget_levels - d))
@@ -2045,7 +2057,11 @@ class _RemoteEnvWorker:
                         pass
                 return final_objective, []
 
-            action_mask = self.env.mask_fn()
+            action_mask = self.env.mask_fn(depth=d)
+
+            # restore
+            self.env.state['budget'][0] = old_budget
+            self.env.state['edge_interdicted'][:] = old_interdicted
             valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
 
             # Report the discovery of invalid actions as progress using estimated subtree sizes
