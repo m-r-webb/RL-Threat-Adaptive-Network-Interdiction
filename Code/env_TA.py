@@ -364,6 +364,20 @@ class CustomEnv(gym.Env):
         # Minimum flow forward and reverse constraints
         self.maxflow_model.addConstrs((self.flow_var[e] >= self.edge_used[e] for e in self.all_both_edges), name="min_flow_forward")
 
+        # Prevent backflow from Super Sink
+        self.maxflow_model.addConstrs(
+            (self.flow_var[e] == 0 
+             for e in self.edge_groups[self.super_sink_nodes[0]]['out']),
+            name="no_backflow_from_supersink"
+        )
+
+        # Prevent backflow to Super Source
+        self.maxflow_model.addConstrs(
+            (self.flow_var[e] == 0 
+             for e in self.edge_groups[self.super_source_nodes[0]]['in']),
+            name="no_backflow_to_supersource"
+        )
+
     def _update_capacity_constraints(self):
         """LEGACY Update edge capacity constraints based on current interdiction state."""
         # Calculate current edge capacities considering interdiction
@@ -708,7 +722,11 @@ class CustomEnv(gym.Env):
         num_to_mark = np.random.randint(1, self.num_sink_nodes + 1)
         chosen_nodes = np.random.choice(self.sink_nodes, size = num_to_mark, replace=False)
         
-        marked_indices = np.where(np.isin(self.edge_departures, chosen_nodes) | np.isin(self.edge_arrivals, chosen_nodes))[0].tolist()
+        # Mark edges where arrival is chosen_node AND departure is NOT super sink
+        arrival_mask = np.isin(self.edge_arrivals, chosen_nodes)
+        departure_mask = ~np.isin(self.edge_departures, self.super_sink_nodes)
+        
+        marked_indices = np.where(arrival_mask & departure_mask)[0].tolist()
         isolate_objective[marked_indices] = 1
     
         return {**base_state, 'isolate_objective': isolate_objective}
@@ -1186,9 +1204,12 @@ class CustomEnv(gym.Env):
         # Get indices where objective is 1
         target_indices = np.where(objective[:self.num_both_edges] == 1)[0]
         
-        total_flow = 0
-
         target_edges = [self.both_edges[i] for i in target_indices]
+
+        # Filter to only include edges outgoing to super sink nodes to avoid double counting
+        # and internal flow between sink nodes.
+        #if objective_key == 'isolate_objective':
+        #     target_edges = [e for e in target_edges if e[1] in self.super_sink_nodes]
     
         # Batch get flows
         flows_array = np.array([(flows.get(edge, 0) + flows.get((edge[1], edge[0]), 0)) for edge in target_edges])
@@ -1768,13 +1789,10 @@ class CustomEnv(gym.Env):
         if start_nodes is None:
             start_nodes = self.state['isolate_objective']
             
-        origin_nodes = set()
-        destination_nodes = set()
+        target_nodes = set()
         for idx in np.where(start_nodes[:self.num_both_edges]==1)[0]:
             edge = self.both_edges[idx]
-            origin_nodes.add(edge[0])
-            destination_nodes.add(edge[1])
-        target_nodes = origin_nodes.intersection(destination_nodes)
+            target_nodes.add(edge[1])
 
         visited_nodes = set(target_nodes)
         incoming_edge_indices = set()
@@ -2105,8 +2123,10 @@ class _RemoteEnvWorker:
                         pass
                 return final_objective, []
 
-            best_reward = -float('inf')
+            # Initialize with current state value (allow stopping here)
+            best_reward = final_objective
             best_seq = []
+            
             for action in valid_actions:
                 new_state = inter_state.copy()
                 new_state[action] += 1
@@ -2382,10 +2402,33 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
     all_nodes.sort(key=lambda x: x.depth, reverse=True)
     
     for node in all_nodes:
+        # Compute value of current node (stopping value)
+        # Temporarily set state
+        old_budget = self.state['budget'][0]
+        old_interdicted = self.state['edge_interdicted'].copy()
+        self.state['budget'][0] = node.budget
+        self.state['edge_interdicted'][:] = node.state
+        
+        if self.attacker_strategy == "zero_sum":
+            val, _ = self._compute_objective_and_flows()
+            val = -val
+        elif self.attacker_strategy == 'canalize':
+            val, _ = self._calculate_canalize_objective_and_flows()
+        elif self.attacker_strategy == 'isolate':
+            val, _ = self._calculate_isolate_objective_and_flows()
+            val = -val
+        elif self.attacker_strategy == 'divert':
+            val, _ = self._calculate_divert_objective_and_flows()
+        else:
+            val = -float('inf')
+        
+        self.state['budget'][0] = old_budget
+        self.state['edge_interdicted'][:] = old_interdicted
+
         if node.children:
             # This is an internal node in our expanded tree.
-            # Its value is the max of its children.
-            best_val = -float('inf')
+            # Its value is the max of its children AND itself (stopping).
+            best_val = val
             best_seq = []
             
             for child in node.children:
@@ -2406,31 +2449,6 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
         
         elif node.value is None:
             # Leaf node that wasn't solved?
-            # This implies it was terminal/invalid and didn't get sent to worker?
-            # We need to compute terminal value locally if it wasn't sent.
-            
-            # Temporarily set state
-            old_budget = self.state['budget'][0]
-            old_interdicted = self.state['edge_interdicted'].copy()
-            self.state['budget'][0] = node.budget
-            self.state['edge_interdicted'][:] = node.state
-            
-            if self.attacker_strategy == "zero_sum":
-                val, _ = self._compute_objective_and_flows()
-                val = -val
-            elif self.attacker_strategy == 'canalize':
-                val, _ = self._calculate_canalize_objective_and_flows()
-            elif self.attacker_strategy == 'isolate':
-                val, _ = self._calculate_isolate_objective_and_flows()
-                val = -val
-            elif self.attacker_strategy == 'divert':
-                val, _ = self._calculate_divert_objective_and_flows()
-            else:
-                val = -float('inf')
-            
-            self.state['budget'][0] = old_budget
-            self.state['edge_interdicted'][:] = old_interdicted
-            
             node.value = val
             node.best_sequence = []
             memo_driver[node.key] = (val, [])
