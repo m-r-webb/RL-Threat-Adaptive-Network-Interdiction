@@ -976,7 +976,7 @@ class CustomEnv(gym.Env):
             reward = self.PENALTY_VALUE
         return reward
 
-    def _calculate_stochastic_objective_and_flow(self, strategy_type="zero_sum"):
+    def _calculate_stochastic_objective_and_flow(self, strategy_type="zero_sum", reduce_memory_usage=False):
         """
         Optimized stochastic calculation: group by unique outcomes and weight by probability.
     
@@ -1018,20 +1018,20 @@ class CustomEnv(gym.Env):
         
         # 1. Check Local Cache
         for outcome in unique_outcomes:
-            if (outcome, strategy_type) not in self.local_outcome_cache:
+            if outcome not in self.local_outcome_cache: #(outcome, strategy_type)
                 outcomes_needed_from_central.append(outcome)
         
         # 2. Check Central Cache (only for what wasn't in local)
         outcomes_to_solve = []
         if outcomes_needed_from_central and self.outcome_memo_actor:
-            keys = [(out, strategy_type) for out in outcomes_needed_from_central]
+            keys = [out for out in outcomes_needed_from_central] #(out, strategy_type)
             # Batch fetch from Ray
             results = ray.get(self.outcome_memo_actor.get_batch.remote(keys))
             
             for outcome, res in zip(outcomes_needed_from_central, results):
                 if res is not None:
                     # Update local cache immediately
-                    self.local_outcome_cache[(outcome, strategy_type)] = res
+                    self.local_outcome_cache[outcome] = res #(outcome, strategy_type)
                 else:
                     outcomes_to_solve.append(outcome)
         else:
@@ -1065,19 +1065,34 @@ class CustomEnv(gym.Env):
                 diverted_flow_to = to_flow - self.reference_start_flows[1]
                 objective = np.min([diverted_flow_from, diverted_flow_to])
         
-            res = {
-                'objective': objective,
-                'flows': flows
-            }
+            if reduce_memory_usage:
+                # Store indices of edges with non-zero flow
+                nonzero_indices = set()
+                for edge, flow in flows.items():
+                    if flow > 0:
+                        if edge in self.edge_to_index:
+                            nonzero_indices.add(self.edge_to_index[edge])
+                        elif (edge[1], edge[0]) in self.edge_to_index:
+                            nonzero_indices.add(self.edge_to_index[(edge[1], edge[0])])
+                
+                res = {
+                    'objective': objective,
+                    'nonzero_flow_indices': list(nonzero_indices)
+                }
+            else:
+                res = {
+                    'objective': objective,
+                    'flows': flows
+                }
             
             # Update local cache
-            self.local_outcome_cache[(outcome, strategy_type)] = res
+            self.local_outcome_cache[outcome] = res #(outcome, strategy_type)
             # Queue for central update
             new_results_for_central[outcome] = res
             
         # 4. Update Central Cache (Async / Fire-and-forget)
         if self.outcome_memo_actor and new_results_for_central:
-            keys = [(out, strategy_type) for out in new_results_for_central.keys()]
+            keys = [out for out in new_results_for_central.keys()]  #(out, strategy_type)
             vals = list(new_results_for_central.values())
             self.outcome_memo_actor.set_batch.remote(keys, vals)
 
@@ -1086,16 +1101,23 @@ class CustomEnv(gym.Env):
         weighted_flows = defaultdict(float)
         
         for outcome, count in outcome_counts.items():
-            result = self.local_outcome_cache[(outcome, strategy_type)]
+            result = self.local_outcome_cache[outcome]  #(outcome, strategy_type)
             weight = count / total_samples
             
             weighted_objective += result['objective'] * weight
-            for edge, flow in result['flows'].items():
-                weighted_flows[edge] += flow * weight
+            
+            if 'nonzero_flow_indices' in result:
+                # Reconstruct flow as 1 for these indices
+                for idx in result['nonzero_flow_indices']:
+                    edge = self.both_edges[idx]
+                    weighted_flows[edge] += 1.0 * weight
+            elif 'flows' in result:
+                for edge, flow in result['flows'].items():
+                    weighted_flows[edge] += flow * weight
     
         return weighted_objective, dict(weighted_flows)
     
-    def _compute_objective_and_flows(self, deterministic_mode=None):
+    def _compute_objective_and_flows(self, deterministic_mode=None, reduce_memory_usage=False):
         """Calculate the max flow objective and edge flows."""
         if deterministic_mode is None:
             deterministic_mode = self.deterministic_outcomes
@@ -1104,11 +1126,11 @@ class CustomEnv(gym.Env):
             objective, flows = self.solve_max_flow()
         else:
             # Stochastic outcome calculation
-            objective, flows = self._calculate_stochastic_objective_and_flow('zero_sum')
+            objective, flows = self._calculate_stochastic_objective_and_flow('zero_sum', reduce_memory_usage)
     
         return objective, flows
 
-    def _calculate_canalize_objective_and_flows(self):
+    def _calculate_canalize_objective_and_flows(self, reduce_memory_usage=False):
         """Calculate objective for canalize strategy (flow through specific path)."""
         if self.deterministic_outcomes:
             _, flows = self.solve_max_flow(routing_assumption = 'canalize')
@@ -1116,7 +1138,7 @@ class CustomEnv(gym.Env):
             return target_path_flow, flows
         else:
             # Stochastic calculation - returns mean objective directly
-            objective, mean_flows = self._calculate_stochastic_objective_and_flow('canalize')
+            objective, mean_flows = self._calculate_stochastic_objective_and_flow('canalize', reduce_memory_usage)
             return objective, mean_flows
         
     def _calculate_canalize_reward(self):
@@ -1130,7 +1152,7 @@ class CustomEnv(gym.Env):
             reward = self.PENALTY_VALUE
         return reward
         
-    def _calculate_isolate_objective_and_flows(self):
+    def _calculate_isolate_objective_and_flows(self, reduce_memory_usage=False):
         """Calculate objective for isolate strategy (reduce flow on specific edges)."""
         if self.deterministic_outcomes:
             _, flows = self.solve_max_flow(routing_assumption = 'isolate')
@@ -1138,7 +1160,7 @@ class CustomEnv(gym.Env):
             return target_node_flow, flows
         else:
             # Stochastic calculation - returns mean objective directly
-            objective, mean_flows = self._calculate_stochastic_objective_and_flow('isolate')
+            objective, mean_flows = self._calculate_stochastic_objective_and_flow('isolate', reduce_memory_usage)
             return objective, mean_flows
         
     def _calculate_isolate_reward(self):
@@ -1152,7 +1174,7 @@ class CustomEnv(gym.Env):
             reward = self.PENALTY_VALUE
         return reward
 
-    def _calculate_divert_objective_and_flows(self, mode = None):
+    def _calculate_divert_objective_and_flows(self, mode = None, reduce_memory_usage=False):
         """Calculate objective for divert strategy (redirect flow from one path to another)."""
         if mode is None:
             mode = self.deterministic_outcomes
@@ -1168,7 +1190,7 @@ class CustomEnv(gym.Env):
             return objective, flows
         else:
             # Stochastic calculation - returns mean objectives directly
-            mean_objective, mean_flows = self._calculate_stochastic_objective_and_flow('divert')
+            mean_objective, mean_flows = self._calculate_stochastic_objective_and_flow('divert', reduce_memory_usage)
             # Return as tuple to maintain consistent interface with reward calculation
             return mean_objective, mean_flows
 
@@ -1826,11 +1848,11 @@ class CustomEnv(gym.Env):
         if self.attacker_strategy == 'isolate':
             # Get edges on paths from isolate objectives to sources
             on_path_to_source = self.get_edges_on_paths_to_source(start_nodes = self.state['isolate_objective'])
-#            has_flow = self.cached_flow_array[:self.num_interdictable] > 0
+            has_flow = self.cached_flow_array[:self.num_interdictable] > 0
             valid_actions = (sufficient_budget & #has_capacity & 
                              has_probability & 
                              on_path_to_source &
-                            # has_flow &
+                             has_flow &
                              within_limit)
         
         elif self.attacker_strategy == 'canalize':
@@ -1904,13 +1926,6 @@ class SharedOutcomeMemoActor:
     def set_batch(self, keys, values):
         for k, v in zip(keys, values):
             self.cache[k] = v
-        
-        # Simple eviction if too large (random eviction is fast)
-      #  if len(self.cache) > self.max_size:
-            # Remove ~20% of items to avoid frequent clearing
-       #     keys_to_remove = list(self.cache.keys())[:int(self.max_size * 0.2)]
-        #    for k in keys_to_remove:
-         #       del self.cache[k]
             
     def size(self):
         return len(self.cache)
@@ -2049,15 +2064,15 @@ class _RemoteEnvWorker:
             # terminal objective
             t_start = time.perf_counter()
             if self.attacker_strategy == "zero_sum":
-                final_objective, _ = self.env._compute_objective_and_flows()
+                final_objective, _ = self.env._compute_objective_and_flows(reduce_memory_usage=True)
                 final_objective = -final_objective
             elif self.attacker_strategy == 'canalize':
-                final_objective, _ = self.env._calculate_canalize_objective_and_flows()
+                final_objective, _ = self.env._calculate_canalize_objective_and_flows(reduce_memory_usage=True)
             elif self.attacker_strategy == 'isolate':
-                final_objective, _ = self.env._calculate_isolate_objective_and_flows()
+                final_objective, _ = self.env._calculate_isolate_objective_and_flows(reduce_memory_usage=True)
                 final_objective = -final_objective
             elif self.attacker_strategy == 'divert':
-                final_objective, _ = self.env._calculate_divert_objective_and_flows()
+                final_objective, _ = self.env._calculate_divert_objective_and_flows(reduce_memory_usage=True)
             else:
                 final_objective = -float('inf')
             self.stats['gurobi_solve_time'] += time.perf_counter() - t_start
