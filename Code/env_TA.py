@@ -13,10 +13,6 @@ os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
 os.environ['NUMEXPR_NUM_THREADS'] = '1'
 
-#os.environ.get('TMPDIR') 
-#os.getenv('TMPDIR')
-#print(TMPDIR)
-
 import pandas as pd
 import gurobipy as grb                # Gurobi optimization library for solving mathematical models
 import gymnasium as gym
@@ -452,8 +448,11 @@ class CustomEnv(gym.Env):
         # 1. Primary Objective: Maximize Total Flow (Always Priority 10)
         self.maxflow_model.setObjectiveN(self.flow_var[self.super_edge], index=0, priority=10, weight=1.0, name="max_flow")
 
+        # Minimize number of edges used to prevent cycles (Always Priority 1)
+        expr = grb.quicksum(self.edge_used[e] for e in self.all_both_edges)
+        self.maxflow_model.setObjectiveN(expr, index=1, priority=1, weight=-1.0, name="min_edges_used")
+
         if routing_assumption == "zero_sum":
-            # No secondary objectives
             pass
 
         elif routing_assumption == "isolate":
@@ -486,7 +485,7 @@ class CustomEnv(gym.Env):
 
         elif routing_assumption == "divert":
             # Secondary: Maximize min flow on 'divert_from' (Priority 5)
-            # Tertiary: Minimize flow on 'divert_to' (Priority 1)
+            # Tertiary: Minimize flow on 'divert_to' (Priority 3)
             
             # Divert From
             from_indices = np.where(self.state['divert_from_objective'][:self.num_both_edges] == 1)[0]
@@ -511,7 +510,7 @@ class CustomEnv(gym.Env):
             if to_edges:
                 expr_to = grb.quicksum(self.flow_var[e] + self.flow_var[(e[1], e[0])] for e in to_edges)
                 # Minimize -> weight = -1.0
-                self.maxflow_model.setObjectiveN(expr_to, index=2, priority=1, weight=-1.0, name="min_divert_to_sum")
+                self.maxflow_model.setObjectiveN(expr_to, index=2, priority=3, weight=-1.0, name="min_divert_to_sum")
 
         self.maxflow_model.update()
     
@@ -741,10 +740,10 @@ class CustomEnv(gym.Env):
         # Find max flow path
         _, flows = self.solve_max_flow()
         from_path = self._extract_max_flow_path(flows)
-        
+
         # Find alternative path avoiding max flow path
         to_path = self._find_alternative_path(from_path)
-    
+
         # Convert paths to objective arrays
         divert_from = np.zeros(self.max_num_edges, dtype=int)
         divert_to = np.zeros(self.max_num_edges, dtype=int)
@@ -789,7 +788,7 @@ class CustomEnv(gym.Env):
     
         while current_node != sink:
             outgoing_edges = self.edge_groups[current_node]['out']
-            next_edge = max(outgoing_edges, key=lambda e: flows.get(e, 0))
+            next_edge = max(outgoing_edges, key=lambda e: flows.get(e, 0)+ random.random() * 1e-6)
             from_path.add(next_edge)
             current_node = next_edge[1]
     
@@ -1251,14 +1250,12 @@ class CustomEnv(gym.Env):
         padding_mask = self.state.get("padding_mask", np.ones(self.max_num_edges))
         valid_indices = np.where(padding_mask == 1)[0]
     
-        print(f"\nNumber of valid (non-padded) edges: {len(valid_indices)} / {self.max_num_edges}")
         print(f"Actual number of edges in graph: {self.num_both_edges}")
     
         # Budget information
         print(f"\n{'Budget Information':^80}")
         print("-" * 80)
-        print(f"Remaining Budget: {self.state['budget'][0]}")
-        print(f"Reference Budget: {self.reference_budget}")
+        print(f"Remaining / Reference Budget: {self.state['budget'][0]} / {self.reference_budget}")
     
         # Edge-based state information (filtered by padding mask)
         print(f"\n{'Edge State Information':^80}")
@@ -1308,17 +1305,8 @@ class CustomEnv(gym.Env):
         print(f"\n{'Other State Information':^80}")
         print("-" * 80)
     
-        if 'episode_step' in self.state:
-            print(f"Episode Step: {self.state['episode_step'][0]}")
-    
-        if 'max_flow_value' in self.state:
-            print(f"Max Flow Value: {self.state['max_flow_value'][0]:.2f}")
-    
-        print(f"\nReference Objective: {self.reference_obj}")
-    
-        if hasattr(self, 'last_obj'):
-            print(f"Last Objective: {self.last_obj}")
-    
+        print(f"Last Objective / Reference Objective: {self.last_obj} / {self.reference_obj}")
+
         print("=" * 80)
         # END Gymnasium Environment Methods
             
