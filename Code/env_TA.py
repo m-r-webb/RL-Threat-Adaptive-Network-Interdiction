@@ -2500,6 +2500,10 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
         try: ray.kill(ma)
         except: pass
 
+    if outcome_memo_actor:
+        try: ray.kill(outcome_memo_actor)
+        except: pass
+
     if self.attacker_strategy in ("zero_sum", "isolate"):
         optimal_reward = -optimal_reward
 
@@ -2511,4 +2515,3 @@ try:
     CustomEnv.solve_backward_induction_ray = solve_backward_induction_ray
 except Exception:
     pass
-
