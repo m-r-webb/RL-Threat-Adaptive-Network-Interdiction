@@ -24,6 +24,7 @@ from tqdm import tqdm
 #tf.get_logger().setLevel('ERROR')          # Optional: Suppress Python-
 
 from collections import defaultdict, Counter
+from itertools import product
 
 import ray
 
@@ -990,28 +991,58 @@ class CustomEnv(gym.Env):
         probs = self.state['edge_interdiction_probability'][:self.num_both_edges]
         interdicted = self.state['edge_interdicted'][:self.num_both_edges].astype(int)
         total_samples = self.SAMPLE_SIZE
-    
-        # Sample interdiction outcomes
-        outcome_samples = []
-        for _ in range(total_samples):
-            # For each edge, determine if interdiction succeeds based on probability
-            
-            # Create outcome tuple (which edges are successfully interdicted)
-            if self.multiple_interdiction_attempts:
-                # Add to existing interdiction count
-                failure_probs = ((1 - probs) ** interdicted)
-                success = np.random.binomial(1, 1-failure_probs)
-                outcome = tuple(np.minimum(interdicted, success)) #tuple(interdicted + success)
-            else:
-                success = np.random.binomial(1, probs)
-                # Binary: either interdicted or not
-                outcome = tuple(np.minimum(interdicted, success))
         
-            outcome_samples.append(outcome)
-    
-        # Count unique outcomes and their frequencies
-        outcome_counts = Counter(outcome_samples)
-        unique_outcomes = list(outcome_counts.keys())
+        unique_outcomes = []
+        outcome_weights = {}
+
+        if total_samples is None:
+            # Systematic approach: Generate all possible outcomes
+            interdicted_indices = np.where(interdicted > 0)[0]
+            num_interdicted = len(interdicted_indices)
+            
+            # Calculate success probabilities for interdicted edges
+            # P(success) = 1 - (1 - p)^k
+            edge_success_probs = 1 - (1 - probs[interdicted_indices]) ** interdicted[interdicted_indices]
+            
+            for outcome_combo in product([0, 1], repeat=num_interdicted):
+                outcome_array = np.zeros(self.num_both_edges, dtype=int)
+                prob = 1.0
+                
+                for i, idx in enumerate(interdicted_indices):
+                    success = outcome_combo[i]
+                    outcome_array[idx] = success
+                    
+                    if success == 1:
+                        prob *= edge_success_probs[i]
+                    else:
+                        prob *= (1 - edge_success_probs[i])
+                
+                outcome = tuple(outcome_array)
+                unique_outcomes.append(outcome)
+                outcome_weights[outcome] = prob
+        else:
+            # Sample interdiction outcomes
+            outcome_samples = []
+            for _ in range(total_samples):
+                # For each edge, determine if interdiction succeeds based on probability
+                
+                # Create outcome tuple (which edges are successfully interdicted)
+                if self.multiple_interdiction_attempts:
+                    # Add to existing interdiction count
+                    failure_probs = ((1 - probs) ** interdicted)
+                    success = np.random.binomial(1, 1-failure_probs)
+                    outcome = tuple(np.minimum(interdicted, success)) #tuple(interdicted + success)
+                else:
+                    success = np.random.binomial(1, probs)
+                    # Binary: either interdicted or not
+                    outcome = tuple(np.minimum(interdicted, success))
+            
+                outcome_samples.append(outcome)
+        
+            # Count unique outcomes and their frequencies
+            outcome_counts = Counter(outcome_samples)
+            unique_outcomes = list(outcome_counts.keys())
+            outcome_weights = {outcome: count / total_samples for outcome, count in outcome_counts.items()}
 
         # --- MEMOIZATION START ---
         outcomes_needed_from_central = []
@@ -1085,9 +1116,9 @@ class CustomEnv(gym.Env):
         weighted_objective = 0.0
         weighted_flows = defaultdict(float)
         
-        for outcome, count in outcome_counts.items():
+        for outcome in unique_outcomes:
             result = self.local_outcome_cache[outcome]  #(outcome, strategy_type)
-            weight = count / total_samples
+            weight = outcome_weights[outcome]
             
             weighted_objective += result['objective'] * weight
             
