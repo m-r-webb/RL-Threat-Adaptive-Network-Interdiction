@@ -976,7 +976,7 @@ class CustomEnv(gym.Env):
             reward = self.PENALTY_VALUE
         return reward
 
-    def _calculate_stochastic_objective_and_flow(self, strategy_type="zero_sum", reduce_memory_usage=False):
+    def _calculate_stochastic_objective_and_flow(self, strategy_type="zero_sum"):
         """
         Optimized stochastic calculation: group by unique outcomes and weight by probability.
     
@@ -1065,25 +1065,10 @@ class CustomEnv(gym.Env):
                 diverted_flow_to = to_flow - self.reference_start_flows[1]
                 objective = np.min([diverted_flow_from, diverted_flow_to])
         
-            if reduce_memory_usage:
-                # Store indices of edges with non-zero flow
-                nonzero_indices = set()
-                for edge, flow in flows.items():
-                    if flow > 0:
-                        if edge in self.edge_to_index:
-                            nonzero_indices.add(self.edge_to_index[edge])
-                        elif (edge[1], edge[0]) in self.edge_to_index:
-                            nonzero_indices.add(self.edge_to_index[(edge[1], edge[0])])
-                
-                res = {
-                    'objective': objective,
-                    'nonzero_flow_indices': list(nonzero_indices)
-                }
-            else:
-                res = {
-                    'objective': objective,
-                    'flows': flows
-                }
+            res = {
+                'objective': objective,
+                'flows': flows
+            }
             
             # Update local cache
             self.local_outcome_cache[outcome] = res #(outcome, strategy_type)
@@ -1117,7 +1102,7 @@ class CustomEnv(gym.Env):
     
         return weighted_objective, dict(weighted_flows)
     
-    def _compute_objective_and_flows(self, deterministic_mode=None, reduce_memory_usage=False):
+    def _compute_objective_and_flows(self, deterministic_mode=None):
         """Calculate the max flow objective and edge flows."""
         if deterministic_mode is None:
             deterministic_mode = self.deterministic_outcomes
@@ -1126,11 +1111,11 @@ class CustomEnv(gym.Env):
             objective, flows = self.solve_max_flow()
         else:
             # Stochastic outcome calculation
-            objective, flows = self._calculate_stochastic_objective_and_flow('zero_sum', reduce_memory_usage)
+            objective, flows = self._calculate_stochastic_objective_and_flow('zero_sum')
     
         return objective, flows
 
-    def _calculate_canalize_objective_and_flows(self, reduce_memory_usage=False):
+    def _calculate_canalize_objective_and_flows(self):
         """Calculate objective for canalize strategy (flow through specific path)."""
         if self.deterministic_outcomes:
             _, flows = self.solve_max_flow(routing_assumption = 'canalize')
@@ -1138,7 +1123,7 @@ class CustomEnv(gym.Env):
             return target_path_flow, flows
         else:
             # Stochastic calculation - returns mean objective directly
-            objective, mean_flows = self._calculate_stochastic_objective_and_flow('canalize', reduce_memory_usage)
+            objective, mean_flows = self._calculate_stochastic_objective_and_flow('canalize')
             return objective, mean_flows
         
     def _calculate_canalize_reward(self):
@@ -1152,7 +1137,7 @@ class CustomEnv(gym.Env):
             reward = self.PENALTY_VALUE
         return reward
         
-    def _calculate_isolate_objective_and_flows(self, reduce_memory_usage=False):
+    def _calculate_isolate_objective_and_flows(self):
         """Calculate objective for isolate strategy (reduce flow on specific edges)."""
         if self.deterministic_outcomes:
             _, flows = self.solve_max_flow(routing_assumption = 'isolate')
@@ -1160,7 +1145,7 @@ class CustomEnv(gym.Env):
             return target_node_flow, flows
         else:
             # Stochastic calculation - returns mean objective directly
-            objective, mean_flows = self._calculate_stochastic_objective_and_flow('isolate', reduce_memory_usage)
+            objective, mean_flows = self._calculate_stochastic_objective_and_flow('isolate')
             return objective, mean_flows
         
     def _calculate_isolate_reward(self):
@@ -1174,7 +1159,7 @@ class CustomEnv(gym.Env):
             reward = self.PENALTY_VALUE
         return reward
 
-    def _calculate_divert_objective_and_flows(self, mode = None, reduce_memory_usage=False):
+    def _calculate_divert_objective_and_flows(self, mode = None):
         """Calculate objective for divert strategy (redirect flow from one path to another)."""
         if mode is None:
             mode = self.deterministic_outcomes
@@ -1190,7 +1175,7 @@ class CustomEnv(gym.Env):
             return objective, flows
         else:
             # Stochastic calculation - returns mean objectives directly
-            mean_objective, mean_flows = self._calculate_stochastic_objective_and_flow('divert', reduce_memory_usage)
+            mean_objective, mean_flows = self._calculate_stochastic_objective_and_flow('divert')
             # Return as tuple to maintain consistent interface with reward calculation
             return mean_objective, mean_flows
 
@@ -1657,7 +1642,7 @@ class CustomEnv(gym.Env):
         def dp_solve(remaining_budget, interdicted_state, depth=0):
             """Dynamic programming recursive function for backward induction."""           
             # Initialize the dynamic programming table
-            state_key = interdicted_state[:self.num_both_edges].tobytes() #tuple(interdicted_state[:self.num_both_edges])
+            state_key = interdicted_state[:self.num_both_edges].tobytes()
         
             # Check if we've already solved this state
             if state_key in memo:
@@ -1838,7 +1823,7 @@ class CustomEnv(gym.Env):
     
         # All vectorized checks
         sufficient_budget = (remaining_budget - self.state['edge_costs'][:self.num_interdictable]) >= -0.1
-        #has_capacity = self.state['edge_capacity'][:self.num_interdictable] > 0
+        has_capacity = self.state['edge_capacity'][:self.num_interdictable] > 0
         has_probability = self.state['edge_interdiction_probability'][:self.num_interdictable] > 0
     
         max_interdictions = self.MAX_INTERDICTION_ATTEMPTS if self.multiple_interdiction_attempts else 1
@@ -1847,11 +1832,12 @@ class CustomEnv(gym.Env):
         # Strategy-specific checks
         if self.attacker_strategy == 'isolate':
             # Get edges on paths from isolate objectives to sources
-            on_path_to_source = self.get_edges_on_paths_to_source(start_nodes = self.state['isolate_objective'])
+            #on_path_to_source = self.get_edges_on_paths_to_source(start_nodes = self.state['isolate_objective'])
             has_flow = self.cached_flow_array[:self.num_interdictable] > 0
-            valid_actions = (sufficient_budget & #has_capacity & 
+            valid_actions = (sufficient_budget &  
                              has_probability & 
-                             on_path_to_source &
+                             #has_capacity &
+                             #on_path_to_source &
                              has_flow &
                              within_limit)
         
@@ -1874,8 +1860,9 @@ class CustomEnv(gym.Env):
                                  has_probability & 
                                  within_limit & has_flow & not_target)
         else:
-            has_flow = self.cached_flow_array[:self.num_interdictable] > 0
-            valid_actions = (has_flow & sufficient_budget & #self.has_capacity & 
+            #has_flow = self.cached_flow_array[:self.num_interdictable] > 0
+            valid_actions = (#has_flow & 
+                             sufficient_budget & self.has_capacity & 
                              self.has_probability & 
                              within_limit)
     
@@ -1899,45 +1886,37 @@ class _ProgressActor:
 class _SharedMemoActor:
     def __init__(self):
         self.memo = {}
-    
     def get(self, key):
         return self.memo.get(key)
-    
     def set(self, key, value):
         self.memo[key] = value
-        
     def size(self):
         return len(self.memo)
 
-# ADD THIS NEW ACTOR CLASS
 @ray.remote
 class SharedOutcomeMemoActor:
     """
     Centralized cache for stochastic max-flow outcomes.
     Stores: (outcome_tuple, strategy) -> {'objective': val, 'flows': dict}
     """
-    def __init__(self): #, max_size=200000):
+    def __init__(self):
         self.cache = {}
-      #  self.max_size = max_size
-
     def get_batch(self, keys):
         return [self.cache.get(k) for k in keys]
-
     def set_batch(self, keys, values):
         for k, v in zip(keys, values):
             self.cache[k] = v
-            
     def size(self):
         return len(self.cache)
-    
     def clear(self):
         self.cache.clear()
 
 @ray.remote
 class _RemoteEnvWorker:
-    def __init__(self, nodes, edges, seed, state_snapshot, attacker_strategy, min_edge_cost, num_both_edges,
-                 deterministic_outcomes, multiple_interdiction_attempts, progress_actor=None, memo_actors=None,
-                 budget_levels=1, progress_granularity=50, max_depth_inner=20, outcome_memo_actor=None):
+    def __init__(self, nodes, edges, seed, state_snapshot, attacker_strategy, min_edge_cost,
+                 num_both_edges, deterministic_outcomes, multiple_interdiction_attempts,
+                 progress_actor=None, memo_actors=None, budget_levels=1, progress_granularity=50,
+                 max_depth_inner=20, outcome_memo_actor=None):
         """
         Worker now accepts a progress_actor handle, a shared memo_actor handle,
         and budget_levels so it can estimate progress for invalid actions.
@@ -1982,13 +1961,6 @@ class _RemoteEnvWorker:
         
         self.progress_granularity = int(progress_granularity)
         self.budget_levels = int(budget_levels)
-        
-        # Performance stats
-        self.stats = defaultdict(float)
-        self.counts = defaultdict(int)
-
-    def get_stats(self):
-        return dict(self.stats), dict(self.counts)
 
     def evaluate_subtree(self, remaining_budget, interdicted_state, depth):
         import numpy as np, ray as _ray, time, zlib # Added zlib for stable hashing
@@ -2042,9 +2014,6 @@ class _RemoteEnvWorker:
                     shared_val = _ray.get(target_actor.get.remote(key))
                 except Exception:
                     shared_val = None
-            
-            self.stats['memo_get_time'] += time.perf_counter() - t_start
-            self.counts['memo_get_count'] += 1
 
             if shared_val is not None:
                 memo_local[key] = shared_val
@@ -2063,20 +2032,27 @@ class _RemoteEnvWorker:
 
             # terminal objective
             t_start = time.perf_counter()
+
+            # Capture flows to update environment state for mask_fn
+            current_flows = None
+            
             if self.attacker_strategy == "zero_sum":
-                final_objective, _ = self.env._compute_objective_and_flows(reduce_memory_usage=True)
+                final_objective, current_flows = self.env._compute_objective_and_flows()
                 final_objective = -final_objective
             elif self.attacker_strategy == 'canalize':
-                final_objective, _ = self.env._calculate_canalize_objective_and_flows(reduce_memory_usage=True)
+                final_objective, current_flows = self.env._calculate_canalize_objective_and_flows()
             elif self.attacker_strategy == 'isolate':
-                final_objective, _ = self.env._calculate_isolate_objective_and_flows(reduce_memory_usage=True)
+                final_objective, current_flows = self.env._calculate_isolate_objective_and_flows()
                 final_objective = -final_objective
             elif self.attacker_strategy == 'divert':
-                final_objective, _ = self.env._calculate_divert_objective_and_flows(reduce_memory_usage=True)
+                final_objective, current_flows_ = self.env._calculate_divert_objective_and_flows()
             else:
                 final_objective = -float('inf')
-            self.stats['gurobi_solve_time'] += time.perf_counter() - t_start
-            self.counts['gurobi_solve_count'] += 1
+                current_flows = {}
+
+            # Update reference flows and cache for mask_fn
+            self.env.reference_flows = current_flows
+            self.env._cache_flow_array()
 
             # base case
             if rem_budget < self.min_edge_cost or d >= self.max_depth_inner:
@@ -2316,6 +2292,18 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
         old_interdicted = self.state['edge_interdicted'].copy()
         self.state['budget'][0] = node.budget
         self.state['edge_interdicted'][:] = node.state
+
+        # Update flows and cache for mask_fn
+        if self.attacker_strategy == "zero_sum":
+            _, self.reference_flows = self._compute_objective_and_flows()
+        elif self.attacker_strategy == 'canalize':
+            _, self.reference_flows = self._calculate_canalize_objective_and_flows()
+        elif self.attacker_strategy == 'isolate':
+            _, self.reference_flows = self._calculate_isolate_objective_and_flows()
+        elif self.attacker_strategy == 'divert':
+            _, self.reference_flows = self._calculate_divert_objective_and_flows()
+        
+        self._cache_flow_array()
         
         action_mask = self.mask_fn(depth = node.depth)
         valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
@@ -2469,28 +2457,6 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
     except Exception:
         pass
     pbar.close()
-
-    # Stats
-#    print("\n" + "="*50)
- #   print("WORKER PERFORMANCE STATS")
-  #  print("="*50)
-    total_gurobi_time = 0
-    total_gurobi_count = 0
-    
-    all_stats = ray.get([w.get_stats.remote() for w in workers])
-    for i, (stats, counts) in enumerate(all_stats):
- #       print(f"\nWorker {i}:")
-        for k, v in stats.items():
-            count = counts.get(k.replace('_time', '_count'), 0)
-            avg = v / count if count > 0 else 0
-  #          print(f"  {k:<20}: {v:.4f}s (Count: {count}, Avg: {avg:.6f}s)")
-            if 'gurobi' in k:
-                total_gurobi_time += v
-                total_gurobi_count += count
-
-#    print("-" * 50)
- #   print(f"Total Gurobi Time: {total_gurobi_time:.4f}s ({total_gurobi_count} calls)")
-  #  print("="*50 + "\n")
 
     for w in workers:
         try: ray.kill(w)
