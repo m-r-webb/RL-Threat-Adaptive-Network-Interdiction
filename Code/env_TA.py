@@ -1891,8 +1891,8 @@ class CustomEnv(gym.Env):
                                  has_probability & 
                                  within_limit & has_flow & not_target)
         else:
-            #has_flow = self.cached_flow_array[:self.num_interdictable] > 0
-            valid_actions = (#has_flow & 
+            has_flow = self.cached_flow_array[:self.num_interdictable] > 0
+            valid_actions = (has_flow & 
                              sufficient_budget & self.has_capacity & 
                              self.has_probability & 
                              within_limit)

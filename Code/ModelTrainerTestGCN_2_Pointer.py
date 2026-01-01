@@ -8,22 +8,23 @@ graphName = "G5x5"
 agent = "MaskablePPO"
 #agent = "PPO"
 
-version = "V12_2" #V[Month]_[Day] 
+version = "v01_01" #V[Month]_[Day] 
 
 # Initial Learning Rate
 initial_learning_rate = 0.0003  #0.0001
 
 # Time Steps to Train
-timesteps = 5000000
+timesteps = 15000000
 
 # Number of parallel cpus
-n_cpus = 144  # Number of environments
+n_cpus = 120  # Number of environments
 
 env_params = {'deterministic_agent': False,
               'multiple_interdiction_attempts': False,
               'attacker_strategy': 'zero_sum',  # canalize   isolate   divert  zero_sum
-              'training_budget_range': (5, 10),  #G5x5: zero_sum/isolate: (5,10), canalize/divert: (8,16) G10x10: zero_sum/isolate: (15,30), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (15,25)
+              'training_budget_range': (5, 15),  #G5x5: zero_sum/isolate: (5,15), canalize/divert: (10,20) G10x10: zero_sum/isolate: (15,30), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (15,25)
               'max_path_length': 6,  #G5x5: 6,  G10x10: 13, UKR: 16
+              'sample_size': None,
              }
 
 if env_params['deterministic_agent']:
@@ -31,8 +32,13 @@ if env_params['deterministic_agent']:
 else:
     deterministicLetter = "S"
 
+if env_params['multiple_interdiction_attempts'] == True:
+    MI_letter = 'M'
+else:
+    MI_letter = 'B'
+
 # Model Name
-model_name = f"{graphName}_{deterministicLetter}_{agent}_{env_params['attacker_strategy']}_{version}"
+model_name = f"{graphName}_{deterministicLetter}_{agent}_{env_params['attacker_strategy']}_{MI_letter}_{version}"
 print(model_name)
 
 # Import all required packages
@@ -541,7 +547,7 @@ def mask_fn(env):
     within_limit = (edge_interdicted[:num_interdictable] + 1) <= max_interdictions
     
     # Use cached flow array (FAST!)
-    has_flow = env.cached_flow_array[:num_interdictable] > 0
+    has_flow = True # env.cached_flow_array[:num_interdictable] > 0
     
     # Strategy-specific checks
     if env.attacker_strategy == 'canalize':

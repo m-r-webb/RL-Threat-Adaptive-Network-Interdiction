@@ -38,17 +38,26 @@ if not ray.is_initialized():
 import env_TA as ce #modified for curriculum learning
 
 #User Determined Settings
-graphName = "UKR"
+graphName = "G5x5"
 env_params = {'deterministic_agent': False,
               'multiple_interdiction_attempts': False,
-              'attacker_strategy': 'isolate',  # canalize   isolate   divert  zero_sum
-              'training_budget_range': (15, 30),  #G5x5: zero_sum/isolate: (5,10), canalize/divert: (8,16) G10x10: zero_sum/isolate: (15,30), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (15,25)
-              'max_path_length': 16,  #G5x5: 6,  G10x10: 13, UKR: 16
+              'attacker_strategy': 'zero_sum',  # canalize   isolate   divert  zero_sum
+              'training_budget_range': (5, 15),  #G5x5: zero_sum/isolate: (5,15), canalize/divert: (10,20) G10x10: zero_sum/isolate: (15,30), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (15,25)
+              'max_path_length': 6  ,  #G5x5: 6,  G10x10: 13, UKR: 16
+              'sample_size': None,
              }
+version_date = "01_01" # numeric month_day
+version_type = "opt"  # bi for backward induction or opt for optimal MIP 
 
 # Number of scenarios to generate
 num_of_scenarios = 500 
-save_interval = 1  # Save every 10 episodes
+save_interval = 10  # Save every 10 episodes
+
+if env_params['multiple_interdiction_attempts'] == True:
+    MI_letter = 'M'
+else:
+    MI_letter = 'B'
+    
 current_dir = os.getcwd()
 
 def save_partial_results(save_path, completed_episodes, obj_vals, interdictions, times, states):
@@ -67,7 +76,7 @@ def save_partial_results(save_path, completed_episodes, obj_vals, interdictions,
         pickle.dump(results, f)
 
 # Construct the path to the data files
-save_filename = f"{graphName}_{env_params['attacker_strategy']}_solution_v12_19_1.pkl"
+save_filename = f"{graphName}_{env_params['attacker_strategy']}_{MI_letter}_solution_v{version_date}_{version_type}.pkl"
 save_path = os.path.join(current_dir, '..', 'Solutions', save_filename)
 print(save_filename)
 
@@ -90,12 +99,14 @@ for episode in range(num_of_scenarios):
     env.render(indices = 3)
     if env_params['attacker_strategy'] == "zero_sum":
         start_time = time.perf_counter()
-        #optimal_obj_val, optimal_interdiction_edges = env.solve_optimal_interdiction()
-        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = 35)
+        if version_type == 'opt':
+            optimal_obj_val, optimal_interdiction_edges = env.solve_optimal_interdiction()
+        elif version_type == 'bi':
+            optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = 40)
         end_time = time.perf_counter()
     else:
         start_time = time.perf_counter()
-        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = 35)
+        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = 40)
         end_time = time.perf_counter()
     
     solve_time = end_time - start_time
@@ -103,7 +114,7 @@ for episode in range(num_of_scenarios):
     #Save optimal solution value and interdiction set
     optimal_obj_vals[episode] = optimal_obj_val
     optimal_solution_times[episode] = solve_time
-    all_optimal_interdiction_edges[episode] = frozenset(optimal_interdiction_edges)
+    all_optimal_interdiction_edges[episode] = sorted(list(optimal_interdiction_edges))
     all_states[episode] = obs  # Add this line to save the state
 
     # Periodically save results
