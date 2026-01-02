@@ -96,7 +96,7 @@ class CustomEnv(gym.Env):
                  max_sink_need=5, penalty_value=-0.1, 
                  sample_size=1000, max_path_length = 6,
                  max_num_edges=500, 
-                 max_num_nodes=250, old_routing="none", outcome_memo_actor=None):
+                 max_num_nodes=250, old_routing="none", outcome_memo_actor=None, outcome_memo_actors=None):
         super(CustomEnv, self).__init__()
 
         #Setup core environment attributes
@@ -123,6 +123,9 @@ class CustomEnv(gym.Env):
         self.max_num_nodes = max_num_nodes
         self.old_routing = old_routing
         self.outcome_memo_actor = outcome_memo_actor
+        self.outcome_memo_actors = outcome_memo_actors
+        if self.outcome_memo_actors is None and self.outcome_memo_actor is not None:
+             self.outcome_memo_actors = [self.outcome_memo_actor]
         self.local_outcome_cache = {} # Add local cache here
 
         self.num_stochastic_scenarios = None
@@ -138,23 +141,13 @@ class CustomEnv(gym.Env):
 
     def _cache_flow_array(self):
         """Fully vectorized cache using array indexing."""
-        num_edges = self.num_both_edges
-    
-        # Pre-allocate
-        flow_array = np.zeros(num_edges, dtype=np.float32)
-    
-        # Vectorized extraction using list comprehension (compiled to C internally)
-        edges = self.both_edges
+        # Optimized to use pre-computed reverse keys
         flows = self.reference_flows
-    
-        # Batch get operations
-        forward_keys = edges
-        reverse_keys = [(e[1], e[0]) for e in edges]
-    
-        # Vectorized lookup and sum
-        flow_array = np.array([flows.get(fk, 0) + flows.get(rk, 0) for fk, rk in zip(forward_keys, reverse_keys)], dtype=np.float32)
-    
-        self.cached_flow_array = flow_array
+        
+        self.cached_flow_array = np.array(
+            [flows.get(e, 0) + flows.get(re, 0) for e, re in zip(self.both_edges, self.reverse_edges_list)], 
+            dtype=np.float32
+        )
     
     def _setup_network_structure(self):
         """Initialize network nodes and edges structure."""
@@ -220,6 +213,9 @@ class CustomEnv(gym.Env):
         for edge_id in self.edge_groups[self.super_sink_nodes[0]]['in']:
             self.sink_nodes.append(edge_id[0])
         self.num_sink_nodes = len(self.sink_nodes)
+
+        # Pre-compute reverse edges for caching speed
+        self.reverse_edges_list = [(e[1], e[0]) for e in self.both_edges]
             
     def _setup_spaces(self):
         """Setup observation and action spaces based on environment configuration."""
@@ -1020,17 +1016,35 @@ class CustomEnv(gym.Env):
         
         # 2. Check Central Cache (only for what wasn't in local)
         outcomes_to_solve = []
-        if outcomes_needed_from_central and self.outcome_memo_actor:
-            keys = [out for out in outcomes_needed_from_central] #(out, strategy_type)
-            # Batch fetch from Ray
-            results = ray.get(self.outcome_memo_actor.get_batch.remote(keys))
+        if outcomes_needed_from_central and self.outcome_memo_actors:
+            import zlib
+            num_shards = len(self.outcome_memo_actors)
             
-            for outcome, res in zip(outcomes_needed_from_central, results):
-                if res is not None:
-                    # Update local cache immediately
-                    self.local_outcome_cache[outcome] = res #(outcome, strategy_type)
-                else:
-                    outcomes_to_solve.append(outcome)
+            # Group keys by shard
+            shard_keys = defaultdict(list)
+            for outcome in outcomes_needed_from_central:
+                # Use stable hash
+                shard_idx = zlib.adler32(str(outcome).encode()) % num_shards
+                shard_keys[shard_idx].append(outcome)
+            
+            # Batch fetch from Ray (parallel)
+            futures = []
+            shard_indices = []
+            for idx, keys in shard_keys.items():
+                futures.append(self.outcome_memo_actors[idx].get_batch.remote(keys))
+                shard_indices.append(idx)
+            
+            if futures:
+                all_results = ray.get(futures)
+                
+                # Process results
+                for i, results in enumerate(all_results):
+                    keys = shard_keys[shard_indices[i]]
+                    for outcome, res in zip(keys, results):
+                        if res is not None:
+                            self.local_outcome_cache[outcome] = res #(outcome, strategy_type)
+                        else:
+                            outcomes_to_solve.append(outcome)
         else:
             outcomes_to_solve = outcomes_needed_from_central
         # --- MEMOIZATION END ---
@@ -1089,10 +1103,20 @@ class CustomEnv(gym.Env):
             new_results_for_central[outcome] = res
             
         # 4. Update Central Cache (Async / Fire-and-forget)
-        if self.outcome_memo_actor and new_results_for_central:
-            keys = [out for out in new_results_for_central.keys()]  #(out, strategy_type)
-            vals = list(new_results_for_central.values())
-            self.outcome_memo_actor.set_batch.remote(keys, vals)
+        if new_results_for_central and self.outcome_memo_actors:
+            import zlib
+            num_shards = len(self.outcome_memo_actors)
+            
+            shard_updates = defaultdict(lambda: ([], [])) # (keys, values)
+            
+            for outcome, res in new_results_for_central.items():
+                shard_idx = zlib.adler32(str(outcome).encode()) % num_shards
+                keys, values = shard_updates[shard_idx]
+                keys.append(outcome)
+                values.append(res)
+            
+            for idx, (keys, vals) in shard_updates.items():
+                self.outcome_memo_actors[idx].set_batch.remote(keys, vals)
 
         # 5. Compute weighted averages using Local Cache (which is now fully populated)
         weighted_objective = 0.0
@@ -1926,7 +1950,7 @@ class _RemoteEnvWorker:
     def __init__(self, nodes, edges, seed, state_snapshot, attacker_strategy, min_edge_cost,
                  num_both_edges, deterministic_outcomes, multiple_interdiction_attempts,
                  progress_actor=None, memo_actors=None, budget_levels=1, progress_granularity=50,
-                 max_depth_inner=20, outcome_memo_actor=None):
+                 max_depth_inner=20, outcome_memo_actor=None, outcome_memo_actors=None):
         """
         Worker now accepts a progress_actor handle, a shared memo_actor handle,
         and budget_levels so it can estimate progress for invalid actions.
@@ -1942,7 +1966,8 @@ class _RemoteEnvWorker:
                              deterministic_agent=deterministic_outcomes,
                              multiple_interdiction_attempts=multiple_interdiction_attempts,
                              attacker_strategy=attacker_strategy,
-                             outcome_memo_actor=outcome_memo_actor)
+                             outcome_memo_actor=outcome_memo_actor,
+                             outcome_memo_actors=outcome_memo_actors)
 
         # Make a deep, writable copy of the state snapshot to avoid read-only numpy arrays
         state_copy = copy.deepcopy(state_snapshot)
@@ -1998,7 +2023,7 @@ class _RemoteEnvWorker:
                 # If time hasn't passed, we keep accumulating local_counter.
                 # This efficiently batches "bursty" progress (like cache hits).
 
-        def dp_local(rem_budget, inter_state, d):
+        def dp_local(rem_budget, inter_state, d, alpha=-float('inf')):
             nonlocal local_counter
             key = inter_state[:self.num_both_edges].tobytes()
 
@@ -2116,14 +2141,55 @@ class _RemoteEnvWorker:
             best_reward = final_objective
             best_seq = []
             
-            for action in valid_actions:
-                new_state = inter_state.copy()
-                new_state[action] += 1
+            # Update alpha with current node value
+            alpha = max(alpha, best_reward)
+
+            if self.attacker_strategy == 'zero_sum':
+                # Heuristic sorting for pruning
+                caps = self.env.state['edge_capacity'][valid_actions]
+                probs = self.env.state['edge_interdiction_probability'][valid_actions]
+                costs = self.env.state['edge_costs'][valid_actions]
+                
+                # Avoid division by zero
+                costs = np.maximum(costs, 1e-6)
+                
+                heuristics = caps * probs / costs
+                
+                # Sort descending
+                sorted_indices = np.argsort(-heuristics)
+                valid_actions = valid_actions[sorted_indices]
+                heuristics = heuristics[sorted_indices]
+            
+            for i, action in enumerate(valid_actions):
+                # Pruning for zero_sum
+                if self.attacker_strategy == 'zero_sum':
+                     # Pruning condition: 
+                     # current obj value - (current remaining budget * heuristic) > current best objective value
+                     # -final_objective - (rem_budget * heuristics[i]) > -alpha
+                     # final_objective + (rem_budget * heuristics[i]) < alpha
+                     if final_objective + (rem_budget * heuristics[i]) < alpha:
+                         # Since heuristics are sorted descending, all subsequent actions will also fail
+                         # Report skipped progress
+                         skipped_actions = len(valid_actions) - i
+                         est_per_skipped = int(self.num_both_edges ** max(0, self.budget_levels - (d + 1)))
+                         local_counter += skipped_actions * est_per_skipped
+                         maybe_flush_progress()
+                         break
+
+                # Apply move in-place
+                inter_state[action] += 1
                 new_budget = rem_budget - self.env.state['edge_costs'][action]
-                fut_reward, fut_seq = dp_local(new_budget, new_state, d + 1)
+                
+                # Recurse
+                fut_reward, fut_seq = dp_local(new_budget, inter_state, d + 1, alpha)
+                
+                # Backtrack (Revert move)
+                inter_state[action] -= 1
+                
                 if fut_reward > best_reward:
                     best_reward = fut_reward
                     best_seq = [action] + fut_seq
+                    alpha = max(alpha, best_reward)
 
             memo_local[key] = (best_reward, best_seq)
             # Do NOT increment local_counter here for internal nodes
@@ -2175,9 +2241,10 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
     memo_actors = [_SharedMemoActor.remote() for _ in range(num_memo_shards)]
 
     # Create outcome memoization actor ONLY if stochastic
-    outcome_memo_actor = None
+    outcome_memo_actors = []
     if not self.deterministic_outcomes:
-        outcome_memo_actor = SharedOutcomeMemoActor.remote()
+        num_outcome_shards = min(4, n_workers)
+        outcome_memo_actors = [SharedOutcomeMemoActor.remote() for _ in range(num_outcome_shards)]
     
     max_budget = self.state['budget'][0]
     budget_levels = max_budget // self.min_edge_cost if self.min_edge_cost > 0 else 1
@@ -2198,7 +2265,7 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
             budget_levels=budget_levels,
             progress_granularity=2000,
             max_depth_inner=20,
-            outcome_memo_actor=outcome_memo_actor 
+            outcome_memo_actors=outcome_memo_actors 
         )
         for _ in range(n_workers)
     ]
@@ -2479,8 +2546,8 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
         try: ray.kill(ma)
         except: pass
 
-    if outcome_memo_actor:
-        try: ray.kill(outcome_memo_actor)
+    for actor in outcome_memo_actors:
+        try: ray.kill(actor)
         except: pass
 
     if self.attacker_strategy in ("zero_sum", "isolate"):
