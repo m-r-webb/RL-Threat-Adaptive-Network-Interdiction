@@ -127,6 +127,8 @@ class CustomEnv(gym.Env):
 
         self.num_stochastic_scenarios = None
         self.num_stochastic_scenarios_IM = None
+
+        self.max_interdictions = self.MAX_INTERDICTION_ATTEMPTS if self.multiple_interdiction_attempts else 1
         
         # Initialize network structure
         self._setup_network_structure()
@@ -547,6 +549,7 @@ class CustomEnv(gym.Env):
         # Sample edge costs and interdiction probabilities
         raw_costs = self.base_spaces['edge_costs'].sample()[:self.num_both_edges]
         edge_costs = (((raw_costs) / 10) * (self.DEFAULT_TRAINING_EDGE_COST_RANGE[1]-self.DEFAULT_TRAINING_EDGE_COST_RANGE[0]) + self.DEFAULT_TRAINING_EDGE_COST_RANGE[0]).astype(int)
+        self.min_edge_cost = np.min(edge_costs)
         
         #Sample interdiction probabilities based on deterministic setting
         if self.deterministic_outcomes:
@@ -893,7 +896,13 @@ class CustomEnv(gym.Env):
             return self.state, float(reward), True, False, {}
 
         # Validate action
-        valid_action = self._validate_action(action, remaining_budget, self.state['edge_interdicted'])
+        # Use mask_fn to validate action (unified logic)
+        action_mask = self.mask_fn(depth=1)
+        
+        # Check if action is valid:
+        # 1. Must be within actual edges (not padding)
+        # 2. Must be allowed by mask_fn
+        valid_action = (action < self.num_both_edges) and (action_mask[action] == 1)
         
         # Apply action effects
         if valid_action:
@@ -924,49 +933,6 @@ class CustomEnv(gym.Env):
     
         return self.state, float(reward), bool(done), False, {}
         
-    def _validate_action(self, action, remaining_budget, interdicted_edges):
-        """Validate if the given action is legal."""
-        ## Checks for all attacker strategies
-        # Check if action is within action space
-        if action >= self.num_both_edges:  # Padded actions are invalid
-            return False
-    
-        # Check budget constraint
-        if remaining_budget[0] - self.state['edge_costs'][action] < -0.1:
-            return False
-    
-        # Check capacity constraint
-        if self.state['edge_capacity'][action] == 0:
-            return False
-
-        # Check interdiction probability constraint
-        if self.state['edge_interdiction_probability'][action] == 0:
-            return False
-    
-        # Check interdiction limit
-        max_interdictions = self.MAX_INTERDICTION_ATTEMPTS if self.multiple_interdiction_attempts else 1
-        if interdicted_edges[action]+1 > max_interdictions:
-            return False
-
-        ## Attacker Strategy Specific Checks
-        # Zero-Sum - Check target has previous flow
-    #    if self.attacker_strategy == 'zero_sum':
-        edge = self.both_edges[action]
-        if self.reference_flows[edge] == 0 and self.reference_flows[(edge[1],edge[0])] == 0:
-            return False
-        
-        # Canalization - Check attacker does not target canalization path
-        if self.attacker_strategy == 'canalize':
-            if self.state['canalize_objective'][action] == 1:
-                return False
-
-        # Divert - Check attacker does not target the divert to path
-        if self.attacker_strategy == 'divert':
-            if self.state['divert_to_objective'][action] == 1:
-                return False
-        
-        return True
-        
     def _calculate_zero_sum_reward(self):                         
         """Calculate reward for zero-sum strategy (maximize disruption)."""
         objective_value, self.reference_flows = self._compute_objective_and_flows()
@@ -977,7 +943,7 @@ class CustomEnv(gym.Env):
             reward = self.PENALTY_VALUE
         return reward
 
-    def _calculate_stochastic_objective_and_flow(self, strategy_type="zero_sum"):
+    def _calculate_stochastic_objective_and_flow(self, strategy_type="zero_sum", return_full_flows=False):
         """
         Optimized stochastic calculation: group by unique outcomes and weight by probability.
     
@@ -1097,9 +1063,25 @@ class CustomEnv(gym.Env):
                 objective = np.min([diverted_flow_from, diverted_flow_to])
         
             res = {
-                'objective': objective,
-                'flows': flows
+                'objective': objective
             }
+            
+            if return_full_flows:
+                res['flows'] = flows
+            else:
+                # Compression logic
+                if self.state['budget'][0] < self.min_edge_cost:
+                    res['nonzero_flow_indices'] = []
+                else:
+                    # Store indices where flow > 0
+                    indices = []
+                    for edge, flow in flows.items():
+                        if flow > 0:
+                            if edge in self.edge_to_index:
+                                indices.append(self.edge_to_index[edge])
+                            elif (edge[1], edge[0]) in self.edge_to_index:
+                                indices.append(self.edge_to_index[(edge[1], edge[0])])
+                    res['nonzero_flow_indices'] = list(set(indices))
             
             # Update local cache
             self.local_outcome_cache[outcome] = res #(outcome, strategy_type)
@@ -1530,17 +1512,15 @@ class CustomEnv(gym.Env):
 
         return(self.optimal_stochastic_model.objVal, interdicted_edges)
 
-    def solve_stochastic_max_flow_IM(self, n_scenarios = 50, seed = 173, interdicted_edges = [], interdicted_quantities =[]):     #PICKUP HERE!!!! 
+    def solve_stochastic_max_flow_IM(self, n_scenarios = 50, seed = 173, interdicted_edges = [], interdicted_quantities =[]):
         # Optimally Solve for Stochastic Solution using Model 1D and SAA
-        max_attempts = self.MAX_INTERDICTION_ATTEMPTS if self.multiple_interdiction_attempts else 1
-
         if not hasattr(self, 'optimal_stochastic_model_IM'):
             # Initializing the model
             self.optimal_stochastic_model_IM = grb.Model("Stochastic Model_IM", env=self.GUROBI_ENV)
 
             # Creating decision variables
             # Create composite keys: (edge_tuple, k)
-            gamma_indices = [(e, k) for e in self.interdictable_edges for k in range(1, max_attempts + 1)]
+            gamma_indices = [(e, k) for e in self.interdictable_edges for k in range(1, self.max_interdictions + 1)]
             self.stochastic_gamma_IM = self.optimal_stochastic_model_IM.addVars(gamma_indices, vtype=grb.GRB.BINARY, name="g_IM")
             self.optimal_stochastic_model_IM.update()
 
@@ -1549,12 +1529,12 @@ class CustomEnv(gym.Env):
 
             # Gamma constraint
             self.stochastic_gamma_constr_IM = self.optimal_stochastic_model_IM.addConstrs((grb.quicksum(
-                self.stochastic_gamma_IM[e,k] for k in range(1, max_attempts + 1)) <= 1 for e in self.interdictable_edges), name="gamma_constr_IM")
+                self.stochastic_gamma_IM[e,k] for k in range(1, self.max_interdictions + 1)) <= 1 for e in self.interdictable_edges), name="gamma_constr_IM")
             
              # Budget constraint
             self.stochastic_budget_constr_IM = self.optimal_stochastic_model_IM.addConstr(grb.quicksum(
                 self.edges_episode[e].interdiction_cost * k * self.stochastic_gamma_IM[e,k] 
-                for e in self.interdictable_edges for k in range(1, max_attempts + 1)) <= self.state['budget'][0], name="budget_IM")
+                for e in self.interdictable_edges for k in range(1, self.max_interdictions + 1)) <= self.state['budget'][0], name="budget_IM")
 
             self.stochastic_old_state_IM = self.state
             self.stochastic_old_interdicted_edges_IM = interdicted_edges
@@ -1562,7 +1542,7 @@ class CustomEnv(gym.Env):
 
         if self.stochastic_old_interdicted_edges_IM != interdicted_edges or self.stochastic_old_interdicted_quantities_IM != interdicted_quantities:
             # Update Variable Lower Bounds
-            self.optimal_stochastic_model_IM.setAttr("LB", [self.stochastic_gamma_IM[e,k] for e in self.interdictable_edges for k in range(1, max_attempts + 1)],0)
+            self.optimal_stochastic_model_IM.setAttr("LB", [self.stochastic_gamma_IM[e,k] for e in self.interdictable_edges for k in range(1, self.max_interdictions + 1)],0)
             self.optimal_stochastic_model_IM.setAttr("LB", [self.stochastic_gamma_IM[e,k] for e, k in zip(interdicted_edges, interdicted_quantities)],1)
             self.stochastic_old_interdicted_edges_IM=interdicted_edges
         
@@ -1598,8 +1578,8 @@ class CustomEnv(gym.Env):
         interdictable_indices = [self.edge_to_index[e] for e in self.interdictable_edges]
         p_base = self.state["edge_interdiction_probability"][interdictable_indices]
 
-        # Create k values (1 to max_attempts)
-        k_vals = np.arange(1, max_attempts + 1)
+        # Create k values (1 to self.max_interdictions)
+        k_vals = np.arange(1, self.max_interdictions + 1)
 
         # Calculate success probabilities: 1 - (1-p)^k for each edge and k
         probs = 1 - (1 - p_base[:, np.newaxis]) ** k_vals
@@ -1625,7 +1605,7 @@ class CustomEnv(gym.Env):
         # Extract interdiction decisions with k-values
         interdiction_decisions = []
         for e in self.interdictable_edges:
-            for k in range(1, max_attempts + 1):
+            for k in range(1, self.max_interdictions + 1):
                 if self.stochastic_gamma_IM[e, k].X > 0.5:
                     interdiction_decisions.append((e, k))
                     break  # Only one k per edge possible
@@ -1774,6 +1754,8 @@ class CustomEnv(gym.Env):
             'probabilities': state['edge_interdiction_probability'][:self.num_both_edges],
             'budget': state['budget']
         }
+        
+        self.min_edge_cost = np.min(network_params['costs'])
 
         # Create base state
         base_state = self._create_base_state(network_params)
@@ -1854,22 +1836,21 @@ class CustomEnv(gym.Env):
     
         # All vectorized checks
         sufficient_budget = (remaining_budget - self.state['edge_costs'][:self.num_interdictable]) >= -0.1
-        has_capacity = self.state['edge_capacity'][:self.num_interdictable] > 0
+        #has_capacity = self.state['edge_capacity'][:self.num_interdictable] > 0
         has_probability = self.state['edge_interdiction_probability'][:self.num_interdictable] > 0
     
-        max_interdictions = self.MAX_INTERDICTION_ATTEMPTS if self.multiple_interdiction_attempts else 1
-        within_limit = (edge_interdicted[:self.num_interdictable] + 1) <= max_interdictions
+        within_limit = (edge_interdicted[:self.num_interdictable] + 1) <= self.max_interdictions
         
         # Strategy-specific checks
         if self.attacker_strategy == 'isolate':
             # Get edges on paths from isolate objectives to sources
-            #on_path_to_source = self.get_edges_on_paths_to_source(start_nodes = self.state['isolate_objective'])
-            has_flow = self.cached_flow_array[:self.num_interdictable] > 0
+            on_path_to_source = self.get_edges_on_paths_to_source(start_nodes = self.state['isolate_objective'])
+            #has_flow = self.cached_flow_array[:self.num_interdictable] > 0
             valid_actions = (sufficient_budget &  
                              has_probability & 
                              #has_capacity &
-                             #on_path_to_source &
-                             has_flow &
+                             on_path_to_source &
+                             #has_flow &
                              within_limit)
         
         elif self.attacker_strategy == 'canalize':
@@ -1883,17 +1864,15 @@ class CustomEnv(gym.Env):
             not_target = self.state['divert_to_objective'][:self.num_interdictable] != 1
             if depth == 0:
                 is_target = self.state['divert_from_objective'][:self.num_interdictable] == 1
-                valid_actions = (sufficient_budget & #has_capacity & 
-                                 has_probability & is_target &
-                                 within_limit & has_flow & not_target)
             else:
-                valid_actions = (sufficient_budget & #has_capacity & 
-                                 has_probability & 
-                                 within_limit & has_flow & not_target)
+                is_target = True
+            valid_actions = (sufficient_budget & #has_capacity & 
+                             has_probability & is_target &
+                             within_limit & has_flow & not_target)
         else:
             has_flow = self.cached_flow_array[:self.num_interdictable] > 0
             valid_actions = (has_flow & 
-                             sufficient_budget & self.has_capacity & 
+                             sufficient_budget & #self.has_capacity & 
                              self.has_probability & 
                              within_limit)
     
