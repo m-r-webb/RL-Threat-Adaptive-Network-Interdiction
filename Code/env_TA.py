@@ -525,7 +525,10 @@ class CustomEnv(gym.Env):
         self.local_outcome_cache = {}
 
         # Clear centralized outcome cache if it exists
-        if self.outcome_memo_actor:
+        if self.outcome_memo_actors:
+            for actor in self.outcome_memo_actors:
+                actor.clear.remote()
+        elif self.outcome_memo_actor:
             self.outcome_memo_actor.clear.remote()
         
         # Call parent reset and set random seeds
@@ -2178,10 +2181,9 @@ class _RemoteEnvWorker:
                 probs = self.env.state['edge_interdiction_probability'][valid_actions]
                 costs = self.env.state['edge_costs'][valid_actions]
                 
-                # Avoid division by zero
-                costs = np.maximum(costs, 1e-6)
-                
-                heuristics = caps * probs / costs
+                # New Heuristic: (capacity * probability) + (self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[1]*(remaining_budget-cost))
+                max_edge_capacity = self.env.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[1]
+                heuristics = (caps * probs) + (max_edge_capacity * (rem_budget - costs))
                 
                 # Sort descending
                 sorted_indices = np.argsort(-heuristics)
@@ -2195,7 +2197,8 @@ class _RemoteEnvWorker:
                      # current obj value - (current remaining budget * heuristic) > current best objective value
                      # -final_objective - (rem_budget * heuristics[i]) > -alpha
                      # final_objective + (rem_budget * heuristics[i]) < alpha
-                     if final_objective + (rem_budget * heuristics[i]) < alpha:
+                     # UPDATED: Use the new heuristic directly (it already looks ahead)
+                     if final_objective + heuristics[i] < alpha:
                          # Since heuristics are sorted descending, all subsequent actions will also fail
                          # Report skipped progress
                          skipped_actions = len(valid_actions) - i
@@ -2587,6 +2590,9 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
     for actor in outcome_memo_actors:
         try: ray.kill(actor)
         except: pass
+
+    try: ray.kill(alpha_actor)
+    except: pass
 
     if self.attacker_strategy in ("zero_sum", "isolate"):
         optimal_reward = -optimal_reward
