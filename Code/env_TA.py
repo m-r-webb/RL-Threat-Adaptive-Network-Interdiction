@@ -1928,6 +1928,16 @@ class _SharedMemoActor:
         return len(self.memo)
 
 @ray.remote
+class _SharedAlphaActor:
+    def __init__(self):
+        self.alpha = -float('inf')
+    def get(self):
+        return self.alpha
+    def update(self, new_alpha):
+        if new_alpha > self.alpha:
+            self.alpha = new_alpha
+
+@ray.remote
 class SharedOutcomeMemoActor:
     """
     Centralized cache for stochastic max-flow outcomes.
@@ -1950,7 +1960,7 @@ class _RemoteEnvWorker:
     def __init__(self, nodes, edges, seed, state_snapshot, attacker_strategy, min_edge_cost,
                  num_both_edges, deterministic_outcomes, multiple_interdiction_attempts,
                  progress_actor=None, memo_actors=None, budget_levels=1, progress_granularity=50,
-                 max_depth_inner=20, outcome_memo_actor=None, outcome_memo_actors=None):
+                 max_depth_inner=20, outcome_memo_actor=None, outcome_memo_actors=None, alpha_actor=None):
         """
         Worker now accepts a progress_actor handle, a shared memo_actor handle,
         and budget_levels so it can estimate progress for invalid actions.
@@ -1989,6 +1999,7 @@ class _RemoteEnvWorker:
         self.num_both_edges = num_both_edges
         self.max_depth_inner = max_depth_inner
         self.progress_actor = progress_actor
+        self.alpha_actor = alpha_actor
         
         # Handle Sharded Memo Actors
         self.memo_actors = memo_actors
@@ -2001,13 +2012,21 @@ class _RemoteEnvWorker:
         import numpy as np, ray as _ray, time, zlib # Added zlib for stable hashing
         memo_local = {}
         local_counter = 0
+        
+        # Local cache of the global alpha value
+        local_alpha_cache = -float('inf')
+        if self.alpha_actor:
+            try:
+                local_alpha_cache = _ray.get(self.alpha_actor.get.remote())
+            except Exception:
+                pass
 
         #Time-based throttling variables
         last_report_time = time.time()
         report_interval = 0.5  # Max 2 reports per second per worker
 
         def maybe_flush_progress():
-            nonlocal local_counter, last_report_time
+            nonlocal local_counter, last_report_time, local_alpha_cache
             # 1. Check if we have enough accumulated progress (batch size)
             if self.progress_actor is not None and local_counter >= self.progress_granularity:
                 # 2. Check if enough time has passed (throttle)
@@ -2018,19 +2037,28 @@ class _RemoteEnvWorker:
                         self.progress_actor.increment.remote(local_counter)
                         local_counter = 0
                         last_report_time = now
+                        
+                        # Sync alpha
+                        if self.alpha_actor:
+                            remote_val = _ray.get(self.alpha_actor.get.remote())
+                            if remote_val > local_alpha_cache:
+                                local_alpha_cache = remote_val
                     except Exception:
                         pass
                 # If time hasn't passed, we keep accumulating local_counter.
                 # This efficiently batches "bursty" progress (like cache hits).
 
         def dp_local(rem_budget, inter_state, d, alpha=-float('inf')):
-            nonlocal local_counter
+            nonlocal local_counter, local_alpha_cache
             key = inter_state[:self.num_both_edges].tobytes()
+            
+            # Incorporate global knowledge
+            alpha = max(alpha, local_alpha_cache)
 
             # 1) check local cache
             if key in memo_local:
                 # ADDED: Count volume for cached hit
-                vol = int(self.num_both_edges ** max(0, self.budget_levels - d))
+                vol = int(int(self.num_both_edges) ** max(0, self.budget_levels - d))
                 local_counter += vol
                 maybe_flush_progress()
                 return memo_local[key]
@@ -2053,7 +2081,7 @@ class _RemoteEnvWorker:
             if shared_val is not None:
                 memo_local[key] = shared_val
                 # ADDED: Count volume for cached hit
-                vol = int(self.num_both_edges ** max(0, self.budget_levels - d))
+                vol = int(int(self.num_both_edges) ** max(0, self.budget_levels - d))
                 local_counter += vol
                 maybe_flush_progress()
                 return shared_val
@@ -2080,7 +2108,7 @@ class _RemoteEnvWorker:
                 final_objective, current_flows = self.env._calculate_isolate_objective_and_flows()
                 final_objective = -final_objective
             elif self.attacker_strategy == 'divert':
-                final_objective, current_flows_ = self.env._calculate_divert_objective_and_flows()
+                final_objective, current_flows = self.env._calculate_divert_objective_and_flows()
             else:
                 final_objective = -float('inf')
                 current_flows = {}
@@ -2097,7 +2125,7 @@ class _RemoteEnvWorker:
 
                 memo_local[key] = (final_objective, [])
                 # Count the volume of the skipped subtree (leaves)
-                volume = int(self.num_both_edges ** max(0, self.budget_levels - d))
+                volume = int(int(self.num_both_edges) ** max(0, self.budget_levels - d))
                 local_counter += volume
                 maybe_flush_progress()
                 # publish to central memo (best-effort, async)
@@ -2116,11 +2144,11 @@ class _RemoteEnvWorker:
             valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
 
             # Report the discovery of invalid actions as progress using estimated subtree sizes
-            num_invalid = self.num_both_edges - len(valid_actions)
+            num_invalid = int(self.num_both_edges) - len(valid_actions)
             if num_invalid > 0 and self.progress_actor is not None:
                 try:
                     # estimated states pruned by each invalid action
-                    est_per_invalid = int(self.num_both_edges ** max(0, self.budget_levels - (d + 1)))
+                    est_per_invalid = int(int(self.num_both_edges) ** max(0, self.budget_levels - (d + 1)))
                     local_counter += num_invalid * est_per_invalid
                     maybe_flush_progress()
                 except Exception:
@@ -2144,7 +2172,7 @@ class _RemoteEnvWorker:
             # Update alpha with current node value
             alpha = max(alpha, best_reward)
 
-            if self.attacker_strategy == 'zero_sum':
+            if self.attacker_strategy in ['zero_sum', 'isolate']:
                 # Heuristic sorting for pruning
                 caps = self.env.state['edge_capacity'][valid_actions]
                 probs = self.env.state['edge_interdiction_probability'][valid_actions]
@@ -2162,7 +2190,7 @@ class _RemoteEnvWorker:
             
             for i, action in enumerate(valid_actions):
                 # Pruning for zero_sum
-                if self.attacker_strategy == 'zero_sum':
+                if self.attacker_strategy in ['zero_sum', 'isolate']:
                      # Pruning condition: 
                      # current obj value - (current remaining budget * heuristic) > current best objective value
                      # -final_objective - (rem_budget * heuristics[i]) > -alpha
@@ -2190,6 +2218,12 @@ class _RemoteEnvWorker:
                     best_reward = fut_reward
                     best_seq = [action] + fut_seq
                     alpha = max(alpha, best_reward)
+                    
+                    # Update global alpha if we found something better
+                    if alpha > local_alpha_cache:
+                        local_alpha_cache = alpha
+                        if self.alpha_actor:
+                            self.alpha_actor.update.remote(alpha)
 
             memo_local[key] = (best_reward, best_seq)
             # Do NOT increment local_counter here for internal nodes
@@ -2246,8 +2280,11 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
         num_outcome_shards = min(4, n_workers)
         outcome_memo_actors = [SharedOutcomeMemoActor.remote() for _ in range(num_outcome_shards)]
     
+    # Create alpha actor
+    alpha_actor = _SharedAlphaActor.remote()
+    
     max_budget = self.state['budget'][0]
-    budget_levels = max_budget // self.min_edge_cost if self.min_edge_cost > 0 else 1
+    budget_levels = int(max_budget // self.min_edge_cost) if self.min_edge_cost > 0 else 1
 
     workers = [
         _RemoteEnvWorker.remote(
@@ -2265,14 +2302,15 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
             budget_levels=budget_levels,
             progress_granularity=2000,
             max_depth_inner=20,
-            outcome_memo_actors=outcome_memo_actors 
+            outcome_memo_actors=outcome_memo_actors,
+            alpha_actor=alpha_actor
         )
         for _ in range(n_workers)
     ]
 
     # Setup progress bar
     budget_levels_local = budget_levels
-    estimated_states = (self.num_both_edges ** budget_levels_local) if budget_levels_local > 0 else 1
+    estimated_states = (int(self.num_both_edges) ** budget_levels_local) if budget_levels_local > 0 else 1
     
     from tqdm import tqdm
     import threading, time
@@ -2397,10 +2435,10 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
         
         # --- PROGRESS REPORTING FIX ---
         # If we expand this node, we are responsible for reporting the volume of the branches we DON'T take.
-        num_invalid = self.num_both_edges - len(valid_actions)
+        num_invalid = int(self.num_both_edges) - len(valid_actions)
         if num_invalid > 0:
             child_remaining_depth = max(0, budget_levels_local - (node.depth + 1))
-            child_volume = int(self.num_both_edges ** child_remaining_depth)
+            child_volume = int(self.num_both_edges) ** child_remaining_depth
             pruned_volume = num_invalid * child_volume
             progress_actor.increment.remote(pruned_volume)
 
