@@ -2,8 +2,8 @@
 
 # Slurm sbatch options
 
-#SBATCH -n 48
-#   SBATCH --gres=gpu:volta:2
+#SBATCH -n 48  #48
+#    SBATCH --gres=gpu:volta:2
 #SBATCH -N 1
 
 #SBATCH -o SolutionGenerator.sh.log-%j
@@ -22,4 +22,4 @@ export RAY_memory_usage_threshold=0.95
 export RAY_memory_monitor_refresh_ms=0
 
 # Run the script
-python SolutionGenerator.py
+python -u SolutionGenerator.py
