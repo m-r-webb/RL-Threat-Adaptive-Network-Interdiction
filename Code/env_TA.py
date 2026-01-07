@@ -1767,9 +1767,18 @@ class CustomEnv(gym.Env):
         """Reset the environment to initial state and return observation."""
         # Clean up any existing models
         self._cleanup_models()
+        self.strategy_objectives_setup = False # Force objective reset on next solve
+        self.old_routing_assumption = False
 
         # Clear local outcome cache when loading new state
         self.local_outcome_cache = {}
+
+        # Clear centralized outcome cache if it exists
+        if self.outcome_memo_actors:
+            for actor in self.outcome_memo_actors:
+                actor.clear.remote()
+        elif self.outcome_memo_actor:
+            self.outcome_memo_actor.clear.remote()
         
         super().reset(seed=seed)
         if seed is not None:
@@ -1974,13 +1983,13 @@ class _RemoteEnvWorker:
         CustomEnv = getattr(env_mod, "CustomEnv")
 
         # Instantiate env with the same key flags so internals (num_both_edges, spaces, models) are set up
-        # Pass the outcome_memo_actor to the environment
+        # Pass None for actors initially to avoid clearing them during load_network_from_state
         self.env = CustomEnv(nodes, edges,
                              deterministic_agent=deterministic_outcomes,
                              multiple_interdiction_attempts=multiple_interdiction_attempts,
                              attacker_strategy=attacker_strategy,
-                             outcome_memo_actor=outcome_memo_actor,
-                             outcome_memo_actors=outcome_memo_actors)
+                             outcome_memo_actor=None,
+                             outcome_memo_actors=None)
 
         # Make a deep, writable copy of the state snapshot to avoid read-only numpy arrays
         state_copy = copy.deepcopy(state_snapshot)
@@ -1996,6 +2005,10 @@ class _RemoteEnvWorker:
 
         # Restore state on the worker
         self.env.load_network_from_state(seed, state_copy)
+
+        # Attach shared actors after loading state
+        self.env.outcome_memo_actor = outcome_memo_actor
+        self.env.outcome_memo_actors = outcome_memo_actors
 
         self.attacker_strategy = attacker_strategy
         self.min_edge_cost = min_edge_cost
