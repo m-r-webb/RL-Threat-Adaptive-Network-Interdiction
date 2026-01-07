@@ -8,20 +8,20 @@ graphName = "G5x5"
 agent = "MaskablePPO"
 #agent = "PPO"
 
-version = "v01_01" #V[Month]_[Day] 
+version = "v01_07" #V[Month]_[Day] 
 
 # Initial Learning Rate
 initial_learning_rate = 0.0003  #0.0001
 
 # Time Steps to Train
-timesteps = 15000000
+timesteps = 5000000
 
 # Number of parallel cpus
 n_cpus = 120  # Number of environments
 
 env_params = {'deterministic_agent': False,
               'multiple_interdiction_attempts': False,
-              'attacker_strategy': 'zero_sum',  # canalize   isolate   divert  zero_sum
+              'attacker_strategy': 'divert',  # canalize   isolate   divert  zero_sum
               'training_budget_range': (5, 15),  #G5x5: zero_sum/isolate: (5,15), canalize/divert: (10,20) G10x10: zero_sum/isolate: (15,30), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (15,25)
               'max_path_length': 6,  #G5x5: 6,  G10x10: 13, UKR: 16
               'sample_size': None,
@@ -40,6 +40,7 @@ else:
 # Model Name
 model_name = f"{graphName}_{deterministicLetter}_{agent}_{env_params['attacker_strategy']}_{MI_letter}_{version}"
 print(model_name)
+print(env_params)
 
 # Import all required packages
 import os
@@ -525,52 +526,11 @@ class MaskablePointerNetworkPolicy(MaskableActorCriticPolicy):
         global_features = th.cat([edge_embeddings.mean(dim=1), budget.reshape(-1, 1)], dim=-1)
         return self.custom_value_net(global_features)
 
-# Add action mask method to your environment or create a wrapper
-def mask_fn(env):
-    """
-    Fully vectorized function using cached flow information.
-    Maximum speed optimization.
-    """
-    remaining_budget = env.state['budget'][0]
-    edge_interdicted = env.state['edge_interdicted']
-    
-    action_mask = np.ones(env.action_space.n, dtype=np.float32)
-    num_interdictable = min(env.num_both_edges, env.action_space.n)
-    
-    # All vectorized checks
-    valid_edges = np.arange(num_interdictable) < env.num_both_edges
-    sufficient_budget = (remaining_budget - env.state['edge_costs'][:num_interdictable]) >= -0.1
-    has_capacity = env.state['edge_capacity'][:num_interdictable] > 0
-    has_probability = env.state['edge_interdiction_probability'][:num_interdictable] > 0
-    
-    max_interdictions = env.MAX_INTERDICTION_ATTEMPTS if env.multiple_interdiction_attempts else 1
-    within_limit = (edge_interdicted[:num_interdictable] + 1) <= max_interdictions
-    
-    # Use cached flow array (FAST!)
-    has_flow = True # env.cached_flow_array[:num_interdictable] > 0
-    
-    # Strategy-specific checks
-    if env.attacker_strategy == 'canalize':
-        not_target = env.state['canalize_objective'][:num_interdictable] != 1
-        valid_actions = (valid_edges & sufficient_budget & has_capacity & 
-                        has_probability & within_limit & has_flow & not_target)
-    elif env.attacker_strategy == 'divert':
-        not_target = env.state['divert_to_objective'][:num_interdictable] != 1
-        valid_actions = (valid_edges & sufficient_budget & has_capacity & 
-                        has_probability & within_limit & has_flow & not_target)
-    else:
-        valid_actions = (valid_edges & sufficient_budget & has_capacity & 
-                        has_probability & within_limit & has_flow)
-    
-    action_mask[:num_interdictable] = valid_actions.astype(np.float32)
-    
-    return action_mask
-    
 # Modified environment setup with action masking
 def make_env():
     env = ce.CustomEnv(nodes, edges, **env_params)
     # Wrap with ActionMasker
-    env = ActionMasker(env, mask_fn)
+    env = ActionMasker(env, lambda env: env.mask_fn())
     return env
 
 # Policy kwargs for your training setup
@@ -599,7 +559,7 @@ if __name__ == "__main__":
         lambda: Monitor(
             ActionMasker(
                 ce.CustomEnv(nodes, edges, **env_params),
-                mask_fn
+                lambda env: env.mask_fn()
             )
         )
     ])
@@ -627,7 +587,7 @@ if __name__ == "__main__":
         n_steps=200,  #128
         n_epochs=10,   #5
         ent_coef=0.01,  #0.05
-        batch_size=9600,  #6144
+        batch_size=2400,  #6144
         gamma=0.99,
         policy_kwargs=policy_kwargs
     )
