@@ -1014,7 +1014,12 @@ class CustomEnv(gym.Env):
         
         # 1. Check Local Cache
         for outcome in unique_outcomes:
-            if outcome not in self.local_outcome_cache: #(outcome, strategy_type)
+            # Check if outcome is in cache AND meets data requirements (ie flows vs no flows)
+            is_valid_hit = outcome in self.local_outcome_cache
+            if is_valid_hit and return_full_flows and 'flows' not in self.local_outcome_cache[outcome]:
+                is_valid_hit = False
+            
+            if not is_valid_hit:
                 outcomes_needed_from_central.append(outcome)
         
         # 2. Check Central Cache (only for what wasn't in local)
@@ -1044,7 +1049,12 @@ class CustomEnv(gym.Env):
                 for i, results in enumerate(all_results):
                     keys = shard_keys[shard_indices[i]]
                     for outcome, res in zip(keys, results):
-                        if res is not None:
+                        # Check if remote result is valid
+                        is_valid_result = res is not None
+                        if is_valid_result and return_full_flows and 'flows' not in res:
+                            is_valid_result = False
+                            
+                        if is_valid_result:
                             self.local_outcome_cache[outcome] = res #(outcome, strategy_type)
                         else:
                             outcomes_to_solve.append(outcome)
@@ -1898,10 +1908,16 @@ class CustomEnv(gym.Env):
         elif self.attacker_strategy == 'divert':
             has_flow = self.cached_flow_array[:self.num_interdictable] > 0
             not_target = self.state['divert_to_objective'][:self.num_interdictable] != 1
-            if depth == 0:
+            
+            # Check if any edges on the divert_from path have been interdicted
+            from_path_interdicted = np.any((self.state['edge_interdicted'][:self.num_interdictable] > 0) & 
+                                         (self.state['divert_from_objective'][:self.num_interdictable] == 1))
+
+            if not from_path_interdicted:
                 is_target = self.state['divert_from_objective'][:self.num_interdictable] == 1
             else:
                 is_target = True
+
             valid_actions = (sufficient_budget & #has_capacity & 
                              has_probability & is_target &
                              within_limit & has_flow & not_target)
