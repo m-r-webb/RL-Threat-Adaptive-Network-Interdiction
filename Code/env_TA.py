@@ -504,6 +504,8 @@ class CustomEnv(gym.Env):
             
             # Divert To
             to_indices = np.where(self.state['divert_to_objective'][:self.num_both_edges] == 1)[0]
+            # Only include edges in divert_to that are NOT in divert_from
+            to_indices = np.setdiff1d(to_indices, from_indices)
             to_edges = [self.both_edges[i] for i in to_indices]
             
             if to_edges:
@@ -1244,13 +1246,36 @@ class CustomEnv(gym.Env):
         """Calculate total flow through edges marked in the objective."""
         objective = self.state[objective_key]
         target_flows = []
-    
-        for idx, edge in enumerate(self.both_edges):
-            if objective[idx] == 1:
-                forward_flow = flows.get(edge, 0)
-                reverse_flow = flows.get((edge[1], edge[0]), 0)
-                target_flows.append(forward_flow+reverse_flow)
-    
+
+        current_node = 1
+        visited = {1}
+
+        while current_node not in self.sink_nodes and current_node not in self.super_sink_nodes:
+            found_next = False
+            if current_node in self.edge_groups:
+                for edge in self.edge_groups[current_node]['out']:
+                    neighbor = edge[1]
+                    
+                    if neighbor in visited:
+                        continue
+                        
+                    idx = self.edge_to_index.get(edge)
+                    if idx is None:
+                        idx = self.edge_to_index.get((neighbor, current_node))
+                        
+                    if idx is not None and objective[idx] == 1:
+                        target_flows.append(flows.get(edge, 0))
+                        current_node = neighbor
+                        visited.add(current_node)
+                        found_next = True
+                        break
+            
+            if not found_next:
+                break
+
+        if not target_flows:
+            return 0.0
+
         # Return minimum flow among target edges
         return min(target_flows)
 
