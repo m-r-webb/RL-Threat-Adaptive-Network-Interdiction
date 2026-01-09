@@ -487,15 +487,14 @@ class CustomEnv(gym.Env):
             # Tertiary: Minimize flow on 'divert_to' (Priority 3)
             
             # Divert From
-            from_indices = np.where(self.state['divert_from_objective'][:self.num_both_edges] == 1)[0]
-            from_edges = [self.both_edges[i] for i in from_indices]
+            from_edges = self._extract_directed_path_edges('divert_from_objective')
             
             if from_edges:
                 z_from = self.maxflow_model.addVar(vtype=grb.GRB.CONTINUOUS, name="min_divert_from_flow")
                 self.aux_vars.append(z_from)
                 
                 constrs = self.maxflow_model.addConstrs(
-                    (z_from <= self.flow_var[e] + self.flow_var[(e[1], e[0])] for e in from_edges),
+                    (z_from <= self.flow_var[e] for e in from_edges),
                     name="min_from_constr"
                 )
                 self.aux_constrs.extend(constrs.values())
@@ -503,13 +502,13 @@ class CustomEnv(gym.Env):
                 self.maxflow_model.setObjectiveN(z_from, index=1, priority=5, weight=1.0, name="max_min_divert_from")
             
             # Divert To
-            to_indices = np.where(self.state['divert_to_objective'][:self.num_both_edges] == 1)[0]
+            to_edges = self._extract_directed_path_edges('divert_to_objective')
             # Only include edges in divert_to that are NOT in divert_from
-            to_indices = np.setdiff1d(to_indices, from_indices)
-            to_edges = [self.both_edges[i] for i in to_indices]
+            from_edge_set = set(from_edges)
+            to_edges = [e for e in to_edges if e not in from_edge_set]
             
             if to_edges:
-                expr_to = grb.quicksum(self.flow_var[e] + self.flow_var[(e[1], e[0])] for e in to_edges)
+                expr_to = grb.quicksum(self.flow_var[e] for e in to_edges)
                 # Minimize -> weight = -1.0
                 self.maxflow_model.setObjectiveN(expr_to, index=2, priority=3, weight=-1.0, name="min_divert_to_sum")
 
@@ -734,6 +733,37 @@ class CustomEnv(gym.Env):
         isolate_objective[marked_indices] = 1
     
         return {**base_state, 'isolate_objective': isolate_objective}
+
+    def _extract_directed_path_edges(self, objective_key):
+        """Helper logic to extract path edges in order based on an objective key."""
+        obj_mask = self.state[objective_key]
+        path_edges = []
+        current_node = 1
+        visited = {1}
+        sink_nodes = set(self.sink_nodes)
+        super_sink_nodes = set(self.super_sink_nodes)
+        
+        while current_node not in sink_nodes and current_node not in super_sink_nodes:
+            found_next = False
+            if current_node in self.edge_groups:
+                for edge in self.edge_groups[current_node]['out']:
+                    neighbor = edge[1]
+                    if neighbor in visited:
+                        continue
+                    
+                    idx = self.edge_to_index.get(edge)
+                    if idx is None:
+                        idx = self.edge_to_index.get((neighbor, current_node))
+                    
+                    if idx is not None and obj_mask[idx] == 1:
+                        path_edges.append(edge)
+                        current_node = neighbor
+                        visited.add(current_node)
+                        found_next = True
+                        break
+            if not found_next:
+                break
+        return path_edges
 
     def _add_divert_components(self, base_state):
         """Add divert-specific objectives to state."""
@@ -1244,37 +1274,12 @@ class CustomEnv(gym.Env):
 
     def _calculate_target_path_flow(self, flows, objective_key):
         """Calculate total flow through edges marked in the objective."""
-        objective = self.state[objective_key]
-        target_flows = []
+        path_edges = self._extract_directed_path_edges(objective_key)
 
-        current_node = 1
-        visited = {1}
-
-        while current_node not in self.sink_nodes and current_node not in self.super_sink_nodes:
-            found_next = False
-            if current_node in self.edge_groups:
-                for edge in self.edge_groups[current_node]['out']:
-                    neighbor = edge[1]
-                    
-                    if neighbor in visited:
-                        continue
-                        
-                    idx = self.edge_to_index.get(edge)
-                    if idx is None:
-                        idx = self.edge_to_index.get((neighbor, current_node))
-                        
-                    if idx is not None and objective[idx] == 1:
-                        target_flows.append(flows.get(edge, 0))
-                        current_node = neighbor
-                        visited.add(current_node)
-                        found_next = True
-                        break
-            
-            if not found_next:
-                break
-
-        if not target_flows:
+        if not path_edges:
             return 0.0
+
+        target_flows = [flows.get(edge, 0) for edge in path_edges]
 
         # Return minimum flow among target edges
         return min(target_flows)
