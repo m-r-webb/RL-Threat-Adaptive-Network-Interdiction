@@ -307,7 +307,12 @@ class CustomEnv(gym.Env):
             
         # Solve and return results
         self.maxflow_model.params.Seed = 1
-        self.maxflow_model.optimize()
+        
+        callback = None
+        if routing_assumption in ['divert', 'canalize']:
+            callback = self._subtour_callback
+
+        self.maxflow_model.optimize(callback)
         
         if self.maxflow_model.Status == grb.GRB.OPTIMAL:
             obj_val = round(self.maxflow_model.ObjVal)
@@ -317,6 +322,67 @@ class CustomEnv(gym.Env):
             flow_results = {e: 0 for e in self.flow_var.keys()}
         
         return obj_val, flow_results 
+
+    def _subtour_callback(self, model, where):
+        """Callback to eliminate subtours."""
+        if where == grb.GRB.Callback.MIPSOL:
+            vals = model.cbGetSolution(self.edge_used)
+            # Filter edges with value > 0.5
+            selected_edges = [e for e, v in vals.items() if v > 0.5]
+            
+            # Detect cycles
+            cycles = self._find_cycles(selected_edges)
+            
+            for cycle in cycles:
+                # Add lazy constraint: sum(edge_used in cycle) <= len(cycle) - 1
+                expr = grb.quicksum(self.edge_used[e] for e in cycle)
+                model.cbLazy(expr <= len(cycle) - 1)
+
+    def _find_cycles(self, edges):
+        """Find cycles in solution graph using DFS."""
+        adj = defaultdict(list)
+        for u, v in edges:
+            adj[u].append(v)
+        
+        cycles = []
+        visited = set()
+        path = []
+        path_set = set()
+        
+        def dfs(u):
+            if u in path_set:
+                try:
+                    idx = path.index(u)
+                    cycle_nodes = path[idx:]
+                    cycle_edges = []
+                    for i in range(len(cycle_nodes)):
+                        u_node = cycle_nodes[i]
+                        v_node = cycle_nodes[(i + 1) % len(cycle_nodes)]
+                        cycle_edges.append((u_node, v_node))
+                    cycles.append(cycle_edges)
+                except ValueError:
+                    pass
+                return
+
+            if u in visited:
+                return
+
+            visited.add(u)
+            path.append(u)
+            path_set.add(u)
+            
+            for v in adj[u]:
+                dfs(v)
+                
+            path.pop()
+            path_set.remove(u)
+            
+        nodes = set(u for u, v in edges) | set(v for u, v in edges)
+        for n in nodes:
+            if n not in visited:
+                dfs(n)
+                
+        return cycles 
 
     def _initialize_maxflow_model(self):
         """Initialize the Gurobi max flow model with variables and constraints."""
@@ -332,7 +398,7 @@ class CustomEnv(gym.Env):
 
         # Add Edge Usage variables
         # CHANGE: vtype=grb.GRB.BINARY -> vtype=grb.GRB.CONTINUOUS for speed
-        self.edge_used = self.maxflow_model.addVars(self.all_both_edges, vtype=grb.GRB.CONTINUOUS, name="edge_used")
+        self.edge_used = self.maxflow_model.addVars(self.all_both_edges, vtype=grb.GRB.BINARY, name="edge_used")
 
         ##CONSTRAINTS
         # Flow conservation for intermediate nodes
@@ -357,7 +423,7 @@ class CustomEnv(gym.Env):
         )
     
         # Minimum flow forward and reverse constraints
-        self.maxflow_model.addConstrs((self.flow_var[e] >= self.edge_used[e] for e in self.all_both_edges), name="min_flow_forward")
+        #self.maxflow_model.addConstrs((self.flow_var[e] >= self.edge_used[e] for e in self.all_both_edges), name="min_flow_forward")
 
         # Prevent backflow from Super Sink
         self.maxflow_model.addConstrs(
@@ -447,9 +513,21 @@ class CustomEnv(gym.Env):
         # 1. Primary Objective: Maximize Total Flow (Always Priority 10)
         self.maxflow_model.setObjectiveN(self.flow_var[self.super_edge], index=0, priority=10, weight=1.0, name="max_flow")
 
-        # Minimize number of edges used to prevent cycles (Always Priority 1)
-        expr = grb.quicksum(self.edge_used[e] for e in self.all_both_edges)
-        self.maxflow_model.setObjectiveN(expr, index=1, priority=1, weight=-1.0, name="min_edges_used")
+        if routing_assumption in ['divert', 'canalize']:
+            # Use subtour elimination callback - requires BINARY vars
+            for v in self.edge_used.values():
+                v.VType = grb.GRB.BINARY
+            self.maxflow_model.params.LazyConstraints = 1
+            # Do NOT add min_edges_used objective
+        else:
+            # Use continuous relaxation + min edge penalty
+            for v in self.edge_used.values():
+                v.VType = grb.GRB.CONTINUOUS
+            self.maxflow_model.params.LazyConstraints = 0
+
+            # Minimize number of edges used to prevent cycles (Always Priority 1)
+            expr = grb.quicksum(self.edge_used[e] for e in self.all_both_edges)
+            self.maxflow_model.setObjectiveN(expr, index=1, priority=1, weight=-1.0, name="min_edges_used")
 
         if routing_assumption == "zero_sum":
             pass
@@ -483,13 +561,48 @@ class CustomEnv(gym.Env):
                 self.maxflow_model.setObjectiveN(z, index=1, priority=5, weight=1.0, name="max_min_canalize")
 
         elif routing_assumption == "divert":
-            # Secondary: Maximize min flow on 'divert_from' (Priority 5)
-            # Tertiary: Minimize flow on 'divert_to' (Priority 3)
+            # Combined Objective: Maximize max(z_from - flow_to_i) for independent edges
             
             # Divert From
             from_edges = self._extract_directed_path_edges('divert_from_objective')
             
-            if from_edges:
+            # Divert To
+            to_edges = self._extract_directed_path_edges('divert_to_objective')
+            from_edge_set = set(from_edges)
+            to_edges = [e for e in to_edges if e not in from_edge_set]
+            
+            if from_edges and to_edges:
+                # 1. Define z_from (min flow on from path)
+                z_from = self.maxflow_model.addVar(vtype=grb.GRB.CONTINUOUS, name="min_from_flow")
+                self.aux_vars.append(z_from)
+                
+                constrs = self.maxflow_model.addConstrs(
+                    (z_from <= self.flow_var[e] for e in from_edges),
+                    name="min_from_constr"
+                )
+                self.aux_constrs.extend(constrs.values())
+
+                # 2. Define differences: diff_i = z_from - flow_to_i
+                diff_vars = []
+                for i, e in enumerate(to_edges):
+                    diff_i = self.maxflow_model.addVar(lb=-grb.GRB.INFINITY, vtype=grb.GRB.CONTINUOUS, name=f"diff_{i}")
+                    self.aux_vars.append(diff_i)
+                    
+                    c = self.maxflow_model.addConstr(diff_i == z_from - self.flow_var[e], name=f"diff_constr_{i}")
+                    self.aux_constrs.append(c)
+                    diff_vars.append(diff_i)
+                
+                # 3. Define Max of diffs
+                obj_combined = self.maxflow_model.addVar(lb=-grb.GRB.INFINITY, vtype=grb.GRB.CONTINUOUS, name="obj_combined")
+                self.aux_vars.append(obj_combined)
+                
+                gc = self.maxflow_model.addGenConstrMax(obj_combined, diff_vars, name="max_diff_gc")
+                self.aux_constrs.append(gc)
+                
+                self.maxflow_model.setObjectiveN(obj_combined, index=2, priority=5, weight=1.0, name="max_combined_divert")
+
+            elif from_edges:
+                # Fallback if no to_edges: just maximize z_from
                 z_from = self.maxflow_model.addVar(vtype=grb.GRB.CONTINUOUS, name="min_divert_from_flow")
                 self.aux_vars.append(z_from)
                 
@@ -499,18 +612,7 @@ class CustomEnv(gym.Env):
                 )
                 self.aux_constrs.extend(constrs.values())
                 
-                self.maxflow_model.setObjectiveN(z_from, index=1, priority=5, weight=1.0, name="max_min_divert_from")
-            
-            # Divert To
-            to_edges = self._extract_directed_path_edges('divert_to_objective')
-            # Only include edges in divert_to that are NOT in divert_from
-            from_edge_set = set(from_edges)
-            to_edges = [e for e in to_edges if e not in from_edge_set]
-            
-            if to_edges:
-                expr_to = grb.quicksum(self.flow_var[e] for e in to_edges)
-                # Minimize -> weight = -1.0
-                self.maxflow_model.setObjectiveN(expr_to, index=2, priority=3, weight=-1.0, name="min_divert_to_sum")
+                self.maxflow_model.setObjectiveN(z_from, index=2, priority=5, weight=1.0, name="max_min_divert_from")
 
         self.maxflow_model.update()
     
