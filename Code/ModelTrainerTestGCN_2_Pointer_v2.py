@@ -8,7 +8,7 @@ graphName = "G5x5"
 agent = "MaskablePPO"
 #agent = "PPO"
 
-version = "v01_09v3" #V[Month]_[Day] 
+version = "v01_09_GCN" #V[Month]_[Day] 
 
 # Initial Learning Rate
 initial_learning_rate = 0.0003  #0.0001
@@ -22,7 +22,7 @@ n_cpus = 120  # Number of environments
 env_params = {'deterministic_agent': False,
               'multiple_interdiction_attempts': False,
               'attacker_strategy': 'divert',  # canalize   isolate   divert  zero_sum
-              'training_budget_range': (10, 20),  #G5x5: zero_sum/isolate: (5,15), canalize/divert: (10,20) G10x10: zero_sum/isolate: (15,30), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (15,25)
+              'training_budget_range': (5, 15),  #G5x5: zero_sum/isolate: (5,15), canalize/divert: (10,20) G10x10: zero_sum/isolate: (15,30), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (15,25)
               'max_path_length': 6,  #G5x5: 6,  G10x10: 13, UKR: 16
               'sample_size': None,
               'penalty_value': -0.01,
@@ -249,6 +249,262 @@ class PointerNetworkFeatureExtractor(BaseFeaturesExtractor):
         batch_size = edge_embeddings.shape[0]
         budget_reshaped = budget.reshape(batch_size, -1)
         return th.cat([edge_embeddings.mean(dim=1), budget_reshaped], dim=-1)
+
+
+class GraphConvLayer(nn.Module):
+    """Graph Convolutional Layer with message passing"""
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.self_linear = nn.Linear(in_features, out_features)  # Separate transform for self
+        
+    def forward(self, node_features, adj_matrix):
+        """
+        node_features: [batch, num_nodes, in_features]
+        adj_matrix: [batch, num_nodes, num_nodes] - normalized adjacency
+        """
+        # Message passing: aggregate neighbor features
+        aggregated = th.bmm(adj_matrix, node_features)  # [batch, num_nodes, in_features]
+        # Transform neighbor aggregation
+        neighbor_out = self.linear(aggregated)
+        # Transform self features
+        self_out = self.self_linear(node_features)
+        # Combine and activate
+        return F.relu(neighbor_out + self_out)
+
+
+class GCNFeatureExtractor(BaseFeaturesExtractor):
+    """
+    Feature extractor using Graph Convolutional Network to process graph structure.
+    GCN learns node representations by aggregating neighbor information, then
+    combines these with edge features for the pointer network.
+    """
+    def __init__(self, observation_space, 
+                 edge_embedding_dim=128, hidden_dim=256,
+                 gcn_hidden_dim=64, num_gcn_layers=2,
+                 max_nodes=500,  # Increased to accommodate larger node indices
+                 edge_capacity_mean=50, edge_capacity_std=28.868,
+                 edge_cost_mean=5, edge_cost_std=1.543,
+                 budget_mean=50, budget_std=28.868,
+                 multiple_interdiction_attempts=False,
+                 edge_interdicted_mean=5, edge_interdicted_std=2.889,
+                 attacker_strategy='zero_sum'):
+        
+        # Features dimension for compatibility
+        super().__init__(observation_space, features_dim=hidden_dim + 1)
+        
+        # Register normalization parameters as buffers (move to correct device)
+        self.register_buffer('edge_capacity_mean', th.tensor(edge_capacity_mean))
+        self.register_buffer('edge_capacity_std', th.tensor(edge_capacity_std))
+        self.register_buffer('edge_cost_mean', th.tensor(edge_cost_mean))
+        self.register_buffer('edge_cost_std', th.tensor(edge_cost_std))
+        self.register_buffer('budget_mean', th.tensor(budget_mean))
+        self.register_buffer('budget_std', th.tensor(budget_std))
+        
+        self.multiple_interdiction_attempts = multiple_interdiction_attempts
+        if self.multiple_interdiction_attempts:
+            self.register_buffer('edge_interdicted_mean', th.tensor(edge_interdicted_mean))
+            self.register_buffer('edge_interdicted_std', th.tensor(edge_interdicted_std))
+        
+        self.max_nodes = max_nodes
+        self.gcn_hidden_dim = gcn_hidden_dim
+        self.edge_embedding_dim = edge_embedding_dim
+        self.hidden_dim = hidden_dim
+        self.attacker_strategy = attacker_strategy
+        
+        # Initial node feature dimension
+        initial_node_dim = 16
+        
+        # Node feature initialization (learnable embedding)
+        self.node_init_embedding = nn.Embedding(max_nodes + 1, initial_node_dim, padding_idx=0)
+        
+        # GCN layers for node representation learning
+        self.gcn_layers = nn.ModuleList()
+        self.gcn_layers.append(GraphConvLayer(initial_node_dim, gcn_hidden_dim))
+        for _ in range(num_gcn_layers - 1):
+            self.gcn_layers.append(GraphConvLayer(gcn_hidden_dim, gcn_hidden_dim))
+        
+        # Layer norm after GCN
+        self.gcn_layer_norm = nn.LayerNorm(gcn_hidden_dim)
+        
+        # Binary embedding for edge_interdicted (when not multiple attempts)
+        self.binary_embed = nn.Embedding(2, 4)
+        
+        # Calculate edge input dimension
+        # Continuous features: capacity, cost, probability, (+ interdicted if multiple attempts)
+        num_continuous = 4 if multiple_interdiction_attempts else 3
+        num_binary_embed = 0 if multiple_interdiction_attempts else 4
+        
+        # Strategy-specific objective features
+        if attacker_strategy == 'divert':
+            num_objective_features = 2  # divert_from, divert_to
+        elif attacker_strategy in ['canalize', 'isolate']:
+            num_objective_features = 1
+        else:
+            num_objective_features = 0
+        
+        # Edge input: continuous + binary embed + objective features + GCN node features (src + dst)
+        edge_input_dim = (num_continuous + num_binary_embed + 
+                          num_objective_features + 2 * gcn_hidden_dim)
+        
+        # Edge embedding network
+        self.edge_embedding = nn.Sequential(
+            nn.Linear(edge_input_dim, edge_embedding_dim),
+            nn.ReLU(),
+            nn.LayerNorm(edge_embedding_dim)
+        )
+        
+        # Storage for pointer network
+        self._last_edge_embeddings = None
+        self._last_budget = None
+        self._last_padding_mask = None
+        self._last_sequence_length = None
+        
+    def _build_adjacency_matrix(self, dep_nodes, arr_nodes, padding_mask, batch_size, device):
+        """
+        Build normalized adjacency matrix from edge list.
+        Uses symmetric normalization: D^(-1/2) * A * D^(-1/2)
+        """
+        # Dynamically determine actual max node index needed
+        max_node_in_batch = max(dep_nodes.max().item(), arr_nodes.max().item()) + 1
+        actual_max_nodes = max(self.max_nodes, max_node_in_batch)
+        
+        adj = th.zeros(batch_size, actual_max_nodes, actual_max_nodes, device=device)
+        
+        # Create edge indices for batch indexing
+        batch_indices = th.arange(batch_size, device=device).unsqueeze(1).expand(-1, dep_nodes.shape[1])
+        valid_mask = padding_mask.bool()
+        
+        # Flatten for indexing
+        b_idx = batch_indices[valid_mask]
+        src_idx = dep_nodes[valid_mask]
+        dst_idx = arr_nodes[valid_mask]
+        
+        # Add edges (undirected for GCN message passing)
+        adj[b_idx, src_idx, dst_idx] = 1.0
+        adj[b_idx, dst_idx, src_idx] = 1.0
+        
+        # Add self-loops
+        self_loop = th.eye(actual_max_nodes, device=device).unsqueeze(0).expand(batch_size, -1, -1)
+        adj = adj + self_loop
+        
+        # Symmetric normalization: D^(-1/2) * A * D^(-1/2)
+        degree = adj.sum(dim=-1, keepdim=True).clamp(min=1)
+        degree_inv_sqrt = degree.pow(-0.5)
+        adj = adj * degree_inv_sqrt
+        adj = adj * degree_inv_sqrt.transpose(-1, -2)
+        
+        # Store actual size for node features
+        self._actual_max_nodes = actual_max_nodes
+        
+        return adj
+        
+    def forward(self, observations):
+        device = next(self.parameters()).device
+        
+        # Extract and move observations to correct device
+        edge_capacity = th.as_tensor(observations['edge_capacity'], dtype=th.float32, device=device)
+        edge_capacity = (edge_capacity - self.edge_capacity_mean) / (self.edge_capacity_std + 1e-8)
+        
+        edge_costs = th.as_tensor(observations['edge_costs'], dtype=th.float32, device=device)
+        edge_costs = (edge_costs - self.edge_cost_mean) / (self.edge_cost_std + 1e-8)
+        
+        edge_prob = th.as_tensor(observations['edge_interdiction_probability'], dtype=th.float32, device=device)
+        
+        padding_mask = th.as_tensor(observations['padding_mask'], dtype=th.float32, device=device)
+        
+        if self.multiple_interdiction_attempts:
+            edge_interdicted = th.as_tensor(observations['edge_interdicted'], dtype=th.float32, device=device)
+            edge_interdicted = (edge_interdicted - self.edge_interdicted_mean) / (self.edge_interdicted_std + 1e-8)
+        else:
+            edge_interdicted = th.as_tensor(observations['edge_interdicted'], dtype=th.long, device=device)
+        
+        budget = th.as_tensor(observations['budget'], dtype=th.float32, device=device)
+        budget = (budget - self.budget_mean) / (self.budget_std + 1e-8)
+        
+        dep_nodes = th.as_tensor(observations['edge_departure_node'], dtype=th.long, device=device)
+        arr_nodes = th.as_tensor(observations['edge_arrival_node'], dtype=th.long, device=device)
+        
+        batch_size = edge_capacity.shape[0]
+        num_edges = dep_nodes.shape[1]
+        
+        # ===== GCN Processing =====
+        # Build adjacency matrix from edge structure
+        adj_matrix = self._build_adjacency_matrix(dep_nodes, arr_nodes, padding_mask, batch_size, device)
+        
+        # Use actual max nodes determined from batch
+        actual_max_nodes = self._actual_max_nodes
+        
+        # Initialize node features with learnable embeddings
+        # Clamp indices to embedding size and handle overflow with modulo
+        node_indices = th.arange(actual_max_nodes, device=device).unsqueeze(0).expand(batch_size, -1)
+        node_indices_clamped = node_indices % (self.max_nodes + 1)  # Wrap around for embedding lookup
+        node_features = self.node_init_embedding(node_indices_clamped)  # [batch, actual_max_nodes, initial_dim]
+        
+        # Apply GCN layers with residual connections
+        for i, gcn_layer in enumerate(self.gcn_layers):
+            new_features = gcn_layer(node_features, adj_matrix)
+            if i > 0 and node_features.shape[-1] == new_features.shape[-1]:
+                node_features = node_features + new_features  # Residual connection
+            else:
+                node_features = new_features
+        
+        # Apply layer norm
+        node_features = self.gcn_layer_norm(node_features)
+        
+        # ===== Gather GCN node features for each edge's endpoints =====
+        # dep_nodes/arr_nodes: [batch, num_edges]
+        dep_features = th.gather(
+            node_features, 1, 
+            dep_nodes.unsqueeze(-1).expand(-1, -1, self.gcn_hidden_dim)
+        )  # [batch, num_edges, gcn_hidden_dim]
+        arr_features = th.gather(
+            node_features, 1,
+            arr_nodes.unsqueeze(-1).expand(-1, -1, self.gcn_hidden_dim)
+        )  # [batch, num_edges, gcn_hidden_dim]
+        
+        # ===== Combine with edge features =====
+        # Extract strategy-specific objectives
+        objective_features = []
+        if self.attacker_strategy == 'canalize':
+            canalize_obj = th.as_tensor(observations['canalize_objective'], dtype=th.float32, device=device).unsqueeze(-1)
+            objective_features.append(canalize_obj)
+        elif self.attacker_strategy == 'isolate':
+            isolate_obj = th.as_tensor(observations['isolate_objective'], dtype=th.float32, device=device).unsqueeze(-1)
+            objective_features.append(isolate_obj)
+        elif self.attacker_strategy == 'divert':
+            divert_from = th.as_tensor(observations['divert_from_objective'], dtype=th.float32, device=device).unsqueeze(-1)
+            divert_to = th.as_tensor(observations['divert_to_objective'], dtype=th.float32, device=device).unsqueeze(-1)
+            objective_features.extend([divert_from, divert_to])
+        
+        # Combine continuous edge features
+        if self.multiple_interdiction_attempts:
+            cont_features = th.stack([edge_capacity, edge_costs, edge_prob, edge_interdicted], dim=-1)
+            if objective_features:
+                combined = th.cat([cont_features] + objective_features + [dep_features, arr_features], dim=-1)
+            else:
+                combined = th.cat([cont_features, dep_features, arr_features], dim=-1)
+        else:
+            cont_features = th.stack([edge_capacity, edge_costs, edge_prob], dim=-1)
+            binary_emb = self.binary_embed(edge_interdicted)
+            if objective_features:
+                combined = th.cat([cont_features, binary_emb] + objective_features + [dep_features, arr_features], dim=-1)
+            else:
+                combined = th.cat([cont_features, binary_emb, dep_features, arr_features], dim=-1)
+        
+        # Generate edge embeddings
+        edge_embeddings = self.edge_embedding(combined)
+        
+        # Store for pointer network
+        self._last_edge_embeddings = edge_embeddings
+        self._last_budget = budget
+        self._last_padding_mask = padding_mask
+        self._last_sequence_length = edge_embeddings.shape[1]
+        
+        # Return features for SB3
+        budget_reshaped = budget.reshape(batch_size, -1)
+        return th.cat([edge_embeddings.mean(dim=1), budget_reshaped], dim=-1)
+
 
 class PointerNetwork(nn.Module):
     """
@@ -535,19 +791,42 @@ def make_env():
     return env
 
 # Policy kwargs for your training setup
-policy_kwargs = dict(
-    features_extractor_class=PointerNetworkFeatureExtractor,
-    features_extractor_kwargs={
-        'edge_embedding_dim': 64,
-        'hidden_dim': 128,
-        'multiple_interdiction_attempts': env_params['multiple_interdiction_attempts'],
-        'attacker_strategy': env_params['attacker_strategy']
-    },
-    edge_embedding_dim=64,
-    hidden_dim=128,
-    net_arch=[128, 128],
-    activation_fn=nn.ReLU,
-)
+# Switch between PointerNetworkFeatureExtractor and GCNFeatureExtractor:
+# - PointerNetworkFeatureExtractor: Uses simple node embeddings
+# - GCNFeatureExtractor: Uses Graph Convolutional Network to learn node representations
+USE_GCN = True  # Set to False to use original PointerNetworkFeatureExtractor
+
+if USE_GCN:
+    policy_kwargs = dict(
+        features_extractor_class=GCNFeatureExtractor,
+        features_extractor_kwargs={
+            'edge_embedding_dim': 64,
+            'hidden_dim': 128,
+            'gcn_hidden_dim': 32,       # Hidden dimension for GCN layers
+            'num_gcn_layers': 2,         # Number of GCN message passing layers
+            'max_nodes': 500,            # Maximum number of nodes in graph (increased for safety)
+            'multiple_interdiction_attempts': env_params['multiple_interdiction_attempts'],
+            'attacker_strategy': env_params['attacker_strategy']
+        },
+        edge_embedding_dim=64,
+        hidden_dim=128,
+        net_arch=[128, 128],
+        activation_fn=nn.ReLU,
+    )
+else:
+    policy_kwargs = dict(
+        features_extractor_class=PointerNetworkFeatureExtractor,
+        features_extractor_kwargs={
+            'edge_embedding_dim': 64,
+            'hidden_dim': 128,
+            'multiple_interdiction_attempts': env_params['multiple_interdiction_attempts'],
+            'attacker_strategy': env_params['attacker_strategy']
+        },
+        edge_embedding_dim=64,
+        hidden_dim=128,
+        net_arch=[128, 128],
+        activation_fn=nn.ReLU,
+    )
 
 # Update your training setup to use MaskablePPO
 if __name__ == "__main__":
