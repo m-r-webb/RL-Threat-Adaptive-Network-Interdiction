@@ -537,7 +537,7 @@ class CustomEnv(gym.Env):
             target_indices = np.where(self.state['isolate_objective'][:self.num_both_edges] == 1)[0]
             target_edges = [self.both_edges[i] for i in target_indices]
             
-            if target_edges:
+            if target_edges:  #CLEAN THIS UP SO IT IS ONLY ONE-WAY
                 expr = grb.quicksum(self.flow_var[e] + self.flow_var[(e[1], e[0])] for e in target_edges)
                 self.maxflow_model.setObjectiveN(expr, index=1, priority=5, weight=1.0, name="max_isolate_flow")
 
@@ -1199,6 +1199,7 @@ class CustomEnv(gym.Env):
         # 3. Solve Max Flow for truly missing outcomes
         new_results_for_central = {}
         for outcome in outcomes_to_solve:
+            #print("Outcome: ", outcome)
             # Convert outcome to capacity dict
             capacity_dict = {}
             for idx, edge in enumerate(self.both_edges):
@@ -1218,11 +1219,13 @@ class CustomEnv(gym.Env):
                 objective = self._calculate_target_edge_flow(flows, 'isolate_objective')
             elif strategy_type == "divert":
                 from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
+                
                 to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
                 diverted_flow_from = self.reference_start_flows[0] - from_flow
-                diverted_flow_to = to_flow - self.reference_start_flows[1]
+                diverted_flow_to = max(0, to_flow - self.reference_start_flows[1])
                 objective = np.min([diverted_flow_from, diverted_flow_to])
-        
+                #print("From, To flows, Obj: ", from_flow, ", ", to_flow, ", ", objective)
+
             res = {
                 'objective': objective
             }
@@ -1353,7 +1356,7 @@ class CustomEnv(gym.Env):
             from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
             to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
             diverted_flow_from = self.reference_start_flows[0] - from_flow
-            diverted_flow_to = to_flow - self.reference_start_flows[1] 
+            diverted_flow_to = max(0, to_flow - self.reference_start_flows[1]) 
             objective = np.min([diverted_flow_from,diverted_flow_to])
             
             return objective, flows
