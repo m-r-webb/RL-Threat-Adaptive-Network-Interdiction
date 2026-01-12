@@ -1030,7 +1030,7 @@ class CustomEnv(gym.Env):
 
         # Validate action
         # Use mask_fn to validate action (unified logic)
-        action_mask = self.mask_fn(depth=1)
+        action_mask = self.mask_fn()
         
         # Check if action is valid:
         # 1. Must be within actual edges (not padding)
@@ -2005,7 +2005,7 @@ class CustomEnv(gym.Env):
         action_mask[list(incoming_edge_indices)] = True
         return(action_mask)
     
-    def mask_fn(self, depth=1):
+    def mask_fn(self):
         """
         Fully vectorized function using cached flow information.
         Maximum speed optimization.
@@ -2055,7 +2055,8 @@ class CustomEnv(gym.Env):
 
             valid_actions = (sufficient_budget & #has_capacity & 
                              has_probability & is_target &
-                             within_limit & has_flow & not_target)
+                             within_limit & has_flow & 
+                             not_target)
         else:
             has_flow = self.cached_flow_array[:self.num_interdictable] > 0
             valid_actions = (has_flow & 
@@ -2303,7 +2304,7 @@ class _RemoteEnvWorker:
                         pass
                 return final_objective, []
 
-            action_mask = self.env.mask_fn(depth=d)
+            action_mask = self.env.mask_fn()
 
             # restore
             self.env.state['budget'][0] = old_budget
@@ -2346,8 +2347,8 @@ class _RemoteEnvWorker:
                 costs = self.env.state['edge_costs'][valid_actions]
                 
                 # New Heuristic: (capacity * probability) + (self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[1]*(remaining_budget-cost))
-                max_edge_capacity = self.env.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[1]
-                heuristics = (caps * probs) + (max_edge_capacity * (rem_budget - costs))
+                max_benefit = max(caps * probs)
+                heuristics = (caps * probs) + (max_benefit * (rem_budget - costs))
                 
                 # Sort descending
                 sorted_indices = np.argsort(-heuristics)
@@ -2587,7 +2588,7 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
         
         self._cache_flow_array()
         
-        action_mask = self.mask_fn(depth = node.depth)
+        action_mask = self.mask_fn()
         valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
         
         # Restore state
