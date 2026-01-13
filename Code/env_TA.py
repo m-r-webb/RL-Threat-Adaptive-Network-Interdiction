@@ -967,8 +967,9 @@ class CustomEnv(gym.Env):
             # Try to find alternative path from this breakpoint
             path_edges = set(path_to_keep)
             current_node = breakpoint[1]
-            visited = {1} | {edge[1] for edge in path_to_keep}
             sink = self.super_sink_nodes[0]
+            nodes_to_avoid = {edge[1] for edge in path_to_avoid if edge[1] != sink}
+            visited = {1} | {edge[1] for edge in path_to_keep} | nodes_to_avoid
         
             stuck_count = 0
             max_stuck_attempts = 5  # Limit retries before choosing new breakpoint
@@ -999,11 +1000,25 @@ class CustomEnv(gym.Env):
                 
                     # Try restarting from the breakpoint
                     current_node = breakpoint[1]
-                    visited = {1} | {edge[1] for edge in path_to_keep}
+                    visited = {1} | {edge[1] for edge in path_to_keep} | nodes_to_avoid
                     path_edges = set(path_to_keep)
                     continue
         
-                selected_edge = random.choice(valid_edges)
+                if current_node == breakpoint[1]:
+                    # Select edge with highest capacity for the first step
+                    max_cap = -1
+                    best_edges = []
+                    for edge in valid_edges:
+                        cap = self.edges_episode[edge].capacity
+                        if cap > max_cap:
+                            max_cap = cap
+                            best_edges = [edge]
+                        elif cap == max_cap:
+                            best_edges.append(edge)
+                    selected_edge = random.choice(best_edges)
+                else:
+                    selected_edge = random.choice(valid_edges)
+
                 path_edges.add(selected_edge)
                 visited.add(selected_edge[1])
                 current_node = selected_edge[1]
