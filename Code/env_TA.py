@@ -2348,7 +2348,8 @@ class _RemoteEnvWorker:
                 
                 # New Heuristic: (capacity * probability) + (self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[1]*(remaining_budget-cost))
                 max_benefit = max(caps * probs)
-                heuristics = (caps * probs) + (max_benefit * (rem_budget - costs))
+                future_moves = np.floor((rem_budget - costs) / self.min_edge_cost)
+                heuristics = (caps * probs) + (max_benefit * future_moves)
                 
                 # Sort descending
                 sorted_indices = np.argsort(-heuristics)
