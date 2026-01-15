@@ -920,14 +920,14 @@ class CustomEnv(gym.Env):
     def _extract_max_flow_path(self, flows):
         """Extract the path with maximum flow from flows dictionary."""
         from_path = set()
-        current_node = 1
-        sink = self.super_sink_nodes[0]
+        current_node = self.super_sink_nodes[0]
+        source = 1
     
-        while current_node != sink:
-            outgoing_edges = self.edge_groups[current_node]['out']
-            next_edge = max(outgoing_edges, key=lambda e: flows.get(e, 0)+ random.random() * 1e-6)
-            from_path.add(next_edge)
-            current_node = next_edge[1]
+        while current_node != source:
+            incoming_edges = self.edge_groups[current_node]['in']
+            prev_edge = max(incoming_edges, key=lambda e: flows.get(e, 0)+ random.random() * 1e-6)
+            from_path.add(prev_edge)
+            current_node = prev_edge[0]
     
         return from_path
 
@@ -992,7 +992,7 @@ class CustomEnv(gym.Env):
                 
                         valid_edges.append(edge)
             
-                if not valid_edges or len(visited) > self.MAX_PATH_LENGTH + len(path_to_keep):
+                if not valid_edges or len(path_edges) >= len(max_flow_path) + self.MAX_PATH_LENGTH:
                     stuck_count += 1
                     if stuck_count >= max_stuck_attempts:
                         # This breakpoint doesn't work, try a new one
@@ -1009,7 +1009,11 @@ class CustomEnv(gym.Env):
                     max_cap = -1
                     best_edges = []
                     for edge in valid_edges:
-                        cap = self.edges_episode[edge].capacity
+                        if edge in self.edges_episode:
+                            cap = self.edges_episode[edge].capacity
+                        else:
+                            cap = self.edges_episode[(edge[1], edge[0])].capacity
+
                         if cap > max_cap:
                             max_cap = cap
                             best_edges = [edge]
@@ -2355,7 +2359,7 @@ class _RemoteEnvWorker:
             # Update alpha with current node value
             alpha = max(alpha, best_reward)
 
-            if self.attacker_strategy in ['zero_sum', 'isolate']:
+            if self.attacker_strategy in ['zero_sum', 'isolate', 'divert']:
                 # Heuristic sorting for pruning
                 caps = self.env.state['edge_capacity'][valid_actions]
                 probs = self.env.state['edge_interdiction_probability'][valid_actions]
@@ -2372,8 +2376,8 @@ class _RemoteEnvWorker:
                 heuristics = heuristics[sorted_indices]
             
             for i, action in enumerate(valid_actions):
-                # Pruning for zero_sum
-                if self.attacker_strategy in ['zero_sum', 'isolate']:
+                # Pruning for zero_sum, isolate, divert
+                if self.attacker_strategy in ['zero_sum', 'isolate', 'divert']:
                      # Pruning condition: 
                      # current obj value - (current remaining budget * heuristic) > current best objective value
                      # -final_objective - (rem_budget * heuristics[i]) > -alpha
