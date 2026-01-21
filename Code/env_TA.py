@@ -568,8 +568,8 @@ class CustomEnv(gym.Env):
             
             # Divert To
             to_edges = self._extract_directed_path_edges('divert_to_objective')
-            from_edge_set = set(from_edges)
-            to_edges = [e for e in to_edges if e not in from_edge_set]
+            #from_edge_set = set(from_edges)
+            #to_edges = [e for e in to_edges if e not in from_edge_set]
             
             if from_edges and to_edges:
                 # 1. Define z_from (min flow on from path)
@@ -879,7 +879,7 @@ class CustomEnv(gym.Env):
         from_path = self._extract_max_flow_path(flows)
 
         # Find alternative path avoiding max flow path
-        to_path = self._find_alternative_path(from_path)
+        to_path = self._find_best_alternative_path(from_path)
 
         # Convert paths to objective arrays
         divert_from = np.zeros(self.max_num_edges, dtype=int)
@@ -931,7 +931,50 @@ class CustomEnv(gym.Env):
     
         return from_path
 
-    def _find_alternative_path(self, max_flow_edges):
+    def _find_best_alternative_path(self, max_flow_edges, num_samples=10):
+        """Find multiple alternative paths and select the one with the widest bottleneck."""
+        candidates = []
+        
+        # Try to find unique valid alternative paths
+        for _ in range(num_samples):
+            alt_path_set = self._find_single_alternative_path(max_flow_edges)
+            
+            # Check if it's just the original path (failure case)
+            # Note: _find_single_alternative_path returns a set of edges
+            is_original = (alt_path_set == set(max_flow_edges))
+            
+            if not is_original:
+                # Calculate bottleneck
+                min_cap = float('inf')
+                for edge in alt_path_set:
+                    # Only consider edges NOT in the max flow path for bottleneck calculation
+                    if edge in max_flow_edges or (edge[1], edge[0]) in max_flow_edges:
+                        continue
+
+                    # Ignore edges connected to supersink
+                    if edge[1] == self.super_sink_nodes[0] or edge[0] == self.super_sink_nodes[0]:
+                        continue
+
+                    # Find capacity for this edge
+                    idx = self.edge_to_index.get(edge)
+                    if idx is None:
+                        idx = self.edge_to_index.get((edge[1], edge[0]))
+                    
+                    if idx is not None:
+                        cap = self.state['edge_capacity'][idx]
+                        if cap < min_cap:
+                            min_cap = cap
+                
+                candidates.append((min_cap, alt_path_set))
+        
+        if not candidates:
+            return self._find_single_alternative_path(max_flow_edges)
+        
+        # Sort by bottleneck (descending)
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+
+    def _find_single_alternative_path(self, max_flow_edges):
         """Find an alternative path avoiding specified edges."""
         adj = {}
         for u, v in max_flow_edges:
@@ -1004,24 +1047,7 @@ class CustomEnv(gym.Env):
                     path_edges = set(path_to_keep)
                     continue
         
-                if current_node == breakpoint[1]:
-                    # Select edge with highest capacity for the first step
-                    max_cap = -1
-                    best_edges = []
-                    for edge in valid_edges:
-                        if edge in self.edges_episode:
-                            cap = self.edges_episode[edge].capacity
-                        else:
-                            cap = self.edges_episode[(edge[1], edge[0])].capacity
-
-                        if cap > max_cap:
-                            max_cap = cap
-                            best_edges = [edge]
-                        elif cap == max_cap:
-                            best_edges.append(edge)
-                    selected_edge = random.choice(best_edges)
-                else:
-                    selected_edge = random.choice(valid_edges)
+                selected_edge = random.choice(valid_edges)
 
                 path_edges.add(selected_edge)
                 visited.add(selected_edge[1])
@@ -1240,7 +1266,7 @@ class CustomEnv(gym.Env):
                 from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
                 
                 to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
-                diverted_flow_from = self.reference_start_flows[0] - from_flow
+                diverted_flow_from = max(0,self.reference_start_flows[0] - from_flow)
                 diverted_flow_to = max(0, to_flow - self.reference_start_flows[1])
                 objective = np.min([diverted_flow_from, diverted_flow_to])
                 #print("From, To flows, Obj: ", from_flow, ", ", to_flow, ", ", objective)
@@ -1374,7 +1400,7 @@ class CustomEnv(gym.Env):
             _, flows = self.solve_max_flow(routing_assumption = 'divert')
             from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
             to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
-            diverted_flow_from = self.reference_start_flows[0] - from_flow
+            diverted_flow_from = max(0, self.reference_start_flows[0] - from_flow)
             diverted_flow_to = max(0, to_flow - self.reference_start_flows[1]) 
             objective = np.min([diverted_flow_from,diverted_flow_to])
             
@@ -1390,10 +1416,10 @@ class CustomEnv(gym.Env):
         # Calculate reward based on flow diversion success
         diverted_flow, self.reference_flows = self._calculate_divert_objective_and_flows()
         
-        reward = (diverted_flow - self.last_obj) / self.reference_budget
+        reward = (diverted_flow - self.last_obj) / self.reference_start_flows[0] #reference_budget  
         self.last_obj = diverted_flow
         if reward == 0:
-            reward = self.PENALTY_VALUE
+            reward = self.PENALTY_VALUE / self.reference_budget
         return reward
 
     def _calculate_target_path_flow(self, flows, objective_key):
