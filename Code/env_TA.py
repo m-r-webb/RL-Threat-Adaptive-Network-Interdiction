@@ -537,23 +537,21 @@ class CustomEnv(gym.Env):
                 self.maxflow_model.setObjectiveN(expr, index=1, priority=5, weight=1.0, name="max_isolate_flow")
 
         elif routing_assumption == "canalize":
-            # Secondary: Maximize minimum flow along canalized edges (Priority 5)
-            target_indices = np.where(self.state['canalize_objective'][:self.num_both_edges] == 1)[0]
-            target_edges = [self.both_edges[i] for i in target_indices]
+            # Secondary: Minimize the minimum flow among all the canalize objective edges of the extracted_directed_path_edges (Priority 5)
+            target_edges = self._extract_directed_path_edges('canalize_objective')
             
             if target_edges:
                 # Aux variable z representing min flow
                 z = self.maxflow_model.addVar(vtype=grb.GRB.CONTINUOUS, name="min_canalize_flow")
                 self.aux_vars.append(z)
                 
-                # Constraints: z <= flow_e
-                constrs = self.maxflow_model.addConstrs(
-                    (z <= self.flow_var[e] + self.flow_var[(e[1], e[0])] for e in target_edges),
-                    name="min_flow_constr"
-                )
-                self.aux_constrs.extend(constrs.values())
+                # Use General Constraint Min: z = min(flows)
+                path_flow_vars = [self.flow_var[e] for e in target_edges]
+                gc = self.maxflow_model.addGenConstrMin(z, path_flow_vars, name="min_flow_gc")
+                self.aux_constrs.append(gc)
                 
-                self.maxflow_model.setObjectiveN(z, index=1, priority=5, weight=1.0, name="max_min_canalize")
+                # Minimize z (since ModelSense is MAXIMIZE, weight=-1.0)
+                self.maxflow_model.setObjectiveN(z, index=1, priority=5, weight=-1.0, name="min_min_canalize")
 
         elif routing_assumption == "divert":
             # Combined Objective: Maximize max(z_from - flow_to_i) for independent edges
@@ -686,7 +684,9 @@ class CustomEnv(gym.Env):
             if self.attacker_strategy == 'zero_sum':
                 self.reference_obj, self.reference_flows = self._compute_objective_and_flows()
             elif self.attacker_strategy == 'canalize':
-                self.reference_obj, self.reference_flows = self._calculate_canalize_objective_and_flows()
+                target_path_flow, self.reference_flows = self._calculate_canalize_objective_and_flows()
+                self.reference_start_flow = target_path_flow
+                self.reference_obj = 0
             elif self.attacker_strategy == 'isolate':
                 self.reference_obj, self.reference_flows = self._calculate_isolate_objective_and_flows()
             elif self.attacker_strategy == 'divert':
@@ -812,16 +812,103 @@ class CustomEnv(gym.Env):
 
     def _add_canalize_components(self, base_state):
         """Add canalize-specific objective to state."""
-        path_edges = self._find_simple_path()
-        canalize_objective = np.zeros(self.max_num_edges, dtype=int)
-        
-        # Create boolean mask for path edges
-        edge_in_path = np.array([edge in path_edges or (edge[1], edge[0]) in path_edges for edge in self.both_edges], dtype=bool)
+        # Temporarily set state so solve_max_flow can read capacities
+        self.state = base_state
 
-        # Vectorized assignment
+        # 1. Determine max flow path
+        _, flows = self.solve_max_flow()
+        max_flow_edge_set = self._extract_max_flow_path(flows)
+        
+        # 2. Identify nodes to avoid (all intermediate nodes on max flow path)
+        avoid_nodes = set()
+        for u, v in max_flow_edge_set:
+            if u != self.super_source_nodes[0] and u != self.super_sink_nodes[0]:
+                avoid_nodes.add(u)
+            if v != self.super_source_nodes[0] and v != self.super_sink_nodes[0]:
+                avoid_nodes.add(v)
+        
+        # 3. Generate alternative paths
+        candidates = []
+        max_len = len(max_flow_edge_set) + self.MAX_PATH_LENGTH
+        
+        # Try to find valid alternative paths (try 50 times)
+        for _ in range(50):
+            if len(candidates) >= 10: break
+            
+            alt_path = self._find_random_path_from_supersource(avoid_nodes, max_len)
+            if alt_path:
+                candidates.append(alt_path)
+
+        # Fallback: if no disjoint paths found, use max_flow_path
+        if not candidates:
+             candidates.append(max_flow_edge_set)
+
+        # 4. Choose the best alternative path
+        best_path = None
+        # Metrics: (bottleneck (maximize), total_flow_per_edge (minimize))
+        best_metrics = (-1.0, -float('inf')) 
+        
+        for path in candidates:
+            # Calculate bottleneck and total flow
+            min_cap = float('inf')
+            sum_flow = 0.0
+            
+            for edge in path:
+                 # Capacity
+                 idx = self.edge_to_index.get(edge)
+                 if idx is None: idx = self.edge_to_index.get((edge[1], edge[0]))
+                 if idx is not None:
+                     cap = self.state['edge_capacity'][idx]
+                     if cap < min_cap: min_cap = cap
+                 
+                 # Current Flow (from max flow solution)
+                 f = flows.get(edge, 0)
+                 sum_flow += f
+            
+            avg_flow = sum_flow / len(path) if len(path) > 0 else 0
+            
+            # Metric: Max bottleneck, then Min avg_flow
+            current_metrics = (min_cap, -avg_flow)
+
+            if best_path is None or current_metrics > best_metrics:
+                best_metrics = current_metrics
+                best_path = path
+
+        # 5. Set objective
+        canalize_objective = np.zeros(self.max_num_edges, dtype=int)
+        edge_in_path = np.array([edge in best_path or (edge[1], edge[0]) in best_path for edge in self.both_edges], dtype=bool)
         canalize_objective[:len(edge_in_path)] = edge_in_path.astype(int)
 
         return {**base_state, 'canalize_objective': canalize_objective}
+
+    def _find_random_path_from_supersource(self, avoid_nodes, max_length):
+        """Find a random path from SuperSource to SuperSink avoiding specific nodes."""
+        path_edges = []
+        current_node = self.super_source_nodes[0]
+        visited = {current_node} | avoid_nodes
+        sink = self.super_sink_nodes[0]
+        
+        while current_node != sink:
+            valid_edges = []
+            if current_node in self.edge_groups:
+                for edge in self.edge_groups[current_node]['out']:
+                    neighbor = edge[1]
+                    if neighbor not in visited and neighbor >= current_node - 1:
+                         valid_edges.append(edge)
+            
+            if not valid_edges:
+                return None
+            
+            # Choose next
+            selected_edge = random.choice(valid_edges)
+            path_edges.append(selected_edge)
+            visited.add(selected_edge[1])
+            current_node = selected_edge[1]
+            
+            if len(path_edges) > max_length:
+                return None
+                
+        return set(path_edges)
 
     def _add_isolate_components(self, base_state):
         """Add isolate-specific objective to state (edge-based, sink-connected only)."""
@@ -1262,7 +1349,8 @@ class CustomEnv(gym.Env):
             if strategy_type == "zero_sum":
                 objective = obj
             elif strategy_type == "canalize":                
-                objective = self._calculate_target_path_flow(flows, 'canalize_objective') 
+                target_flow = self._calculate_target_path_flow(flows, 'canalize_objective')
+                objective = max(0, target_flow - getattr(self, 'reference_start_flow', 0))
             elif strategy_type == "isolate":
                 objective = self._calculate_target_edge_flow(flows, 'isolate_objective')
             elif strategy_type == "divert":
@@ -1355,7 +1443,8 @@ class CustomEnv(gym.Env):
         if self.deterministic_outcomes:
             _, flows = self.solve_max_flow(routing_assumption = 'canalize')
             target_path_flow = self._calculate_target_path_flow(flows, 'canalize_objective')
-            return target_path_flow, flows
+            objective = max(0, target_path_flow - getattr(self, 'reference_start_flow', 0))
+            return objective, flows
         else:
             # Stochastic calculation - returns mean objective directly
             objective, mean_flows = self._calculate_stochastic_objective_and_flow('canalize')
@@ -1875,7 +1964,15 @@ class CustomEnv(gym.Env):
         if self.attacker_strategy == 'zero_sum':
             self.reference_obj, self.reference_flows = self._compute_objective_and_flows()
         elif self.attacker_strategy == 'canalize':
-            self.reference_obj, self.reference_flows = self._calculate_canalize_objective_and_flows()
+            # Use original method to get raw flow without subtraction to initialize start flow
+            # We temporarily bypass the objective subtraction logic effectively by checking if attribute exists
+            # but since self.reference_start_flow is not set on self yet, it defaults to 0 in _calculate...
+            
+            # Recalculate reference flow based on CURRENT state (loaded state)
+            _, flows = self.solve_max_flow(routing_assumption = 'canalize')
+            self.reference_start_flow = self._calculate_target_path_flow(flows, 'canalize_objective')
+            self.reference_obj = 0
+            self.reference_flows = flows
         elif self.attacker_strategy == 'isolate':
             self.reference_obj, self.reference_flows = self._calculate_isolate_objective_and_flows()
         elif self.attacker_strategy == 'divert':
