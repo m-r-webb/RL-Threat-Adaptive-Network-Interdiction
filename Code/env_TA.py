@@ -2,11 +2,8 @@
 
 # Import all required packages
 import os
-#os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Disable oneDNN messages
-#os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'   # Suppress most logs (including CUDA errors)
 os.environ["RAY_DISABLE_USAGE_STATS"] = "1"
 os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
-
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
@@ -20,8 +17,6 @@ from gymnasium import spaces
 import numpy as np
 import copy, random
 from tqdm import tqdm
-#import tensorflow as tf
-#tf.get_logger().setLevel('ERROR')          # Optional: Suppress Python-
 
 from collections import defaultdict, Counter
 from itertools import product
@@ -92,8 +87,8 @@ class CustomEnv(gym.Env):
                  budget_range=(0, 100), edge_capacity_range=(0, 100), 
                  edge_cost_range=(0, 10), training_budget_range=(5, 10), 
                  training_edge_capacity_range=(30, 60), training_edge_cost_range=(3, 5),
-                 max_interdiction_attempts=10, max_source_flow=5, 
-                 max_sink_need=5, penalty_value=-0.1, 
+                 max_interdiction_attempts=10, max_source_flow=3, 
+                 max_sink_need=3, penalty_value=-0.1, 
                  sample_size=1000, max_path_length = 6,
                  max_num_edges=500, 
                  max_num_nodes=250, old_routing="none", outcome_memo_actor=None, outcome_memo_actors=None):
@@ -639,66 +634,74 @@ class CustomEnv(gym.Env):
         if seed is not None:
             self._set_random_seeds(seed)
 
-        # Generate network parameters
-        # Sample edge capacities
-        raw_capacities = self.base_spaces['edge_capacity'].sample()[:self.num_both_edges]
-        edge_capacities = ((raw_capacities / 100.0) * (self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[1]-self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[0]) + self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[0]).astype(int)
-        if self.MAX_SOURCE_FLOW is not None:
-            edge_capacities[self.super_source_out_indices] = self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[0] * np.random.uniform(0.5, self.MAX_SOURCE_FLOW)
-        if self.MAX_SINK_NEED is not None:
-            edge_capacities[self.super_sink_in_indices] = self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[0] * np.random.uniform(0.5, self.MAX_SINK_NEED)
-        
-        # Sample edge costs and interdiction probabilities
-        raw_costs = self.base_spaces['edge_costs'].sample()[:self.num_both_edges]
-        edge_costs = (((raw_costs) / 10) * (self.DEFAULT_TRAINING_EDGE_COST_RANGE[1]-self.DEFAULT_TRAINING_EDGE_COST_RANGE[0]) + self.DEFAULT_TRAINING_EDGE_COST_RANGE[0]).astype(int)
-        self.min_edge_cost = np.min(edge_costs)
-        
-        #Sample interdiction probabilities based on deterministic setting
-        if self.deterministic_outcomes:
-            edge_interdiction_probabilities = np.ones(self.num_both_edges, dtype=np.float32)
-        else:
-            probs = self.base_spaces['edge_interdiction_probability'].sample()[:self.num_both_edges]
-            # Round to 0.25 increments for consistency
-            sample_rounded = np.round(probs * 20) #Trying replacing 4 with 20 to reduce symmetrical answers
-            edge_interdiction_probabilities = (sample_rounded.astype(float) / 20)
-        edge_interdiction_probabilities[self.noninterdictable_indices]=0
-    
-        # Sample budget based on initial budget setting."""
-        if self.initial_budget is not None:
-            remaining_budget = np.array([self.initial_budget], dtype=int)
-        else:
-            budget_sample = self.base_spaces['budget'].sample()
-            # Map from 0-100 to training budget range
-            budget_range = self.DEFAULT_TRAINING_BUDGET_RANGE
-            scaled_budget = ((budget_range[1] - budget_range[0]) * budget_sample[0] / 100) + budget_range[0]
-            remaining_budget = np.array([round(scaled_budget)], dtype=int)
+        while True:
+            # Generate network parameters
+            # Sample edge capacities
+            raw_capacities = self.base_spaces['edge_capacity'].sample()[:self.num_both_edges]
+            edge_capacities = ((raw_capacities / 100.0) * (self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[1]-self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[0]) + self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[0]).astype(int)
+            if self.MAX_SOURCE_FLOW is not None:
+                edge_capacities[self.super_source_out_indices] = self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[0] * np.random.uniform(0.85, self.MAX_SOURCE_FLOW)
+            if self.MAX_SINK_NEED is not None:
+                edge_capacities[self.super_sink_in_indices] = self.DEFAULT_TRAINING_EDGE_CAPACITY_RANGE[0] * np.random.uniform(0.85, self.MAX_SINK_NEED)
             
-        network_params = {
-            'capacities': edge_capacities, 
-            'costs': edge_costs,          
-            'probabilities': edge_interdiction_probabilities,
-            'budget': remaining_budget
-        }
+            # Sample edge costs and interdiction probabilities
+            raw_costs = self.base_spaces['edge_costs'].sample()[:self.num_both_edges]
+            edge_costs = (((raw_costs) / 10) * (self.DEFAULT_TRAINING_EDGE_COST_RANGE[1]-self.DEFAULT_TRAINING_EDGE_COST_RANGE[0]) + self.DEFAULT_TRAINING_EDGE_COST_RANGE[0]).astype(int)
+            self.min_edge_cost = np.min(edge_costs)
+            
+            #Sample interdiction probabilities based on deterministic setting
+            if self.deterministic_outcomes:
+                edge_interdiction_probabilities = np.ones(self.num_both_edges, dtype=np.float32)
+            else:
+                probs = self.base_spaces['edge_interdiction_probability'].sample()[:self.num_both_edges]
+                # Round to 0.25 increments for consistency
+                sample_rounded = np.round(probs * 20) #Trying replacing 4 with 20 to reduce symmetrical answers
+                edge_interdiction_probabilities = (sample_rounded.astype(float) / 20)
+            edge_interdiction_probabilities[self.noninterdictable_indices]=0
+        
+            # Sample budget based on initial budget setting."""
+            if self.initial_budget is not None:
+                remaining_budget = np.array([self.initial_budget], dtype=int)
+            else:
+                budget_sample = self.base_spaces['budget'].sample()
+                # Map from 0-100 to training budget range
+                budget_range = self.DEFAULT_TRAINING_BUDGET_RANGE
+                scaled_budget = ((budget_range[1] - budget_range[0]) * budget_sample[0] / 100) + budget_range[0]
+                remaining_budget = np.array([round(scaled_budget)], dtype=int)
+                
+            network_params = {
+                'capacities': edge_capacities, 
+                'costs': edge_costs,          
+                'probabilities': edge_interdiction_probabilities,
+                'budget': remaining_budget
+            }
 
-        # Create base state
-        base_state = self._create_base_state(network_params)
+            # Create base state
+            base_state = self._create_base_state(network_params)
 
-        # Add strategy-specific components
-        self.state = self._add_strategy_components(base_state)
+            # Add strategy-specific components
+            self.state = self._add_strategy_components(base_state)
 
-        # Calculate reference objective value for the attacker's strategy
-        if self.attacker_strategy == 'zero_sum':
-            self.reference_obj, self.reference_flows = self._compute_objective_and_flows()
-        elif self.attacker_strategy == 'canalize':
-            self.reference_obj, self.reference_flows = self._calculate_canalize_objective_and_flows()
-        elif self.attacker_strategy == 'isolate':
-            self.reference_obj, self.reference_flows = self._calculate_isolate_objective_and_flows()
-        elif self.attacker_strategy == 'divert':
-            _, self.reference_flows = self.solve_max_flow(routing_assumption = 'divert')
-            from_flow = self._calculate_target_path_flow(self.reference_flows, 'divert_from_objective')
-            to_flow = self._calculate_target_path_flow(self.reference_flows, 'divert_to_objective')
-            self.reference_start_flows = (from_flow, to_flow)
-            self.reference_obj = 0
+            # Calculate reference objective value for the attacker's strategy
+            if self.attacker_strategy == 'zero_sum':
+                self.reference_obj, self.reference_flows = self._compute_objective_and_flows()
+            elif self.attacker_strategy == 'canalize':
+                self.reference_obj, self.reference_flows = self._calculate_canalize_objective_and_flows()
+            elif self.attacker_strategy == 'isolate':
+                self.reference_obj, self.reference_flows = self._calculate_isolate_objective_and_flows()
+            elif self.attacker_strategy == 'divert':
+                _, self.reference_flows = self.solve_max_flow(routing_assumption = 'divert')
+                from_flow = self._calculate_target_path_flow(self.reference_flows, 'divert_from_objective')
+                to_flow = self._calculate_target_path_flow(self.reference_flows, 'divert_to_objective')
+                self.reference_start_flows = (from_flow, to_flow)
+                self.reference_obj = 0
+                
+                # Check if restart is needed for divert strategy
+                if self.reference_start_flows[0] == 0:
+                    continue
+            
+            # If we made it here, the environment is valid
+            break
         
         self.last_obj = self.reference_obj
         self.reference_budget = remaining_budget[0]
@@ -1832,126 +1835,6 @@ class CustomEnv(gym.Env):
         interdicted_quantities = [k for e, k in interdiction_decisions]
 
         return (self.optimal_stochastic_model_IM.objVal, interdicted_edges, interdicted_quantities)
-
-    def solve_backward_induction_OLD(self, verbose=False):  #REMOVE _OLD
-        """
-        Solve the optimal interdiction strategy for attacker using backward induction.
-        This method finds the optimal interdictions for a particular attacker strategy.
-    
-        Returns:
-            tuple: (optimal_objective_value, optimal_interdiction_sequence)
-        """
-        # Calculate minimum edge cost for depth estimation (only from real edges)
-        real_edge_costs = self.state['edge_costs'][:self.num_both_edges]
-        self.min_edge_cost = min(real_edge_costs[real_edge_costs > 0], default=float('inf'))
-        if self.min_edge_cost == float('inf'):
-            self.min_edge_cost = 1  # Fallback
-    
-        # Estimate total states
-        max_budget = self.state['budget'][0]
-        budget_levels = max_budget // self.min_edge_cost
-        estimated_states = self.num_both_edges ** budget_levels  # Use actual_num_edges, not max
-        update_rate = max(200, 1)
-        memo = {}
-
-        states_processed = 0
-        pbar = tqdm(total=estimated_states, desc="DP States", unit=" states", disable=not verbose)
-
-        def update_progress(num_states_processed):
-            # Update progress every 100 states
-            nonlocal states_processed
-            states_processed += num_states_processed
-            if states_processed>=update_rate:
-                pbar.update(states_processed)
-                pbar.set_postfix({'Memo': len(memo)})
-                states_processed = 0
-            return
-        
-        def dp_solve(remaining_budget, interdicted_state, depth=0):
-            """Dynamic programming recursive function for backward induction."""           
-            # Initialize the dynamic programming table
-            state_key = interdicted_state[:self.num_both_edges].tobytes()
-        
-            # Check if we've already solved this state
-            if state_key in memo:
-                update_progress(self.num_both_edges**(budget_levels-depth))
-                return memo[state_key]
-
-            old_budget = self.state['budget'][0]
-            old_interdicted = self.state['edge_interdicted'].copy()  # Only copy this array
-    
-            self.state['budget'][0] = remaining_budget
-            self.state['edge_interdicted'][:] = interdicted_state            
-            
-            if self.attacker_strategy == "zero_sum":
-                final_objective, self.reference_flows = self._compute_objective_and_flows()
-                final_objective = -final_objective
-            elif self.attacker_strategy == 'canalize':
-                final_objective, self.reference_flows = self._calculate_canalize_objective_and_flows()
-            elif self.attacker_strategy == 'isolate':
-                final_objective, self.reference_flows = self._calculate_isolate_objective_and_flows()
-                final_objective = -final_objective
-            elif self.attacker_strategy == 'divert':
-                final_objective, self.reference_flows = self._calculate_divert_objective_and_flows()
-                
-            #self.state = old_state
-            self.state['budget'][0] = old_budget
-            self.state['edge_interdicted'][:] = old_interdicted
-            
-            # Base case: no more budget or maximum depth reached
-            if remaining_budget < self.min_edge_cost or depth >= 20:
-                               
-                memo[state_key] = (final_objective, [])
-                update_progress(self.num_both_edges**(budget_levels-depth))
-                return final_objective, []
-       
-            # Find all valid actions from current state
-            action_mask = self.mask_fn()
-            valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
-            num_invalid_actions = np.where(action_mask[:self.num_both_edges] == 0)[0].shape[0]
-            update_progress((self.num_both_edges**(budget_levels-(depth+1)))*num_invalid_actions)
-        
-            # If no valid actions, evaluate terminal state
-            if len(valid_actions)==0:
-                memo[state_key] = (final_objective, [])
-                update_progress(self.num_both_edges**(budget_levels-depth))
-                return final_objective, []
-        
-            # Evaluate each possible action
-            best_reward = -float('inf')
-            best_sequence = []
-        
-            for action in valid_actions:
-                # Create new state after taking this action
-                new_interdicted_state = interdicted_state.copy()
-                new_interdicted_state[action] += 1
-                new_budget = remaining_budget - self.state['edge_costs'][action]
-            
-                # Recursively solve for the remaining problem
-                future_reward, future_sequence = dp_solve(new_budget, new_interdicted_state, depth + 1)
-            
-                # Update best solution if this is better
-                if future_reward > best_reward:
-                    best_reward = future_reward
-                    best_sequence = [action] + future_sequence
-        
-            memo[state_key] = (best_reward, best_sequence)
-            return best_reward, best_sequence
-        
-        # Start the backward induction from current state
-        initial_budget = self.state['budget'][0]
-        initial_interdicted_state = self.state['edge_interdicted'].copy()
-    
-        optimal_reward, optimal_sequence = dp_solve(initial_budget, initial_interdicted_state)
-        pbar.update(states_processed)        
-        pbar.close()
-        
-        if self.attacker_strategy == "zero_sum" or self.attacker_strategy == 'isolate':
-            optimal_reward = -optimal_reward
-        
-        optimal_actions = [self.both_edges[idx] for idx in optimal_sequence]
-
-        return optimal_reward, optimal_actions
 
     def load_network_from_state(self, seed, state):
         """Reset the environment to initial state and return observation."""
