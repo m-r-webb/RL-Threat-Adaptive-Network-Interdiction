@@ -566,7 +566,7 @@ class CustomEnv(gym.Env):
             
             if from_edges and to_edges:
                 # 1. Define z_from (min flow on from path)
-                z_from = self.maxflow_model.addVar(vtype=grb.GRB.CONTINUOUS, name="min_from_flow")
+                z_from = self.maxflow_model.addVar(lb=0, vtype=grb.GRB.CONTINUOUS, name="min_from_flow")
                 self.aux_vars.append(z_from)
                 
                 constrs = self.maxflow_model.addConstrs(
