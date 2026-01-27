@@ -554,58 +554,87 @@ class CustomEnv(gym.Env):
                 self.maxflow_model.setObjectiveN(z, index=1, priority=5, weight=-1.0, name="min_min_canalize")
 
         elif routing_assumption == "divert":
-            # Combined Objective: Maximize max(z_from - flow_to_i) for independent edges
-            
-            # Divert From
+            # Identify Edge Sets
             from_edges = self._extract_directed_path_edges('divert_from_objective')
-            
-            # Divert To
             to_edges = self._extract_directed_path_edges('divert_to_objective')
-            #from_edge_set = set(from_edges)
-            #to_edges = [e for e in to_edges if e not in from_edge_set]
-            
-            if from_edges and to_edges:
-                # 1. Define z_from (min flow on from path)
-                z_from = self.maxflow_model.addVar(lb=0, vtype=grb.GRB.CONTINUOUS, name="min_from_flow")
-                self.aux_vars.append(z_from)
-                
-                constrs = self.maxflow_model.addConstrs(
-                    (z_from <= self.flow_var[e] for e in from_edges),
-                    name="min_from_constr"
-                )
-                self.aux_constrs.extend(constrs.values())
 
-                # 2. Define differences: diff_i = z_from - flow_to_i
-                diff_vars = []
-                for i, e in enumerate(to_edges):
-                    diff_i = self.maxflow_model.addVar(lb=-grb.GRB.INFINITY, vtype=grb.GRB.CONTINUOUS, name=f"diff_{i}")
-                    self.aux_vars.append(diff_i)
+            # Determine Phase based on existence of reference flows
+            if hasattr(self, 'reference_start_flows') and self.reference_start_flows is not None:
+                # INTERDICTION PHASE: Minimize min(A - Min(F), Min(T) - B)
+                A = self.reference_start_flows[0] # Reference min flow on 'from' path
+                B = self.reference_start_flows[1] # Reference min flow on 'to' path
+                
+                if from_edges and to_edges:
+                    # Define z_from = Min(set F)
+                    z_from = self.maxflow_model.addVar(vtype=grb.GRB.CONTINUOUS, name="z_from_F")
+                    self.aux_vars.append(z_from)
+                    path_flow_vars_from = [self.flow_var[e] for e in from_edges]
+                    gc_from = self.maxflow_model.addGenConstrMin(z_from, path_flow_vars_from, name="gc_min_F")
+                    self.aux_constrs.append(gc_from)
+
+                    # Define z_to = Min(set T)
+                    z_to = self.maxflow_model.addVar(vtype=grb.GRB.CONTINUOUS, name="z_to_T")
+                    self.aux_vars.append(z_to)
+                    path_flow_vars_to = [self.flow_var[e] for e in to_edges]
+                    gc_to = self.maxflow_model.addGenConstrMin(z_to, path_flow_vars_to, name="gc_min_T")
+                    self.aux_constrs.append(gc_to)
+
+                    # Terms: term1 = A - z_from, term2 = z_to - B
+                    term1 = self.maxflow_model.addVar(lb=-grb.GRB.INFINITY, vtype=grb.GRB.CONTINUOUS, name="term1")
+                    term2 = self.maxflow_model.addVar(lb=-grb.GRB.INFINITY, vtype=grb.GRB.CONTINUOUS, name="term2")
+                    self.aux_vars.extend([term1, term2])
+
+                    c1 = self.maxflow_model.addConstr(term1 == A - z_from, name="c_term1")
+                    c2 = self.maxflow_model.addConstr(term2 == z_to - B, name="c_term2")
+                    self.aux_constrs.extend([c1, c2])
+
+                    # Objective: Minimize min(term1, term2) -> Weight -1.0
+                    obj_divert = self.maxflow_model.addVar(lb=-grb.GRB.INFINITY, vtype=grb.GRB.CONTINUOUS, name="obj_divert")
+                    self.aux_vars.append(obj_divert)
+
+                    gc_obj = self.maxflow_model.addGenConstrMin(obj_divert, [term1, term2], name="gc_obj_divert")
+                    self.aux_constrs.append(gc_obj)
+
+                    self.maxflow_model.setObjectiveN(obj_divert, index=2, priority=5, weight=-1.0, name="min_divert_metric")
+
+            else:
+                # INITIALIZATION PHASE: Maximize (Min(F) - Min(T))
+                # Establish strong flow on F and empty T
+                if from_edges and to_edges:
+                    # Define z_from = Min(set F)
+                    z_from = self.maxflow_model.addVar(vtype=grb.GRB.CONTINUOUS, name="z_from_init")
+                    self.aux_vars.append(z_from)
+                    path_flow_vars_from = [self.flow_var[e] for e in from_edges]
+                    gc_from = self.maxflow_model.addGenConstrMin(z_from, path_flow_vars_from, name="gc_min_F_init")
+                    self.aux_constrs.append(gc_from)
+
+                    # Define z_to = Min(set T)
+                    z_to = self.maxflow_model.addVar(vtype=grb.GRB.CONTINUOUS, name="z_to_init")
+                    self.aux_vars.append(z_to)
+                    path_flow_vars_to = [self.flow_var[e] for e in to_edges]
+                    gc_to = self.maxflow_model.addGenConstrMin(z_to, path_flow_vars_to, name="gc_min_T_init")
+                    self.aux_constrs.append(gc_to)
                     
-                    c = self.maxflow_model.addConstr(diff_i == z_from - self.flow_var[e], name=f"diff_constr_{i}")
+                    # Objective: z_from - z_to
+                    diff = self.maxflow_model.addVar(lb=-grb.GRB.INFINITY, vtype=grb.GRB.CONTINUOUS, name="init_diff")
+                    self.aux_vars.append(diff)
+                    c = self.maxflow_model.addConstr(diff == z_from - z_to)
                     self.aux_constrs.append(c)
-                    diff_vars.append(diff_i)
-                
-                # 3. Define Max of diffs
-                obj_combined = self.maxflow_model.addVar(lb=-grb.GRB.INFINITY, vtype=grb.GRB.CONTINUOUS, name="obj_combined")
-                self.aux_vars.append(obj_combined)
-                
-                gc = self.maxflow_model.addGenConstrMax(obj_combined, diff_vars, name="max_diff_gc")
-                self.aux_constrs.append(gc)
-                
-                self.maxflow_model.setObjectiveN(obj_combined, index=2, priority=5, weight=1.0, name="max_combined_divert")
+                    
+                    # Maximize diff (Weight 1.0)
+                    self.maxflow_model.setObjectiveN(diff, index=2, priority=5, weight=1.0, name="max_init_diff")
 
-            elif from_edges:
-                # Fallback if no to_edges: just maximize z_from
-                z_from = self.maxflow_model.addVar(vtype=grb.GRB.CONTINUOUS, name="min_divert_from_flow")
-                self.aux_vars.append(z_from)
-                
-                constrs = self.maxflow_model.addConstrs(
-                    (z_from <= self.flow_var[e] for e in from_edges),
-                    name="min_from_constr"
-                )
-                self.aux_constrs.extend(constrs.values())
-                
-                self.maxflow_model.setObjectiveN(z_from, index=2, priority=5, weight=1.0, name="max_min_divert_from")
+                elif from_edges:
+                    # Fallback
+                    z_from = self.maxflow_model.addVar(vtype=grb.GRB.CONTINUOUS, name="min_from_flow")
+                    self.aux_vars.append(z_from)
+                    
+                    constrs = self.maxflow_model.addConstrs(
+                        (z_from <= self.flow_var[e] for e in from_edges),
+                        name="min_from_constr"
+                    )
+                    self.aux_constrs.extend(constrs.values())
+                    self.maxflow_model.setObjectiveN(z_from, index=2, priority=5, weight=1.0, name="max_min_divert_from")
 
         self.maxflow_model.update()
     
@@ -616,6 +645,7 @@ class CustomEnv(gym.Env):
         self._cleanup_models()
         self.strategy_objectives_setup = False # Force objective reset on next solve
         self.old_routing_assumption = False
+        self.reference_start_flows = None
 
         # Clear local outcome cache on reset because capacities/objectives change
         self.local_outcome_cache = {}
@@ -1508,7 +1538,11 @@ class CustomEnv(gym.Env):
         # Calculate reward based on flow diversion success
         diverted_flow, self.reference_flows = self._calculate_divert_objective_and_flows()
         
-        reward = (diverted_flow - self.last_obj) / self.reference_start_flows[0] #reference_budget  
+        if self.reference_start_flows[0] > 1e-9:
+            reward = (diverted_flow - self.last_obj) / self.reference_start_flows[0] #reference_budget  
+        else:
+            reward = 0.0
+
         self.last_obj = diverted_flow
         if reward == 0:
             reward = self.PENALTY_VALUE / self.reference_budget
@@ -1931,6 +1965,7 @@ class CustomEnv(gym.Env):
         self._cleanup_models()
         self.strategy_objectives_setup = False # Force objective reset on next solve
         self.old_routing_assumption = False
+        self.reference_start_flows = None
 
         # Clear local outcome cache when loading new state
         self.local_outcome_cache = {}
