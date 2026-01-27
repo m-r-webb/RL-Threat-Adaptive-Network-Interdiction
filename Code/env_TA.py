@@ -845,71 +845,86 @@ class CustomEnv(gym.Env):
         # Temporarily set state so solve_max_flow can read capacities
         self.state = base_state
 
-        # 1. Determine max flow path
+        # 1. Determine max flow path (for length calculation)
         _, flows = self.solve_max_flow()
         max_flow_edge_set = self._extract_max_flow_path(flows)
         
-        # 2. Identify nodes to avoid (all intermediate nodes on max flow path)
-        avoid_nodes = set()
-        for u, v in max_flow_edge_set:
-            if u != self.super_source_nodes[0] and u != self.super_sink_nodes[0]:
-                avoid_nodes.add(u)
-            if v != self.super_source_nodes[0] and v != self.super_sink_nodes[0]:
-                avoid_nodes.add(v)
-        
-        # 3. Generate alternative paths
+        # 2. Generate alternative paths (without avoiding specific nodes)
         candidates = []
+        candidates.append(max_flow_edge_set)
+        
         max_len = len(max_flow_edge_set) + self.MAX_PATH_LENGTH
         
         # Try to find valid alternative paths (try 50 times)
         for _ in range(50):
             if len(candidates) >= 10: break
             
-            alt_path = self._find_random_path_from_supersource(avoid_nodes, max_len)
-            if alt_path:
+            # Pass empty set to not avoid any nodes (except standard cycle prevention)
+            alt_path = self._find_random_path_from_supersource(set(), max_len)
+            
+            if alt_path and alt_path not in candidates:
                 candidates.append(alt_path)
 
-        # Fallback: if no disjoint paths found, use max_flow_path
-        if not candidates:
-             candidates.append(max_flow_edge_set)
-
-        # 4. Choose the best alternative path
-        best_path = None
-        # Metrics: (bottleneck (maximize), total_flow_per_edge (minimize))
-        best_metrics = (-1.0, -float('inf')) 
+        # 3. Calculate Bottlenecks for all candidates
+        candidate_metrics = []
+        max_bottleneck = -1.0
         
         for path in candidates:
-            # Calculate bottleneck and total flow
+            # Calculate bottleneck
             min_cap = float('inf')
-            sum_flow = 0.0
-            
             for edge in path:
-                 # Capacity
                  idx = self.edge_to_index.get(edge)
                  if idx is None: idx = self.edge_to_index.get((edge[1], edge[0]))
                  if idx is not None:
                      cap = self.state['edge_capacity'][idx]
                      if cap < min_cap: min_cap = cap
-                 
-                 # Current Flow (from max flow solution)
-                 f = flows.get(edge, 0)
-                 sum_flow += f
             
-            avg_flow = sum_flow / len(path) if len(path) > 0 else 0
+            if min_cap == float('inf'): min_cap = 0
             
-            # Metric: Max bottleneck, then Min avg_flow
-            current_metrics = (min_cap, -avg_flow)
+            if min_cap > max_bottleneck:
+                max_bottleneck = min_cap
+                
+            candidate_metrics.append({'path': path, 'bottleneck': min_cap})
 
-            if best_path is None or current_metrics > best_metrics:
-                best_metrics = current_metrics
+        # 4. Filter and Select Best Candidate
+        # Filter: bottleneck >= 10% worse than max (>= 0.9 * max)
+        threshold = 0.9 * max_bottleneck
+        filtered_candidates = [c for c in candidate_metrics if c['bottleneck'] >= threshold]
+        
+        best_path = None
+        min_objective_val = float('inf')
+
+        # We must temporarily set 'canalize_objective' in self.state to evaluate the objective function
+        working_state = base_state.copy()
+        
+        for c in filtered_candidates:
+            path = c['path']
+            
+            # Construct objective mask for this candidate
+            canalize_objective = np.zeros(self.max_num_edges, dtype=int)
+            edge_in_path = np.array([edge in path or (edge[1], edge[0]) in path for edge in self.both_edges], dtype=bool)
+            canalize_objective[:len(edge_in_path)] = edge_in_path.astype(int)
+            
+            # Update state with this objective
+            working_state['canalize_objective'] = canalize_objective
+            self.state = working_state
+            
+            # Run objective calculation: choose lowest objective value
+            # This calls solve_max_flow(routing_assumption='canalize') 
+            # which returns flow when defender actively minimizes flow on target path
+            obj_val, _ = self._calculate_canalize_objective_and_flows()
+            
+            if obj_val < min_objective_val:
+                min_objective_val = obj_val
                 best_path = path
 
-        # 5. Set objective
-        canalize_objective = np.zeros(self.max_num_edges, dtype=int)
-        edge_in_path = np.array([edge in best_path or (edge[1], edge[0]) in best_path for edge in self.both_edges], dtype=bool)
-        canalize_objective[:len(edge_in_path)] = edge_in_path.astype(int)
+        # 5. Finalize State
+        final_canalize_objective = np.zeros(self.max_num_edges, dtype=int)
+        if best_path:
+            edge_in_path = np.array([edge in best_path or (edge[1], edge[0]) in best_path for edge in self.both_edges], dtype=bool)
+            final_canalize_objective[:len(edge_in_path)] = edge_in_path.astype(int)
 
-        return {**base_state, 'canalize_objective': canalize_objective}
+        return {**base_state, 'canalize_objective': final_canalize_objective}
 
     def _find_random_path_from_supersource(self, avoid_nodes, max_length):
         """Find a random path from SuperSource to SuperSink avoiding specific nodes."""
