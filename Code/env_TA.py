@@ -2411,7 +2411,7 @@ class _RemoteEnvWorker:
             # Update alpha with current node value
             alpha = max(alpha, best_reward)
 
-            if self.attacker_strategy in ['zero_sum', 'isolate', 'divert']:
+            if self.attacker_strategy in ['zero_sum', 'canalize', 'isolate','divert']: #ADD isolate
                 # Heuristic sorting for pruning
                 caps = self.env.state['edge_capacity'][valid_actions]
                 probs = self.env.state['edge_interdiction_probability'][valid_actions]
@@ -2429,7 +2429,7 @@ class _RemoteEnvWorker:
             
             for i, action in enumerate(valid_actions):
                 # Pruning for zero_sum, isolate, divert
-                if self.attacker_strategy in ['zero_sum', 'isolate', 'divert']:
+                if self.attacker_strategy in ['zero_sum', 'canalize', 'isolate','divert']: #ADD isolate
                      # Pruning condition: 
                      # current obj value - (current remaining budget * heuristic) > current best objective value
                      # -final_objective - (rem_budget * heuristics[i]) > -alpha
@@ -2597,7 +2597,7 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
             alpha = max(alpha, best_reward)
             
             # Apply Heuristics (Same as in Worker)
-            if self.attacker_strategy in ['zero_sum', 'isolate', 'divert']:
+            if self.attacker_strategy in ['zero_sum', 'canalize', 'isolate','divert']: #ADD Isolate
                 caps = self.state['edge_capacity'][valid_actions]
                 probs = self.state['edge_interdiction_probability'][valid_actions]
                 costs = self.state['edge_costs'][valid_actions]
@@ -2610,7 +2610,7 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
 
             for i, action in enumerate(valid_actions):
                 # Pruning
-                if self.attacker_strategy in ['zero_sum', 'isolate', 'divert']:
+                if self.attacker_strategy in ['zero_sum', 'canalize', 'isolate','divert']: #ADD Isolate
                      if val + heuristics[i] < alpha:
                          skipped_actions = len(valid_actions) - i
                          child_volume = int(int(self.num_both_edges) ** max(0, budget_levels - (d + 1)))
