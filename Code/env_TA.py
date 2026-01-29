@@ -1395,15 +1395,15 @@ class CustomEnv(gym.Env):
                 objective = obj
             elif strategy_type == "canalize":                
                 target_flow = self._calculate_target_path_flow(flows, 'canalize_objective')
-                objective = max(0, target_flow - getattr(self, 'reference_start_flow', 0))
+                objective = (target_flow - getattr(self, 'reference_start_flow', 0))
             elif strategy_type == "isolate":
                 objective = self._calculate_target_edge_flow(flows, 'isolate_objective')
             elif strategy_type == "divert":
                 from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
                 
                 to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
-                diverted_flow_from = max(0,self.reference_start_flows[0] - from_flow)
-                diverted_flow_to = max(0, to_flow - self.reference_start_flows[1])
+                diverted_flow_from = (self.reference_start_flows[0] - from_flow)
+                diverted_flow_to = (to_flow - self.reference_start_flows[1])
                 objective = np.min([diverted_flow_from, diverted_flow_to])
                 #print("From, To flows, Obj: ", from_flow, ", ", to_flow, ", ", objective)
 
@@ -1488,7 +1488,7 @@ class CustomEnv(gym.Env):
         if self.deterministic_outcomes:
             _, flows = self.solve_max_flow(routing_assumption = 'canalize')
             target_path_flow = self._calculate_target_path_flow(flows, 'canalize_objective')
-            objective = max(0, target_path_flow - getattr(self, 'reference_start_flow', 0))
+            objective = (target_path_flow - getattr(self, 'reference_start_flow', 0))
             return objective, flows
         else:
             # Stochastic calculation - returns mean objective directly
@@ -1537,8 +1537,8 @@ class CustomEnv(gym.Env):
             _, flows = self.solve_max_flow(routing_assumption = 'divert')
             from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
             to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
-            diverted_flow_from = max(0, self.reference_start_flows[0] - from_flow)
-            diverted_flow_to = max(0, to_flow - self.reference_start_flows[1]) 
+            diverted_flow_from = (self.reference_start_flows[0] - from_flow)
+            diverted_flow_to = (to_flow - self.reference_start_flows[1]) 
             objective = np.min([diverted_flow_from,diverted_flow_to])
             
             return objective, flows
@@ -2092,7 +2092,7 @@ class CustomEnv(gym.Env):
     
         # All vectorized checks
         sufficient_budget = (remaining_budget - self.state['edge_costs'][:self.num_interdictable]) >= -0.1
-        #has_capacity = self.state['edge_capacity'][:self.num_interdictable] > 0
+        has_capacity = self.state['edge_capacity'][:self.num_interdictable] > 0
         has_probability = self.state['edge_interdiction_probability'][:self.num_interdictable] > 0
     
         within_limit = (edge_interdicted[:self.num_interdictable] + 1) <= self.max_interdictions
@@ -2100,14 +2100,15 @@ class CustomEnv(gym.Env):
         # Strategy-specific checks
         if self.attacker_strategy == 'isolate':
             # Get edges on paths from isolate objectives to sources
-            on_path_to_source = self.get_edges_on_paths_to_source(start_nodes = self.state['isolate_objective'])
+            on_path_to_source = True #self.get_edges_on_paths_to_source(start_nodes = self.state['isolate_objective'])
             #has_flow = self.cached_flow_array[:self.num_interdictable] > 0
-            valid_actions = (sufficient_budget &  
-                             has_probability & 
-                             #has_capacity &
-                             on_path_to_source &
+            valid_actions = (#sufficient_budget &  
+                             #has_probability & 
+                             has_capacity &
+                             on_path_to_source )
                              #has_flow &
-                             within_limit)
+                             #within_limit
+            
         
         elif self.attacker_strategy == 'canalize':
             has_flow = self.cached_flow_array[:self.num_interdictable] > 0
@@ -2415,7 +2416,7 @@ class _RemoteEnvWorker:
             # Update alpha with current node value
             alpha = max(alpha, best_reward)
 
-            if self.attacker_strategy in ['zero_sum', 'isolate', 'divert']:
+            if self.attacker_strategy in ['zero_sum',  'divert', 'canalize']: #'isolate',
                 # Heuristic sorting for pruning
                 caps = self.env.state['edge_capacity'][valid_actions]
                 probs = self.env.state['edge_interdiction_probability'][valid_actions]
@@ -2433,7 +2434,7 @@ class _RemoteEnvWorker:
             
             for i, action in enumerate(valid_actions):
                 # Pruning for zero_sum, isolate, divert
-                if self.attacker_strategy in ['zero_sum', 'isolate', 'divert']:
+                if self.attacker_strategy in ['zero_sum', 'divert', 'canalize']: #'isolate',
                      # Pruning condition: 
                      # current obj value - (current remaining budget * heuristic) > current best objective value
                      # -final_objective - (rem_budget * heuristics[i]) > -alpha
