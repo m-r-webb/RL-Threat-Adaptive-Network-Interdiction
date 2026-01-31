@@ -80,7 +80,8 @@ def create_nodes_edges(node_filename, edge_filename):
 class CustomEnv(gym.Env):
     """Custom Gym environment for network interdiction problems."""
     # Class constants
-    GUROBI_ENV = grb.Env(params={"OutputFlag": 0, "LogToConsole": 0, "Threads": 1, "Seed": 1})
+    # Set Method=1 (Dual Simplex) and MIPGap=0 for strict deterministic/optimal behavior
+    GUROBI_ENV = grb.Env(params={"OutputFlag": 0, "LogToConsole": 0, "Threads": 1, "Seed": 1}) #, "Method": 1, "MIPGap": 0})
     
     def __init__(self, nodes, edges, deterministic_agent=True, initial_budget = None, 
                  multiple_interdiction_attempts=True, attacker_strategy="zero_sum",
@@ -311,8 +312,10 @@ class CustomEnv(gym.Env):
         self.maxflow_model.optimize(callback)
         
         if self.maxflow_model.Status == grb.GRB.OPTIMAL:
-            obj_val = round(self.maxflow_model.ObjVal)
-            flow_results = {e: round(var.X) for e, var in self.flow_var.items()}
+            # Use strict values without rounding to avoid flipping behavior near .5 boundaries
+            obj_val = self.maxflow_model.ObjVal
+            # Rounding flows is safer for interpretation but obj_val should be precise
+            flow_results = {e: var.X for e, var in self.flow_var.items()}
         else:
             obj_val = 0
             flow_results = {e: 0 for e in self.flow_var.keys()}
@@ -474,6 +477,8 @@ class CustomEnv(gym.Env):
         if hasattr(self, 'forward_cons'):
             self.maxflow_model.remove(self.forward_cons)
             self.maxflow_model.remove(self.reverse_cons)
+
+        self.maxflow_model.update() # FORCE UPDATE TO CLEAR
 
         self.forward_cons = self.maxflow_model.addConstrs((
             self.flow_var[e] <= capacity_dict.get(e, 0) * self.edge_used[e] 
@@ -1263,6 +1268,12 @@ class CustomEnv(gym.Env):
             # P(success) = 1 - (1 - p)^k
             edge_success_probs = 1 - (1 - probs[interdicted_indices]) ** interdicted[interdicted_indices]
             
+            # Use deterministic iteration order by sorting indices (though indices are already sorted from np.where)
+            # interdicted_indices is already sorted
+            
+            # Enforce deterministic ordering of product generation
+            # outcome_combo will be e.g., (0,0,0), (0,0,1)... in deterministic order
+            
             for outcome_combo in product([0, 1], repeat=num_interdicted):
                 outcome_array = np.zeros(self.num_both_edges, dtype=int)
                 prob = 1.0
@@ -1278,7 +1289,11 @@ class CustomEnv(gym.Env):
                 
                 outcome = tuple(outcome_array)
                 unique_outcomes.append(outcome)
-                outcome_weights[outcome] = prob
+                # Ensure probabilities are consistently rounded to avoid minor drift
+                outcome_weights[outcome] = float(np.round(prob, 10))
+        
+            # Sort outcomes to ensure deterministic summation order
+            unique_outcomes.sort()
         else:
             # Sample interdiction outcomes
             outcome_samples = []
@@ -1300,7 +1315,8 @@ class CustomEnv(gym.Env):
         
             # Count unique outcomes and their frequencies
             outcome_counts = Counter(outcome_samples)
-            unique_outcomes = list(outcome_counts.keys())
+            # Sort outcomes to ensure deterministic summation order
+            unique_outcomes = sorted(list(outcome_counts.keys()))
             outcome_weights = {outcome: count / total_samples for outcome, count in outcome_counts.items()}
 
         # --- MEMOIZATION START ---
@@ -1416,7 +1432,7 @@ class CustomEnv(gym.Env):
                                 indices.append(self.edge_to_index[edge])
                             elif (edge[1], edge[0]) in self.edge_to_index:
                                 indices.append(self.edge_to_index[(edge[1], edge[0])])
-                    res['nonzero_flow_indices'] = list(set(indices))
+                    res['nonzero_flow_indices'] = sorted(list(set(indices)))
             
             # Update local/working cache
             working_cache[outcome] = res #(outcome, strategy_type)
@@ -2110,17 +2126,15 @@ class CustomEnv(gym.Env):
 
         # 3. Calculate heuristics for valid_actions
         action_costs = self.state['edge_costs'][valid_actions]
-        future_moves = np.floor((remaining_budget - action_costs) / self.min_edge_cost)
+        # Added epsilon to prevent floating point floor errors from underestimating moves
+        future_moves = np.floor((remaining_budget - action_costs + 1e-9) / self.min_edge_cost)
         
-        # Calculate Current Flow on the candidate edges
-        # flows is a dict {(u,v): flow}
-        current_flow_vals = np.array([
-            flows.get(self.both_edges[a], 0) + flows.get((self.both_edges[a][1], self.both_edges[a][0]), 0)
-            for a in valid_actions
-        ])
+        caps = self.state['edge_capacity'][valid_actions]
+        probs = self.state['edge_interdiction_probability'][valid_actions]
+        potential_vals = caps * probs
         
-        # Heuristic = Current Flow (Immediate Potential) + Projected Future Benefit
-        heuristics = current_flow_vals + (future_moves * max_benefit)
+        # Heuristic = Base + Projected Future Benefit
+        heuristics = potential_vals + (future_moves * max_benefit)
         
         return heuristics
 
@@ -2243,7 +2257,7 @@ class _RemoteEnvWorker:
     def __init__(self, nodes, edges, seed, state_snapshot, attacker_strategy, min_edge_cost, 
                  num_both_edges, deterministic_outcomes, multiple_interdiction_attempts,
                  progress_actor=None, memo_actors=None, budget_levels=1, progress_granularity=50,
-                 max_depth_inner=20, outcome_memo_actor=None, outcome_memo_actors=None, alpha_actor=None,
+                 max_depth_inner=100, outcome_memo_actor=None, outcome_memo_actors=None, alpha_actor=None,
                  enable_outcome_caching=True, enable_alpha_pruning=True):
         """
         Worker now accepts a progress_actor handle, a shared memo_actor handle,
@@ -2485,12 +2499,15 @@ class _RemoteEnvWorker:
                 # Pruning
                 if self.enable_alpha_pruning:
                      # Pruning condition using the new consolidated heuristic
-                     if final_objective + heuristics[i] < alpha:
+                     # Added tolerace (1e-6) to tolerate floating point errors
+                     if final_objective + heuristics[i] < alpha - 1e-6:
                          skipped_actions = len(valid_actions) - i
                          est_per_skipped = int(self.num_both_edges ** max(0, self.budget_levels - (d + 1)))
                          local_counter += skipped_actions * est_per_skipped
                          maybe_flush_progress()
-                         break
+                         #break  # ADD BACK
+                         # Do not memoize results from pruned nodes as they may be valid for lower alphas
+                         return best_reward, best_seq
 
                 # Apply move in-place
                 inter_state[action] += 1
@@ -2546,163 +2563,18 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
     if n_workers > 0 and not ray.is_initialized():
         ray.init(address=ray_address, ignore_reinit_error=True)
 
+    # Ensure clean Gurobi model state for determinism
+    self._cleanup_models()
+
     # precompute min edge cost etc
     real_edge_costs = self.state['edge_costs'][:self.num_both_edges]
     self.min_edge_cost = min(real_edge_costs[real_edge_costs > 0], default=float('inf'))
     if self.min_edge_cost == float('inf'):
         self.min_edge_cost = 1
 
-    # SERIAL EXECUTION PATH
-    if n_workers <= 0:
-        # Propagate implementation flag to the env used by the serial process
-        self.enable_outcome_caching = enable_outcome_caching
-
-        if verbose:
-            print(f"Running in SERIAL mode (Main Process). Memoization: {'ON' if enable_memoization else 'OFF'}")
-        
-        # Local Memoization
-        memo_serial = {}
-        
-        # Calculate budget stats for progress bar
-        max_budget = self.state['budget'][0]
-        budget_levels = int(max_budget // self.min_edge_cost) if self.min_edge_cost > 0 else 1
-        estimated_states = (int(self.num_both_edges) ** budget_levels) if budget_levels > 0 else 1
-        
-        from tqdm import tqdm
-        pbar = tqdm(total=estimated_states, desc="DP States (Serial)", unit=" states", disable=not verbose)
-
-        # Define recursive solver for serial execution
-        def dp_serial(rem_budget, inter_state, d, alpha=-float('inf')):
-            key = inter_state[:self.num_both_edges].tobytes()
-            
-            # Volume calc for this node's potential subtree
-            current_volume = int(int(self.num_both_edges) ** max(0, budget_levels - d))
-
-            if enable_memoization and key in memo_serial:
-                pbar.update(current_volume)
-                return memo_serial[key]
-            
-            # Save state
-            old_budget = self.state['budget'][0]
-            old_interdicted = self.state['edge_interdicted'].copy()
-            
-            # Set state
-            self.state['budget'][0] = rem_budget
-            self.state['edge_interdicted'][:] = inter_state
-            
-            # Compute objective
-            if self.attacker_strategy == "zero_sum":
-                val, flows = self._compute_objective_and_flows()
-                val = -val # Attacker maximizes negative flow (minimizes flow)
-            elif self.attacker_strategy == 'canalize':
-                val, flows = self._calculate_canalize_objective_and_flows()
-            elif self.attacker_strategy == 'isolate':
-                val, flows = self._calculate_isolate_objective_and_flows()
-                val = -val
-            elif self.attacker_strategy == 'divert':
-                val, flows = self._calculate_divert_objective_and_flows()
-            else:
-                val = -float('inf')
-                flows = {}
-                
-            self.reference_flows = flows
-            self._cache_flow_array()
-            
-            # Base case
-            if rem_budget < self.min_edge_cost or (worker_depth is not None and d >= worker_depth):
-                # Restore
-                self.state['budget'][0] = old_budget
-                self.state['edge_interdicted'][:] = old_interdicted
-                
-                if enable_memoization:
-                    memo_serial[key] = (val, [])
-                pbar.update(current_volume)
-                return val, []
-
-            # Get actions
-            action_mask = self.mask_fn()
-            
-            # Restore state immediately after mask calculation to keep environment clean
-            self.state['budget'][0] = old_budget
-            self.state['edge_interdicted'][:] = old_interdicted
-            
-            valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
-            
-            # Account for branches pruned by invalid actions
-            num_invalid = int(self.num_both_edges) - len(valid_actions)
-            if num_invalid > 0:
-                child_volume = int(int(self.num_both_edges) ** max(0, budget_levels - (d + 1)))
-                pbar.update(num_invalid * child_volume)
-
-            if len(valid_actions) == 0:
-                if enable_memoization:
-                    memo_serial[key] = (val, [])
-                return val, []
-                
-            best_reward = val
-            best_seq = []
-            
-            alpha = max(alpha, best_reward)
-            
-            # Apply Heuristics (Same as in Worker)
-            if enable_alpha_pruning:
-                # Set temporary state for accurate heuristic projection benefit calculation
-                self.state['budget'][0] = rem_budget
-                self.state['edge_interdicted'][:] = inter_state
-                
-                heuristics = self.calculate_action_heuristics(valid_actions, flows, rem_budget)
-                
-                # Restore state immediately
-                self.state['budget'][0] = old_budget
-                self.state['edge_interdicted'][:] = old_interdicted
-                
-                sorted_indices = np.argsort(-heuristics)
-                valid_actions = valid_actions[sorted_indices]
-                heuristics = heuristics[sorted_indices]
-
-            for i, action in enumerate(valid_actions):
-                # Pruning
-                if enable_alpha_pruning:
-                     if val + heuristics[i] < alpha:
-                         skipped_actions = len(valid_actions) - i
-                         child_volume = int(int(self.num_both_edges) ** max(0, budget_levels - (d + 1)))
-                         pbar.update(skipped_actions * child_volume)
-                         break
-
-                inter_state[action] += 1
-                new_budget = rem_budget - self.state['edge_costs'][action]
-                
-                fut_reward, fut_seq = dp_serial(new_budget, inter_state, d + 1, alpha)
-                
-                inter_state[action] -= 1
-                
-                if fut_reward > best_reward:
-                    best_reward = fut_reward
-                    best_seq = [action] + fut_seq
-                    alpha = max(alpha, best_reward)
-                    
-            if enable_memoization:
-                memo_serial[key] = (best_reward, best_seq)
-            return best_reward, best_seq
-
-        # Run Serial
-        t0 = time.time()
-        initial_interdicted = self.state['edge_interdicted'].copy()
-        initial_budget = self.state['budget'][0]
-        
-        opt_reward, opt_seq = dp_serial(initial_budget, initial_interdicted, 0)
-        
-        pbar.close()
-
-        if verbose:
-            print(f"Serial execution completed in {time.time() - t0:.2f}s")
-            
-        optimal_actions = [self.both_edges[idx] for idx in opt_seq]
-        return opt_reward, optimal_actions
-
-    # Calculate Initial Alpha (Heuristic)
+    # Calculate Initial Alpha (Heuristic) - MOVED TO TOP to support Serial Mode
     initial_alpha = -float('inf')
-    if n_workers > 0 and enable_alpha_pruning:
+    if enable_alpha_pruning:
         if verbose:
             print("Running heuristic for initial alpha...")
         
@@ -2726,6 +2598,10 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
                     obj_val, flows = self._calculate_divert_objective_and_flows()
                 else:
                     obj_val, flows = -float('inf'), {}
+
+                # Update reference flows and cache for mask_fn to ensure valid actions are correct
+                self.reference_flows = flows
+                self._cache_flow_array()
 
                 # 2. Check if budget exhausted
                 if current_budget < self.min_edge_cost:
@@ -2911,11 +2787,161 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
         if verbose:
             print(f"Heuristic found initial alpha: {initial_alpha}")
 
+    # SERIAL EXECUTION PATH
+    if n_workers <= 0:
+        # Propagate implementation flag to the env used by the serial process
+        self.enable_outcome_caching = enable_outcome_caching
+
+        if verbose:
+            print(f"Running in SERIAL mode (Main Process). Memoization: {'ON' if enable_memoization else 'OFF'}")
+        
+        # Local Memoization
+        memo_serial = {}
+        
+        # Calculate budget stats for progress bar
+        max_budget = self.state['budget'][0]
+        budget_levels = int(max_budget // self.min_edge_cost) if self.min_edge_cost > 0 else 1
+        estimated_states = (int(self.num_both_edges) ** budget_levels) if budget_levels > 0 else 1
+        
+        from tqdm import tqdm
+        pbar = tqdm(total=estimated_states, desc="DP States (Serial)", unit=" states", disable=not verbose)
+
+        # Define recursive solver for serial execution
+        def dp_serial(rem_budget, inter_state, d, alpha=-float('inf')):
+            key = inter_state[:self.num_both_edges].tobytes()
+            
+            # Volume calc for this node's potential subtree
+            current_volume = int(int(self.num_both_edges) ** max(0, budget_levels - d))
+
+            if enable_memoization and key in memo_serial:
+                pbar.update(current_volume)
+                return memo_serial[key]
+            
+            # Save state
+            old_budget = self.state['budget'][0]
+            old_interdicted = self.state['edge_interdicted'].copy()
+            
+            # Set state
+            self.state['budget'][0] = rem_budget
+            self.state['edge_interdicted'][:] = inter_state
+            
+            # Compute objective
+            if self.attacker_strategy == "zero_sum":
+                val, flows = self._compute_objective_and_flows()
+                val = -val # Attacker maximizes negative flow (minimizes flow)
+            elif self.attacker_strategy == 'canalize':
+                val, flows = self._calculate_canalize_objective_and_flows()
+            elif self.attacker_strategy == 'isolate':
+                val, flows = self._calculate_isolate_objective_and_flows()
+                val = -val
+            elif self.attacker_strategy == 'divert':
+                val, flows = self._calculate_divert_objective_and_flows()
+            else:
+                val = -float('inf')
+                flows = {}
+                
+            self.reference_flows = flows
+            self._cache_flow_array()
+            
+            # Base case
+            if rem_budget < self.min_edge_cost or (worker_depth is not None and d >= worker_depth):
+                # Restore
+                self.state['budget'][0] = old_budget
+                self.state['edge_interdicted'][:] = old_interdicted
+                
+                if enable_memoization:
+                    memo_serial[key] = (val, [])
+                pbar.update(current_volume)
+                return val, []
+
+            # Get actions
+            action_mask = self.mask_fn()
+            
+            # Restore state immediately after mask calculation to keep environment clean
+            self.state['budget'][0] = old_budget
+            self.state['edge_interdicted'][:] = old_interdicted
+            
+            valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
+            
+            # Account for branches pruned by invalid actions
+            num_invalid = int(self.num_both_edges) - len(valid_actions)
+            if num_invalid > 0:
+                child_volume = int(int(self.num_both_edges) ** max(0, budget_levels - (d + 1)))
+                pbar.update(num_invalid * child_volume)
+
+            if len(valid_actions) == 0:
+                if enable_memoization:
+                    memo_serial[key] = (val, [])
+                return val, []
+                
+            best_reward = val
+            best_seq = []
+            
+            alpha = max(alpha, best_reward)
+            
+            # Apply Heuristics (Same as in Worker)
+            if enable_alpha_pruning:
+                # Set temporary state for accurate heuristic projection benefit calculation
+                self.state['budget'][0] = rem_budget
+                self.state['edge_interdicted'][:] = inter_state
+                
+                heuristics = self.calculate_action_heuristics(valid_actions, flows, rem_budget)
+                
+                # Restore state immediately
+                self.state['budget'][0] = old_budget
+                self.state['edge_interdicted'][:] = old_interdicted
+                
+                sorted_indices = np.argsort(-heuristics)
+                valid_actions = valid_actions[sorted_indices]
+                heuristics = heuristics[sorted_indices]
+
+            for i, action in enumerate(valid_actions):
+                # Pruning
+                if enable_alpha_pruning:
+                     if val + heuristics[i] < alpha- 1e-6:
+                         skipped_actions = len(valid_actions) - i
+                         child_volume = int(int(self.num_both_edges) ** max(0, budget_levels - (d + 1)))
+                         pbar.update(skipped_actions * child_volume)
+                         break
+
+                inter_state[action] += 1
+                new_budget = rem_budget - self.state['edge_costs'][action]
+                
+                fut_reward, fut_seq = dp_serial(new_budget, inter_state, d + 1, alpha)
+                
+                inter_state[action] -= 1
+                
+                if fut_reward > best_reward:
+                    best_reward = fut_reward
+                    best_seq = [action] + fut_seq
+                    alpha = max(alpha, best_reward)
+                    
+            if enable_memoization:
+                memo_serial[key] = (best_reward, best_seq)
+            return best_reward, best_seq
+
+        # Run Serial
+        t0 = time.time()
+        initial_interdicted = self.state['edge_interdicted'].copy()
+        initial_budget = self.state['budget'][0]
+        
+        opt_reward, opt_seq = dp_serial(initial_budget, initial_interdicted, 0, alpha=initial_alpha)
+        
+        pbar.close()
+
+        if verbose:
+            print(f"Serial execution completed in {time.time() - t0:.2f}s")
+            
+        optimal_actions = [self.both_edges[idx] for idx in opt_seq]
+        return opt_reward, optimal_actions
+
+
     # snapshot state to send to workers
     state_snapshot = copy.deepcopy(self.state)
     seed = getattr(self, 'seed', None)
 
     # create actors
+
     progress_actor = _ProgressActor.remote()
     # SHARDED MEMOIZATION
     # Create multiple memo actors to reduce lock contention
@@ -2934,6 +2960,12 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
         outcome_memo_actors = [SharedOutcomeMemoActor.remote() for _ in range(num_outcome_shards)]
     
     # Create alpha actor
+    # When using heuristics, the initial_alpha is a lower bound on the optimal value.
+    # We should subtract a small epsilon to ensure we don't prune branches that are exactly equal 
+    # to this initial value due to floating point noise.
+    if initial_alpha > -float('inf'):
+         initial_alpha -= 1e-5
+    
     alpha_actor = _SharedAlphaActor.remote(initial_alpha)
     
     max_budget = self.state['budget'][0]
@@ -2954,7 +2986,7 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
             memo_actors=memo_actors, # Pass list of actors
             budget_levels=budget_levels,
             progress_granularity=2000,
-            max_depth_inner=20,
+            max_depth_inner=100,
             outcome_memo_actors=outcome_memo_actors,
             alpha_actor=alpha_actor,
             enable_outcome_caching=enable_outcome_caching,
