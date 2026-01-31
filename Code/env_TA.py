@@ -518,7 +518,7 @@ class CustomEnv(gym.Env):
         else:
             # Use continuous relaxation + min edge penalty
             for v in self.edge_used.values():
-                v.VType = grb.GRB.CONTINUOUS
+                v.VType = grb.GRB.BINARY
             self.maxflow_model.params.LazyConstraints = 0
 
             # Minimize number of edges used to prevent cycles (Always Priority 1)
@@ -2719,10 +2719,7 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
 
                 # 2. Check if budget exhausted
                 if current_budget < self.min_edge_cost:
-                    if self.attacker_strategy in ["zero_sum", "isolate", "canalize", "divert"]:
-                         initial_alpha = obj_val 
-                    else:
-                        initial_alpha = -float('inf')
+                    initial_alpha = obj_val 
                     break
                 
                 # 3. Get valid actions
@@ -2730,11 +2727,8 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
                 valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
                 
                 if len(valid_actions) == 0:
-                     if self.attacker_strategy in ["zero_sum", "isolate", "canalize", "divert"]:
-                        initial_alpha = obj_val
-                     else:
-                        initial_alpha = -float('inf')
-                     break
+                    initial_alpha = obj_val
+                    break
 
                 # 4. Select best action (Heuristic: Max Flow on Edge)
                 best_action = -1
@@ -2761,11 +2755,8 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
                             metric = caps * probs
                             best_idx = np.argmax(metric)
                             best_action = valid_objective_actions[best_idx]
-                            max_flow = -1 # not used, just to enter the next block
-                        else:
+                        #else:
                             # No more valid objective edges, fall back to flow-based on all valid edges
-                            best_action = -1
-                            max_flow = -1
                     
                     # Fallback/Default logic for zero_sum and isolate (after objective edges are done)
                     if best_action == -1:
@@ -2887,80 +2878,6 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
                             if f > max_flow_away:
                                 max_flow_away = f
                                 best_action = action
-                
-                if best_action != -1:
-                     canal_nodes = set()
-                     canal_edges = set()
-                     for idx, val in enumerate(self.state['canalize_objective'][:self.num_both_edges]):
-                         if val == 1:
-                             u, v = self.both_edges[idx]
-                             canal_nodes.update([u, v])
-                             canal_edges.add(tuple(sorted((u, v))))
-                     
-                     target_action_indices = []
-                     for action in valid_actions:
-                         u, v = self.both_edges[action]
-                         # Check if edge touches canal
-                         if u in canal_nodes or v in canal_nodes:
-                             # Check if edge is NOT in canal
-                             if tuple(sorted((u, v))) not in canal_edges:
-                                 target_action_indices.append(action)
-                     
-                     if not target_action_indices:
-                         # Fallback if no target edges valid
-                         target_action_indices = valid_actions
-                     
-                     # 2. Heuristic: Interdict edge with most flow LEAVING canal (or just most flow)
-                     # Since we want to keep flow IN, we cut leaks.
-                     for action in target_action_indices:
-                         edge = self.both_edges[action]
-                         # Get total flow on this edge
-                         f = flows.get(edge, 0) + flows.get((edge[1], edge[0]), 0)
-                         if f > max_flow:
-                             max_flow = f
-                             best_action = action
-
-                elif self.attacker_strategy == "divert":
-                     # Strategy: Break old path, then keep flow IN new path
-                     
-                     # Check if divert_from path is fully broken (simplistic check: is any edge interdicted?)
-                     # Using "smallest capacity" rule as requested
-                     divert_from_indices = np.where(self.state['divert_from_objective'][:self.num_both_edges] == 1)[0]
-                     valid_from_actions = [a for a in divert_from_indices if a in valid_actions]
-                     
-                     # 1. First priority: Interdict critical edge in 'divert_from'
-                     if valid_from_actions:
-                         # Pick valid edge with SMALLEST capacity
-                         caps = self.state['edge_capacity'][valid_from_actions]
-                         min_cap_idx = np.argmin(caps)
-                         best_action = valid_from_actions[min_cap_idx]
-                         max_flow = -1 # Sentinel to skip flow check
-                     else:
-                         # 2. Remainder: Protect 'divert_to' path (similar to canalize logic)
-                         divert_to_nodes = set()
-                         divert_to_edges = set()
-                         for idx, val in enumerate(self.state['divert_to_objective'][:self.num_both_edges]):
-                             if val == 1:
-                                 u, v = self.both_edges[idx]
-                                 divert_to_nodes.update([u, v])
-                                 divert_to_edges.add(tuple(sorted((u, v))))
-
-                         target_action_indices = []
-                         for action in valid_actions:
-                             u, v = self.both_edges[action]
-                             if u in divert_to_nodes or v in divert_to_nodes:
-                                 if tuple(sorted((u, v))) not in divert_to_edges:
-                                     target_action_indices.append(action)
-                        
-                         if not target_action_indices:
-                             target_action_indices = valid_actions
-
-                         for action in target_action_indices:
-                             edge = self.both_edges[action]
-                             f = flows.get(edge, 0) + flows.get((edge[1], edge[0]), 0)
-                             if f > max_flow:
-                                 max_flow = f
-                                 best_action = action
                 
                 if best_action != -1:
                     # Apply action
