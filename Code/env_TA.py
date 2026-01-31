@@ -393,7 +393,6 @@ class CustomEnv(gym.Env):
         self.flow_var = self.maxflow_model.addVars(self.mf_all_both_edges, vtype=grb.GRB.CONTINUOUS, lb=0, name="flow_var")
 
         # Add Edge Usage variables
-        # CHANGE: vtype=grb.GRB.BINARY -> vtype=grb.GRB.CONTINUOUS for speed
         self.edge_used = self.maxflow_model.addVars(self.all_both_edges, vtype=grb.GRB.BINARY, name="edge_used")
 
         ##CONSTRAINTS
@@ -509,16 +508,11 @@ class CustomEnv(gym.Env):
         # 1. Primary Objective: Maximize Total Flow (Always Priority 10)
         self.maxflow_model.setObjectiveN(self.flow_var[self.super_edge], index=0, priority=10, weight=1.0, name="max_flow")
 
-        if routing_assumption in ['divert', 'canalize']:
+        if routing_assumption in ['divert', 'canalize', 'isolate']:
             # Use subtour elimination callback - requires BINARY vars
-            for v in self.edge_used.values():
-                v.VType = grb.GRB.BINARY
             self.maxflow_model.params.LazyConstraints = 1
             # Do NOT add min_edges_used objective
         else:
-            # Use continuous relaxation + min edge penalty
-            for v in self.edge_used.values():
-                v.VType = grb.GRB.BINARY
             self.maxflow_model.params.LazyConstraints = 0
 
             # Minimize number of edges used to prevent cycles (Always Priority 1)
@@ -1475,7 +1469,7 @@ class CustomEnv(gym.Env):
             objective, flows = self.solve_max_flow()
         else:
             # Stochastic outcome calculation
-            objective, flows = self._calculate_stochastic_objective_and_flow('zero_sum')
+            objective, flows = self._calculate_stochastic_objective_and_flow('zero_sum', return_full_flows=True)
     
         return objective, flows
 
@@ -1488,7 +1482,7 @@ class CustomEnv(gym.Env):
             return objective, flows
         else:
             # Stochastic calculation - returns mean objective directly
-            objective, mean_flows = self._calculate_stochastic_objective_and_flow('canalize')
+            objective, mean_flows = self._calculate_stochastic_objective_and_flow('canalize', return_full_flows=True)
             return objective, mean_flows
         
     def _calculate_canalize_reward(self):
@@ -1510,7 +1504,7 @@ class CustomEnv(gym.Env):
             return target_node_flow, flows
         else:
             # Stochastic calculation - returns mean objective directly
-            objective, mean_flows = self._calculate_stochastic_objective_and_flow('isolate')
+            objective, mean_flows = self._calculate_stochastic_objective_and_flow('isolate', return_full_flows=True)
             return objective, mean_flows
         
     def _calculate_isolate_reward(self):
@@ -1540,7 +1534,7 @@ class CustomEnv(gym.Env):
             return objective, flows
         else:
             # Stochastic calculation - returns mean objectives directly
-            mean_objective, mean_flows = self._calculate_stochastic_objective_and_flow('divert')
+            mean_objective, mean_flows = self._calculate_stochastic_objective_and_flow('divert', return_full_flows=True)
             # Return as tuple to maintain consistent interface with reward calculation
             return mean_objective, mean_flows
 
@@ -2472,7 +2466,15 @@ class _RemoteEnvWorker:
 
             if self.enable_alpha_pruning:
                 # Heuristic sorting for pruning
+                # Temporarily set state for calculate_action_heuristics to see current interdictions
+                self.env.state['budget'][0] = rem_budget
+                self.env.state['edge_interdicted'][:] = inter_state
+                
                 heuristics = self.env.calculate_action_heuristics(valid_actions, current_flows, rem_budget)
+                
+                # Restore
+                self.env.state['budget'][0] = old_budget
+                self.env.state['edge_interdicted'][:] = old_interdicted
                 
                 # Sort descending
                 sorted_indices = np.argsort(-heuristics)
@@ -2644,7 +2646,15 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
             
             # Apply Heuristics (Same as in Worker)
             if enable_alpha_pruning:
+                # Set temporary state for accurate heuristic projection benefit calculation
+                self.state['budget'][0] = rem_budget
+                self.state['edge_interdicted'][:] = inter_state
+                
                 heuristics = self.calculate_action_heuristics(valid_actions, flows, rem_budget)
+                
+                # Restore state immediately
+                self.state['budget'][0] = old_budget
+                self.state['edge_interdicted'][:] = old_interdicted
                 
                 sorted_indices = np.argsort(-heuristics)
                 valid_actions = valid_actions[sorted_indices]
