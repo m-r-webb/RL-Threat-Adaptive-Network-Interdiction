@@ -306,7 +306,8 @@ class CustomEnv(gym.Env):
         self.maxflow_model.params.Seed = 1
         
         callback = None
-        if routing_assumption in ['divert', 'canalize']:
+        if routing_assumption in ['divert', 'canalize', 'isolate']:
+            self._update_sensitive_edges(routing_assumption)
             callback = self._subtour_callback
 
         self.maxflow_model.optimize(callback)
@@ -322,14 +323,28 @@ class CustomEnv(gym.Env):
         
         return obj_val, flow_results 
 
+    def _update_sensitive_edges(self, routing_assumption):
+        """Identify edges that are part of the current strategy's objective."""
+        self.sensitive_edges = []
+        if routing_assumption == 'isolate':
+            indices = np.where(self.state['isolate_objective'][:self.num_both_edges] == 1)[0]
+            self.sensitive_edges = [self.both_edges[i] for i in indices]
+        elif routing_assumption == 'canalize':
+            indices = np.where(self.state['canalize_objective'][:self.num_both_edges] == 1)[0]
+            self.sensitive_edges = [self.both_edges[i] for i in indices]
+        elif routing_assumption == 'divert':
+            idx1 = np.where(self.state['divert_from_objective'][:self.num_both_edges] == 1)[0]
+            idx2 = np.where(self.state['divert_to_objective'][:self.num_both_edges] == 1)[0]
+            self.sensitive_edges = [self.both_edges[i] for i in idx1] + [self.both_edges[i] for i in idx2]
+
     def _subtour_callback(self, model, where):
-        """Callback to eliminate subtours."""
+        """Callback to eliminate subtours efficiently."""
         if where == grb.GRB.Callback.MIPSOL:
             vals = model.cbGetSolution(self.edge_used)
             # Filter edges with value > 0.5
             selected_edges = [e for e, v in vals.items() if v > 0.5]
             
-            # Detect cycles
+            # Detect cycles involving sensitive edges
             cycles = self._find_cycles(selected_edges)
             
             for cycle in cycles:
@@ -338,48 +353,50 @@ class CustomEnv(gym.Env):
                 model.cbLazy(expr <= len(cycle) - 1)
 
     def _find_cycles(self, edges):
-        """Find cycles in solution graph using DFS."""
+        """Find cycles in solution graph using targeted BFS on sensitive edges."""
+        if not hasattr(self, 'sensitive_edges') or not self.sensitive_edges:
+             return []
+        
         adj = defaultdict(list)
+        active_edges_set = set(edges)
         for u, v in edges:
             adj[u].append(v)
         
         cycles = []
-        visited = set()
-        path = []
-        path_set = set()
         
-        def dfs(u):
-            if u in path_set:
-                try:
-                    idx = path.index(u)
-                    cycle_nodes = path[idx:]
-                    cycle_edges = []
-                    for i in range(len(cycle_nodes)):
-                        u_node = cycle_nodes[i]
-                        v_node = cycle_nodes[(i + 1) % len(cycle_nodes)]
-                        cycle_edges.append((u_node, v_node))
-                    cycles.append(cycle_edges)
-                except ValueError:
-                    pass
-                return
-
-            if u in visited:
-                return
-
-            visited.add(u)
-            path.append(u)
-            path_set.add(u)
+        # Identify which sensitive edges are currently active
+        active_sensitive = [e for e in self.sensitive_edges if e in active_edges_set]
+        
+        for u, v in active_sensitive:
+            if len(cycles) >= 20: break
             
-            for v in adj[u]:
-                dfs(v)
+            # BFS to find shortest path from v back to u
+            # This confirms a cycle passing through (u, v)
+            queue = [(v, [v])]
+            visited = {v}
+            found_path = None
+            
+            while queue:
+                curr, path = queue.pop(0)
+                if curr == u:
+                    found_path = path
+                    break
                 
-            path.pop()
-            path_set.remove(u)
+                # Limit depth to avoid large search in complex graphs
+                if len(path) > 20: 
+                    continue
+
+                for neighbor in adj[curr]:
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append((neighbor, path + [neighbor]))
             
-        nodes = set(u for u, v in edges) | set(v for u, v in edges)
-        for n in nodes:
-            if n not in visited:
-                dfs(n)
+            if found_path:
+                # Cycle found: (u, v) + (v -> ... -> u)
+                cycle_edges = [(u, v)]
+                for i in range(len(found_path) - 1):
+                    cycle_edges.append((found_path[i], found_path[i+1]))
+                cycles.append(cycle_edges)
                 
         return cycles 
 
@@ -513,16 +530,14 @@ class CustomEnv(gym.Env):
         # 1. Primary Objective: Maximize Total Flow (Always Priority 10)
         self.maxflow_model.setObjectiveN(self.flow_var[self.super_edge], index=0, priority=10, weight=1.0, name="max_flow")
 
+        # Minimize number of edges used to prevent cycles (Always Priority 1)
+        # self.maxflow_model.setObjectiveN(expr, index=10, priority=1, weight=-1.0, name="min_edges_used")
+
         if routing_assumption in ['divert', 'canalize', 'isolate']:
             # Use subtour elimination callback - requires BINARY vars
             self.maxflow_model.params.LazyConstraints = 1
-            # Do NOT add min_edges_used objective
         else:
             self.maxflow_model.params.LazyConstraints = 0
-
-            # Minimize number of edges used to prevent cycles (Always Priority 1)
-            expr = grb.quicksum(self.edge_used[e] for e in self.all_both_edges)
-            self.maxflow_model.setObjectiveN(expr, index=1, priority=1, weight=-1.0, name="min_edges_used")
 
         if routing_assumption == "zero_sum":
             pass
@@ -532,26 +547,85 @@ class CustomEnv(gym.Env):
             target_indices = np.where(self.state['isolate_objective'][:self.num_both_edges] == 1)[0]
             target_edges = [self.both_edges[i] for i in target_indices]
             
-            if target_edges:  #CLEAN THIS UP SO IT IS ONLY ONE-WAY
-                expr = grb.quicksum(self.flow_var[e] + self.flow_var[(e[1], e[0])] for e in target_edges)
+            if target_edges:
+                # Only count flow towards the sink (encoded in the edge tuple)
+                expr = grb.quicksum(self.flow_var[e] for e in target_edges)
                 self.maxflow_model.setObjectiveN(expr, index=1, priority=5, weight=1.0, name="max_isolate_flow")
 
         elif routing_assumption == "canalize":
-            # Secondary: Minimize the minimum flow among all the canalize objective edges of the extracted_directed_path_edges (Priority 5)
-            target_edges = self._extract_directed_path_edges('canalize_objective')
+            # Secondary: Minimize the maximum of the minimum flows for each direction (Priority 5)
+            # Canalize uses segments, so we extract directly from the mask rather than tracing from source
+            target_indices = np.where(self.state['canalize_objective'][:self.num_both_edges] == 1)[0]
+            target_edges = [self.both_edges[i] for i in target_indices]
             
             if target_edges:
-                # Aux variable z representing min flow
-                z = self.maxflow_model.addVar(vtype=grb.GRB.CONTINUOUS, name="min_canalize_flow")
-                self.aux_vars.append(z)
+                # Reconstruct path topology to ensure consistent direction
+                target_edges_set = set(target_edges)
+                adj = defaultdict(list)
+                degrees = defaultdict(int)
+                for u, v in target_edges:
+                    adj[u].append(v)
+                    adj[v].append(u)
+                    degrees[u] += 1
+                    degrees[v] += 1
                 
-                # Use General Constraint Min: z = min(flows)
-                path_flow_vars = [self.flow_var[e] for e in target_edges]
-                gc = self.maxflow_model.addGenConstrMin(z, path_flow_vars, name="min_flow_gc")
-                self.aux_constrs.append(gc)
+                # Find start node (degree 1 for path, or just min ID if cycle/ambiguous)
+                endpoints = [n for n, d in degrees.items() if d == 1]
+                curr = min(endpoints) if endpoints else min(degrees.keys())
                 
-                # Minimize z (since ModelSense is MAXIMIZE, weight=-1.0)
-                self.maxflow_model.setObjectiveN(z, index=1, priority=5, weight=-1.0, name="min_min_canalize")
+                ordered_fwd_edges = []
+                visited_edges = set()
+                
+                # Stack-based traversal to order edges into a consistent chain
+                # Handles potentially disjoint components by restarting if needed
+                while len(ordered_fwd_edges) < len(target_edges):
+                    found_next_in_path = False
+                    for neighbor in adj[curr]:
+                         edge_c_n = (curr, neighbor)
+                         edge_n_c = (neighbor, curr)
+                         
+                         actual_edge = None
+                         if edge_c_n in target_edges_set: actual_edge = edge_c_n
+                         elif edge_n_c in target_edges_set: actual_edge = edge_n_c
+                         
+                         if actual_edge and actual_edge not in visited_edges:
+                             ordered_fwd_edges.append((curr, neighbor)) # Consistent direction
+                             visited_edges.add(actual_edge)
+                             curr = neighbor
+                             found_next_in_path = True
+                             break
+                    
+                    if not found_next_in_path:
+                         remaining_edges = target_edges_set - visited_edges
+                         if not remaining_edges:
+                             break
+                         next_edge = list(remaining_edges)[0]
+                         curr = next_edge[0]
+
+                ordered_rev_edges = [(v, u) for (u, v) in ordered_fwd_edges]
+
+                # 1. Forward Direction Min Flow
+                z_fwd = self.maxflow_model.addVar(vtype=grb.GRB.CONTINUOUS, name="min_canalize_fwd")
+                self.aux_vars.append(z_fwd)
+                path_flow_vars_fwd = [self.flow_var[e] for e in ordered_fwd_edges]
+                gc_fwd = self.maxflow_model.addGenConstrMin(z_fwd, path_flow_vars_fwd, name="min_flow_gc_fwd")
+                self.aux_constrs.append(gc_fwd)
+
+                # 2. Reverse Direction Min Flow
+                z_rev = self.maxflow_model.addVar(vtype=grb.GRB.CONTINUOUS, name="min_canalize_rev")
+                self.aux_vars.append(z_rev)
+                path_flow_vars_rev = [self.flow_var[e] for e in ordered_rev_edges]
+                gc_rev = self.maxflow_model.addGenConstrMin(z_rev, path_flow_vars_rev, name="min_flow_gc_rev")
+                self.aux_constrs.append(gc_rev)
+
+                # 3. Combined Metric: Max(Min_Fwd, Min_Rev)
+                z_comb = self.maxflow_model.addVar(vtype=grb.GRB.CONTINUOUS, name="max_min_canalize")
+                self.aux_vars.append(z_comb)
+                gc_comb = self.maxflow_model.addGenConstrMax(z_comb, [z_fwd, z_rev], name="max_min_gc")
+                self.aux_constrs.append(gc_comb)
+                
+                # Minimize z_comb (since ModelSense is MAXIMIZE, weight=-1.0)
+                self.maxflow_model.setObjectiveN(z_comb, index=1, priority=5, weight=-1.0, name="min_min_canalize")
 
         elif routing_assumption == "divert":
             # Identify Edge Sets
@@ -645,7 +719,8 @@ class CustomEnv(gym.Env):
         self._cleanup_models()
         self.strategy_objectives_setup = False # Force objective reset on next solve
         self.old_routing_assumption = False
-        self.reference_start_flows = None
+        self.reference_start_flows = None # Plural (divert)
+        self.reference_start_flow = None # Singular (canalize)
 
         # Clear local outcome cache on reset because capacities/objectives change
         self.local_outcome_cache = {}
@@ -714,9 +789,13 @@ class CustomEnv(gym.Env):
             if self.attacker_strategy == 'zero_sum':
                 self.reference_obj, self.reference_flows = self._compute_objective_and_flows()
             elif self.attacker_strategy == 'canalize':
-                target_path_flow, self.reference_flows = self._calculate_canalize_objective_and_flows()
+                # Explicitly calculate reference (raw) flow on reset
+                _, flows = self.solve_max_flow(routing_assumption = 'canalize')
+                target_path_flow = self._calculate_target_path_flow(flows, 'canalize_objective')
+                
                 self.reference_start_flow = target_path_flow
-                self.reference_obj = 0
+                self.reference_obj = 0 # (target_path_flow - self.reference_start_flow)
+                self.reference_flows = flows
             elif self.attacker_strategy == 'isolate':
                 self.reference_obj, self.reference_flows = self._calculate_isolate_objective_and_flows()
             elif self.attacker_strategy == 'divert':
@@ -873,43 +952,103 @@ class CustomEnv(gym.Env):
         if not candidates:
              candidates.append(max_flow_edge_set)
 
-        # 4. Choose the best alternative path
-        best_path = None
-        # Metrics: (bottleneck (maximize), total_flow_per_edge (minimize))
-        best_metrics = (-1.0, -float('inf')) 
+        # 4. Generate Connected Segments
+        # "randomly choose three connected segments and use these as the candidates"
+        final_candidates = []
+        segment_pool = []
         
         for path in candidates:
-            # Calculate bottleneck and total flow
-            min_cap = float('inf')
-            sum_flow = 0.0
+            # Filter to edges that actually exist in the model's edge set
+            # This filters out potential artifacts or non-indexed edges but accounts for reverse edges
+            valid_edges = [edge for edge in path if edge in self.edge_to_index or (edge[1], edge[0]) in self.edge_to_index]
             
-            for edge in path:
-                 # Capacity
-                 idx = self.edge_to_index.get(edge)
-                 if idx is None: idx = self.edge_to_index.get((edge[1], edge[0]))
-                 if idx is not None:
-                     cap = self.state['edge_capacity'][idx]
-                     if cap < min_cap: min_cap = cap
-                 
-                 # Current Flow (from max flow solution)
-                 f = flows.get(edge, 0)
-                 sum_flow += f
+            # Further filter to "internal" edges if possible (exclude SuperSource/SuperSink connections)
+            # to make the canalization objective more "central" to the network
+            internal_edges = [e for e in valid_edges if e[0] not in self.super_source_nodes and e[1] not in self.super_sink_nodes]
             
-            avg_flow = sum_flow / len(path) if len(path) > 0 else 0
+            # Use internal edges if we have enough, otherwise fallback to all valid edges
+            pool_source = internal_edges if len(internal_edges) >= 2 else valid_edges
+
+            if len(pool_source) >= 2:
+                if len(pool_source) == 2:
+                    segment_pool.append(pool_source)
+                else:
+                    # Pick a random segment of length 2
+                    start_idx = random.randint(0, len(pool_source) - 2)
+                    segment_pool.append(pool_source[start_idx : start_idx + 2])
+        
+        # Fallback: If segment pool is empty (no paths with >= 2 edges), try to use any valid edge pair from candidates
+        if not segment_pool and candidates:
+             for path in candidates:
+                 valid_edges = [edge for edge in path if edge in self.edge_to_index or (edge[1], edge[0]) in self.edge_to_index]
+                 if len(valid_edges) >= 2:
+                     segment_pool.append(valid_edges[:2])
+                     
+        # Select top 3 segments based on bottleneck capacity
+        candidates_with_caps = []
+        for seg in segment_pool:
+            caps = []
+            for edge in seg:
+                if edge in self.edge_to_index:
+                    caps.append(self.state['edge_capacity'][self.edge_to_index[edge]])
+                elif (edge[1], edge[0]) in self.edge_to_index:
+                    caps.append(self.state['edge_capacity'][self.edge_to_index[(edge[1], edge[0])]])
             
-            # Metric: Max bottleneck, then Min avg_flow
-            current_metrics = (min_cap, -avg_flow)
+            # Bottleneck is minimum capacity in the segment
+            bottleneck = min(caps) if caps else -1
+            candidates_with_caps.append((bottleneck, seg))
+        
+        # Sort descending by bottleneck capacity
+        candidates_with_caps.sort(key=lambda x: x[0], reverse=True)
+            
+        # Take top 3
+        final_candidates = [seg for _, seg in candidates_with_caps[:3]]
+            
+        # 5. Select Best Candidate (Least Flow)
+        best_path = None
+        min_candidate_flow = float('inf')
+        
+        for candidate in final_candidates:
+             # Construct objective vector for this candidate
+             temp_objective = np.zeros(self.max_num_edges, dtype=int)
+             for edge in candidate:
+                 # Mark ONLY forward (directed) edge
+                 if edge in self.edge_to_index:
+                     temp_objective[self.edge_to_index[edge]] = 1
+                 elif (edge[1], edge[0]) in self.edge_to_index:
+                     temp_objective[self.edge_to_index[(edge[1], edge[0])]] = 1
+             
+             # Apply temporary objective
+             self.state['canalize_objective'] = temp_objective
+             
+             # Solve and measure flow
+             _, candidate_flows = self.solve_max_flow(routing_assumption='canalize')
+             
+             # Calculate total flow passing through the candidate edges
+             # For bottleneck calculation, we want the flow through the sequence.
+             # Using min flow is better than sum for bottleneck.
+             current_flow_vals = [candidate_flows.get(edge, 0) for edge in candidate]
+             current_flow = min(current_flow_vals) if current_flow_vals else 0
+             
+             if current_flow < min_candidate_flow:
+                 min_candidate_flow = current_flow
+                 best_path = candidate
 
-            if best_path is None or current_metrics > best_metrics:
-                best_metrics = current_metrics
-                best_path = path
+        # Handle case where no candidates found/processed
+        if best_path is None:
+             best_path = candidates[0] if candidates else []
 
-        # 5. Set objective
-        canalize_objective = np.zeros(self.max_num_edges, dtype=int)
-        edge_in_path = np.array([edge in best_path or (edge[1], edge[0]) in best_path for edge in self.both_edges], dtype=bool)
-        canalize_objective[:len(edge_in_path)] = edge_in_path.astype(int)
+        # 6. Set Final Objective
+        final_objective = np.zeros(self.max_num_edges, dtype=int)
+        
+        for edge in best_path:
+            # Mark ONLY forward (directed) edge
+            if edge in self.edge_to_index:
+                final_objective[self.edge_to_index[edge]] = 1
+            elif (edge[1], edge[0]) in self.edge_to_index:
+                final_objective[self.edge_to_index[(edge[1], edge[0])]] = 1
 
-        return {**base_state, 'canalize_objective': canalize_objective}
+        return {**base_state, 'canalize_objective': final_objective}
 
     def _find_random_path_from_supersource(self, avoid_nodes, max_length):
         """Find a random path from SuperSource to SuperSink avoiding specific nodes."""
@@ -938,7 +1077,7 @@ class CustomEnv(gym.Env):
             if len(path_edges) > max_length:
                 return None
                 
-        return set(path_edges)
+        return path_edges
 
     def _add_isolate_components(self, base_state):
         """Add isolate-specific objective to state (edge-based, sink-connected only)."""
@@ -959,32 +1098,54 @@ class CustomEnv(gym.Env):
     def _extract_directed_path_edges(self, objective_key):
         """Helper logic to extract path edges in order based on an objective key."""
         obj_mask = self.state[objective_key]
-        path_edges = []
-        current_node = 1
-        visited = {1}
-        sink_nodes = set(self.sink_nodes)
-        super_sink_nodes = set(self.super_sink_nodes)
+        indices = np.where(obj_mask[:self.num_both_edges] == 1)[0]
+        if len(indices) == 0:
+            return []
+            
+        target_edges_set = {self.both_edges[i] for i in indices}
         
-        while current_node not in sink_nodes and current_node not in super_sink_nodes:
-            found_next = False
-            if current_node in self.edge_groups:
-                for edge in self.edge_groups[current_node]['out']:
-                    neighbor = edge[1]
-                    if neighbor in visited:
-                        continue
-                    
-                    idx = self.edge_to_index.get(edge)
-                    if idx is None:
-                        idx = self.edge_to_index.get((neighbor, current_node))
-                    
-                    if idx is not None and obj_mask[idx] == 1:
-                        path_edges.append(edge)
-                        current_node = neighbor
-                        visited.add(current_node)
-                        found_next = True
-                        break
-            if not found_next:
+        # Build adjacency for subgraph
+        adj = defaultdict(list)
+        in_degree = defaultdict(int)
+        nodes = set()
+        
+        for u, v in target_edges_set:
+            adj[u].append(v)
+            in_degree[v] += 1
+            if u not in in_degree: in_degree[u] += 0
+            nodes.add(u)
+            nodes.add(v)
+            
+        # Find start node(s): in-degree 0 in the subgraph
+        start_nodes = [n for n in nodes if in_degree[n] == 0]
+        
+        if not start_nodes:
+            # If no start node (e.g. cycle), just pick one
+            curr = 1 if 1 in nodes else min(nodes)
+        else:
+             curr = 1 if 1 in start_nodes else start_nodes[0]
+        
+        path_edges = []
+        visited = {curr}
+        
+        # Traverse
+        while True:
+            next_node = None
+            # Find next step in the path
+            if curr in adj:
+                for neighbor in adj[curr]:
+                     if (curr, neighbor) in target_edges_set:
+                          if neighbor not in visited:
+                               next_node = neighbor
+                               path_edges.append((curr, neighbor))
+                               break
+            
+            if next_node is not None:
+                curr = next_node
+                visited.add(curr)
+            else:
                 break
+                
         return path_edges
 
     def _add_divert_components(self, base_state):
@@ -998,20 +1159,96 @@ class CustomEnv(gym.Env):
         _, flows = self.solve_max_flow()
         from_path = self._extract_max_flow_path(flows)
 
-        # Find alternative path avoiding max flow path
-        to_path = self._find_best_alternative_path(from_path)
+        # Identify valid breakpoints and corresponding divert_from/divert_to segments
+        candidates = []
+        
+        # We need at least 1 edge before and 2 edges after for divert_from
+        for i in range(1, len(from_path) - 1):
+             breakpoint_node = from_path[i][0]
+             
+             # divert_from segments: 1 before, 2 after
+             if i + 2 > len(from_path):
+                 continue
+                 
+             # Edge before breakpoint
+             pre_edge = from_path[i-1]
+             
+             # Edges after breakpoint
+             post_divert_from = [from_path[i], from_path[i+1]]
+             
+             divert_from_segments = [pre_edge] + post_divert_from
+             
+             # divert_to segments: find alternate path of length 2 from breakpoint
+             # that does not intersect with post_divert_from (pre_edge is shared)
+             divert_to_post = self._find_alternate_segment(breakpoint_node, post_divert_from)
+             
+             if divert_to_post:
+                 divert_to_segments = [pre_edge] + divert_to_post
+                 candidates.append((divert_from_segments, divert_to_segments))
+        
+        if not candidates:
+             # Fallback if no valid configuration found
+             divert_from_edges = from_path 
+             divert_to_edges = [] 
+        else:
+             # Randomly choose a breakpoint configuration
+             selected_candidate = random.choice(candidates)
+             divert_from_edges = selected_candidate[0]
+             divert_to_edges = selected_candidate[1]
 
         # Convert paths to objective arrays
         divert_from = np.zeros(self.max_num_edges, dtype=int)
         divert_to = np.zeros(self.max_num_edges, dtype=int)
 
         for e, edge in enumerate(self.both_edges):
-            if edge in from_path or (edge[1],edge[0]) in from_path:
+            if edge in divert_from_edges or (edge[1],edge[0]) in divert_from_edges:
                 divert_from[e] = 1
-            if edge in to_path or (edge[1],edge[0]) in to_path:
+            if edge in divert_to_edges or (edge[1],edge[0]) in divert_to_edges:
                 divert_to[e] = 1
              # Padded entries remain 0
         return {**base_state, 'divert_from_objective': divert_from, 'divert_to_objective': divert_to}
+
+    def _find_alternate_segment(self, start_node, avoid_edges):
+        """Find a random 2-segment path starting from start_node avoiding avoid_edges."""
+        avoid_set = set(avoid_edges)
+        
+        # Edges from start_node
+        if start_node not in self.edge_groups:
+            return None
+        
+        valid_first_edges = []
+        for edge1 in self.edge_groups[start_node]['out']:
+             # Check if edge is in avoid_set
+             if edge1 in avoid_set or (edge1[1], edge1[0]) in avoid_set:
+                 continue
+             
+             # Check if edge is valid
+             if edge1[1] not in self.edge_groups: # Need outgoing edges for 2nd segment
+                  continue
+             
+             valid_first_edges.append(edge1)
+        
+        random.shuffle(valid_first_edges)
+        
+        for edge1 in valid_first_edges:
+             node2 = edge1[1]
+             valid_second_edges = []
+             
+             if node2 not in self.edge_groups: continue
+
+             for edge2 in self.edge_groups[node2]['out']:
+                 if edge2 in avoid_set or (edge2[1], edge2[0]) in avoid_set:
+                      continue
+                 # Avoid immediate cycle back to start
+                 if edge2[1] == start_node:
+                      continue
+                 valid_second_edges.append(edge2)
+             
+             if valid_second_edges:
+                  edge2 = random.choice(valid_second_edges)
+                  return [edge1, edge2]
+                  
+        return None
 
     def _find_simple_path(self):
         """Find a simple path from source to sink."""
@@ -1039,17 +1276,17 @@ class CustomEnv(gym.Env):
 
     def _extract_max_flow_path(self, flows):
         """Extract the path with maximum flow from flows dictionary."""
-        from_path = set()
+        from_path = []
         current_node = self.super_sink_nodes[0]
         source = 1
     
         while current_node != source:
             incoming_edges = self.edge_groups[current_node]['in']
             prev_edge = max(incoming_edges, key=lambda e: flows.get(e, 0)+ random.random() * 1e-6)
-            from_path.add(prev_edge)
+            from_path.append(prev_edge)
             current_node = prev_edge[0]
     
-        return from_path
+        return list(reversed(from_path))
 
     def _find_best_alternative_path(self, max_flow_edges, num_samples=10):
         """Find multiple alternative paths and select the one with the widest bottleneck."""
@@ -1567,15 +1804,51 @@ class CustomEnv(gym.Env):
 
     def _calculate_target_path_flow(self, flows, objective_key):
         """Calculate total flow through edges marked in the objective."""
-        path_edges = self._extract_directed_path_edges(objective_key)
-
-        if not path_edges:
+        # Modified to support partial paths (canalize) by using mask directly
+        if objective_key == 'canalize_objective':
+            # Just get all marked edges
+            objective = self.state[objective_key]
+            indices = np.where(objective[:self.num_both_edges] == 1)[0]
+            path_edges = [self.both_edges[i] for i in indices]
+            
+            if not path_edges:
+                return 0.0
+                
+            # Check for contiguous flow in either direction relative to the path definition
+            fwd_flows = [flows.get(e, 0) for e in path_edges]
+            rev_flows = [flows.get((e[1], e[0]), 0) for e in path_edges]
+            
+            min_fwd = min(fwd_flows)
+            max_rev = max(rev_flows)
+            
+            # Use small epsilon for float comparison
+            EPS = 1e-5
+            
+            # Case 1: Consistent forward flow (min > 0) AND no reverse flow
+            if min_fwd > EPS and max_rev < EPS:
+                return min_fwd
+                
+            min_rev = min(rev_flows)
+            max_fwd = max(fwd_flows)
+            
+            # Case 2: Consistent reverse flow (min > 0) AND no forward flow
+            if min_rev > EPS and max_fwd < EPS:
+                return min_rev
+                
+            # If mixed directions or breaks in flow, return 0
             return 0.0
+            
+        else:
+            # Use strict path extraction for other strategies (ensures connectivity from source)
+            path_edges = self._extract_directed_path_edges(objective_key)
 
-        target_flows = [flows.get(edge, 0) for edge in path_edges]
-
-        # Return minimum flow among target edges
-        return min(target_flows)
+            if not path_edges:
+                return 0.0
+    
+            target_flows = [flows.get(edge, 0) for edge in path_edges]
+    
+            # Return minimum flow among target edges (bottleneck)
+            return min(target_flows)
 
     def _calculate_target_edge_flow(self, flows, objective_key):
         """Calculate total flow on edges marked in the objective."""
@@ -1690,8 +1963,158 @@ class CustomEnv(gym.Env):
         print("=" * 80)
         # END Gymnasium Environment Methods
             
-    def solve_optimal_interdiction(self):
+    def _solve_with_benders(self, n_scenarios, seed=None, interdicted_edges=[]):
+        """
+        Solves network interdiction using Benders Decomposition (L-shaped method).
+        Speed-up for stochastic/deterministic cases compared to large MIP.
+        """
+        if seed is not None:
+            self._set_random_seeds(seed)
+            
+        # Use local random state for scenario generation to ensure consistency
+        rng = np.random.RandomState(seed if seed is not None else 1)
+        
+        # 1. Generate Sampling Outcomes (consistent across iterations)
+        # Outcome: 1 if interdiction succeeds (removing capacity), 0 if fails.
+        probs = self.state["edge_interdiction_probability"][:self.num_both_edges]
+        if self.deterministic_outcomes:
+             scenario_outcomes = np.ones((1, self.num_both_edges))
+             n_scenarios = 1
+        else:
+            scenario_outcomes = rng.binomial(1, probs, size=(n_scenarios, self.num_both_edges))
+
+        # 2. Master Problem Setup
+        master = grb.Model("Benders Master", env=self.GUROBI_ENV)
+        master.Params.OutputFlag = 0
+        master.setParam('Threads', 1) 
+        
+        # Variables: Gamma (Interdiction decision)
+        gamma = master.addVars(self.both_edges, vtype=grb.GRB.BINARY, name="gamma")
+        
+        # Enforce fixed interdictions
+        for e in interdicted_edges:
+            gamma[e].LB = 1.0
+            
+        # Theta: Objective value proxy for each scenario
+        theta = master.addVars(n_scenarios, lb=0, vtype=grb.GRB.CONTINUOUS, name="theta")
+        
+        # Budget Constraint
+        master.addConstr(
+            grb.quicksum(self.edges_reset[e].interdiction_cost * gamma[e] for e in self.both_edges) <= self.state['budget'][0],
+            name="budget"
+        )
+        
+        if self.deterministic_outcomes:
+             master.addConstrs((gamma[e] <= probs[self.edge_to_index[e]] for e in self.both_edges), "prob_limit")
+
+        # Objective: Min Avg Theta
+        master.setObjective((1.0/n_scenarios) * grb.quicksum(theta[s] for s in range(n_scenarios)), grb.GRB.MINIMIZE)
+        
+        # 3. Initialize MaxFlow Model (Subproblem)
+        if not hasattr(self, 'maxflow_model'):
+            self._initialize_maxflow_model()
+            
+        # Relax edge_used variables to get LP duals
+        original_vtypes = {e: self.edge_used[e].VType for e in self.all_both_edges}
+        for e in self.all_both_edges:
+            self.edge_used[e].VType = grb.GRB.CONTINUOUS
+            self.edge_used[e].UB = 1.0 # Enforce [0,1]
+            
+        self.maxflow_model.update()
+        
+        # 4. Benders Loop
+        MAX_ITER = 30
+        epsilon = 1e-4
+        
+        converged = False
+        best_gamma = []
+        best_obj = float('inf')
+        
+        for iteration in range(MAX_ITER):
+            # Solve Master
+            master.optimize()
+            if master.Status != grb.GRB.OPTIMAL:
+                if iteration == 0: return float('inf'), []
+                break
+                
+            gamma_val = {e: gamma[e].X for e in self.both_edges}
+            master_obj = master.ObjVal
+            
+            total_subproblem_obj = 0
+            cuts_added = 0
+            
+            for s in range(n_scenarios):
+                # Construct capacity_dict for scenario s
+                cap_dict = {}
+                for idx, e in enumerate(self.both_edges):
+                    is_interdicted = (gamma_val[e] > 0.5)
+                    outcome = scenario_outcomes[s, idx]
+                    
+                    if is_interdicted and outcome == 1:
+                        cap_dict[e] = 0.0
+                    else:
+                        cap_dict[e] = self.edges_reset[e].capacity
+
+                # Solve Max Flow (LP Relaxation)
+                # Ensure solve_max_flow uses provided dict and returns obj
+                val_lp, _ = self.solve_max_flow(capacity_dict=cap_dict)
+                total_subproblem_obj += val_lp
+                
+                theta_val = theta[s].X
+                
+                if theta_val < val_lp - epsilon:
+                    # Generate Cut
+                    lhs_expr = 0
+                    for idx, e in enumerate(self.both_edges):
+                        pi_fwd = 0
+                        pi_rev = 0
+                        try:
+                            # Try tuple key (idx, e) as created by enumerate in addConstrs
+                            pi_fwd = self.forward_cons[idx, e].Pi
+                            pi_rev = self.reverse_cons[idx, e].Pi
+                        except (KeyError, AttributeError, TypeError):
+                            pass
+
+                        sensitivity = (pi_fwd + pi_rev)
+                        cap_e = self.edges_reset[e].capacity
+                        outcome_e = scenario_outcomes[s, idx]
+                        
+                        term_coeff = sensitivity * (-cap_e * outcome_e)
+                        
+                        if abs(term_coeff) > 1e-9:
+                            lhs_expr += term_coeff * (gamma[e] - gamma_val[e])
+
+                    master.addConstr(theta[s] >= val_lp + lhs_expr, name=f"cut_{iteration}_{s}")
+                    cuts_added += 1
+
+            avg_subproblem_obj = total_subproblem_obj / n_scenarios
+            
+            # Check convergence
+            if abs(master_obj - avg_subproblem_obj) < epsilon:
+                converged = True
+                best_obj = avg_subproblem_obj
+                best_gamma = [e for e in self.both_edges if gamma_val[e] > 0.5]
+                break
+                
+            if cuts_added == 0 and iteration > 0:
+                break
+        
+        # Restore variable types
+        for e in self.all_both_edges:
+            self.edge_used[e].VType = original_vtypes[e]
+        self.maxflow_model.update()
+        
+        if not converged:
+             best_obj = avg_subproblem_obj
+             best_gamma = [e for e in self.both_edges if gamma_val[e] > 0.5]
+            
+        return best_obj, best_gamma
+
+    def solve_optimal_interdiction(self, use_benders=False):
         if self.deterministic_outcomes == True: #Solve Deterministic Case with Wood's Max/Min Formulation
+            if use_benders:
+                 return self._solve_with_benders(n_scenarios=1)
+            
             if not hasattr(self, 'optimal_deterministic_model'):
                 # Initialize the Gurobi model
                 self.optimal_deterministic_model = grb.Model("Network Interdiction Model 1U", env=self.GUROBI_ENV)
@@ -1763,7 +2186,7 @@ class CustomEnv(gym.Env):
                     interdicted_key = tuple(interdiction_vector)
                     
                 else:
-                    objective_value, interdicted_edges = self.solve_stochastic_max_flow(n_scenarios=M, seed=seed)
+                    objective_value, interdicted_edges = self.solve_stochastic_max_flow(n_scenarios=M, seed=seed, use_benders=use_benders)
                     
                     # Create dense vector for key (binary)
                     interdiction_vector = np.zeros(len(self.both_edges), dtype=int)
@@ -1783,7 +2206,7 @@ class CustomEnv(gym.Env):
                         for e, k in zip(interdicted_edges, interdicted_quantities):
                             current_solution.extend([e] * k)
                     else:
-                        objective_value, interdicted_edges = self.solve_stochastic_max_flow(n_scenarios=N, interdicted_edges=interdicted_edges)
+                        objective_value, interdicted_edges = self.solve_stochastic_max_flow(n_scenarios=N, interdicted_edges=interdicted_edges, use_benders=use_benders)
                         current_solution = interdicted_edges
 
                     if objective_value < best_objective_value:
@@ -1792,7 +2215,10 @@ class CustomEnv(gym.Env):
 
             return best_objective_value, best_interdicted_edges
 
-    def solve_stochastic_max_flow(self, n_scenarios = 50, seed = 173, interdicted_edges = []):      
+    def solve_stochastic_max_flow(self, n_scenarios = 50, seed = 173, interdicted_edges = [], use_benders=False):
+        if use_benders:
+            return self._solve_with_benders(n_scenarios, seed, interdicted_edges)
+
         # Optimally Solve for Stochastic Solution using Model 1U and SAA
         if not hasattr(self, 'optimal_stochastic_model'):
             # Initializing the model
@@ -2054,11 +2480,35 @@ class CustomEnv(gym.Env):
         """
         if start_nodes is None:
             start_nodes = self.state['isolate_objective']
-            
-        target_nodes = set()
-        for idx in np.where(start_nodes[:self.num_both_edges]==1)[0]:
-            edge = self.both_edges[idx]
-            target_nodes.add(edge[1])
+        
+        objective_edge_indices = set()
+        is_canalize = (self.attacker_strategy == 'canalize')
+
+        # Check if the start_nodes contains nodes or edges
+        # If passed an array of size num_edges with 0/1, it's an edge mask
+        if isinstance(start_nodes, np.ndarray) and start_nodes.shape[0] >= self.num_both_edges:
+            if is_canalize:
+                # Canalize case: use both endpoints of the objective path
+                obj_indices = np.where(start_nodes[:self.num_both_edges]==1)[0]
+                objective_edge_indices = set(obj_indices)
+                obj_edges = [self.both_edges[i] for i in obj_indices]
+                
+                counts = {}
+                for u, v in obj_edges:
+                    counts[u] = counts.get(u, 0) + 1
+                    counts[v] = counts.get(v, 0) + 1
+                    
+                # Endpoints (degree 1 in path subgraph)
+                target_nodes = {n for n, c in counts.items() if c == 1}
+            else:
+                 # Standard extraction for other strategies (nodes from edge mask)
+                 target_nodes = set()
+                 for idx in np.where(start_nodes[:self.num_both_edges]==1)[0]:
+                     edge = self.both_edges[idx]
+                     target_nodes.add(edge[1])
+        else:
+            # Assume start_nodes is already a set/list of node IDs
+            target_nodes = set(start_nodes)
 
         visited_nodes = set(target_nodes)
         incoming_edge_indices = set()
@@ -2067,9 +2517,24 @@ class CustomEnv(gym.Env):
             arrival_in_targets = np.isin(self.edge_arrivals, list(target_nodes))
             has_flow = (self.cached_flow_array[:self.num_both_edges]) > 1e-6
             valid_edge_indices = np.where(arrival_in_targets & has_flow)[0]
-            incoming_edge_indices.update(valid_edge_indices)
-            # Get new target nodes (departure nodes of incoming edges)
-            new_target_nodes = set([self.both_edges[idx][0] for idx in valid_edge_indices])
+            
+            if is_canalize:
+                # Traceback logic for canalize: filter out tracing THROUGH objective edges
+                indices_to_trace = []
+                for idx in valid_edge_indices:
+                    incoming_edge_indices.add(idx)
+                    # If edge is NOT in objective, we can trace back from its start node.
+                    # If it IS in objective, we record it (protected) but STOP tracing this branch.
+                    if idx not in objective_edge_indices:
+                        indices_to_trace.append(idx)
+                
+                if indices_to_trace:
+                     new_target_nodes = set([self.both_edges[i][0] for i in indices_to_trace])
+                else:
+                     new_target_nodes = set()
+            else:
+                incoming_edge_indices.update(valid_edge_indices)
+                new_target_nodes = set([self.both_edges[idx][0] for idx in valid_edge_indices])
     
             # Remove already visited nodes
             target_nodes = new_target_nodes - visited_nodes
@@ -2079,7 +2544,8 @@ class CustomEnv(gym.Env):
     
 #        incoming_edges_with_flow = [self.both_edges[idx] for idx in incoming_edge_indices]
         action_mask = np.zeros(self.num_both_edges, dtype=bool)
-        action_mask[list(incoming_edge_indices)] = True
+        if incoming_edge_indices:
+            action_mask[list(incoming_edge_indices)] = True
         return(action_mask)
     
     def calculate_action_heuristics(self, valid_actions, flows, remaining_budget):
@@ -2116,25 +2582,31 @@ class CustomEnv(gym.Env):
         
         projection_mask = affordable & has_prob & limit_ok & strategy_mask
         
-        # 2. Max Benefit (for future moves)
+        # 2. Get Max Projected Benefit for future moves
         if np.any(projection_mask):
-            caps = self.state['edge_capacity'][:self.num_interdictable]
-            probs = self.state['edge_interdiction_probability'][:self.num_interdictable]
-            max_benefit = np.max((caps * probs)[projection_mask])
+            caps_proj = self.state['edge_capacity'][:self.num_interdictable]
+            probs_proj = self.state['edge_interdiction_probability'][:self.num_interdictable]
+            
+            # Use max expected value (prob * cap) for future moves
+            max_future_benefit = np.max((caps_proj * probs_proj)[projection_mask])
         else:
-            max_benefit = 0.0
+            max_future_benefit = 0.0
 
         # 3. Calculate heuristics for valid_actions
         action_costs = self.state['edge_costs'][valid_actions]
         # Added epsilon to prevent floating point floor errors from underestimating moves
         future_moves = np.floor((remaining_budget - action_costs + 1e-9) / self.min_edge_cost)
         
-        caps = self.state['edge_capacity'][valid_actions]
         probs = self.state['edge_interdiction_probability'][valid_actions]
-        potential_vals = caps * probs
         
-        # Heuristic = Base + Projected Future Benefit
-        heuristics = potential_vals + (future_moves * max_benefit)
+        # Calculate Current Flow on the candidate edges
+        current_flow_vals = np.array([
+            flows.get(self.both_edges[a], 0) + flows.get((self.both_edges[a][1], self.both_edges[a][0]), 0)
+            for a in valid_actions
+        ])
+        
+        # User requested formula: prop*flow +(future_moves*max(probs*caps))
+        heuristics = (probs * current_flow_vals) + (future_moves * max_future_benefit)
         
         return heuristics
 
@@ -2166,13 +2638,19 @@ class CustomEnv(gym.Env):
                              on_path_to_source &
                              #has_flow &
                              within_limit)
-        
         elif self.attacker_strategy == 'canalize':
-            has_flow = self.cached_flow_array[:self.num_interdictable] > 0
-            not_target = self.state['canalize_objective'][:self.num_interdictable] != 1
-            valid_actions = (sufficient_budget & #has_capacity & 
-                             has_probability & 
-                             within_limit & has_flow & not_target)
+             # Logic for canalize: valid actions should NOT be on path to source from the objective start node.
+             # "These edges should not be valid targets."
+             on_path_to_source = self.get_edges_on_paths_to_source(start_nodes = self.state['canalize_objective'])
+             
+             has_flow = self.cached_flow_array[:self.num_interdictable] > 0
+             not_target = self.state['canalize_objective'][:self.num_interdictable] != 1
+             
+             valid_actions = (sufficient_budget &
+                              has_probability &
+                              #~on_path_to_source & # INVERTED logic: Must NOT be on path to source
+                              within_limit & has_flow & not_target)
+        
         elif self.attacker_strategy == 'divert':
             has_flow = self.cached_flow_array[:self.num_interdictable] > 0
             not_target = self.state['divert_to_objective'][:self.num_interdictable] != 1
@@ -2566,14 +3044,27 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
     # Ensure clean Gurobi model state for determinism
     self._cleanup_models()
 
+    # Propagate caching flag to driver for heuristic usage
+    self.enable_outcome_caching = enable_outcome_caching
+    if self.enable_outcome_caching:
+         self.local_outcome_cache = {}
+
     # precompute min edge cost etc
     real_edge_costs = self.state['edge_costs'][:self.num_both_edges]
     self.min_edge_cost = min(real_edge_costs[real_edge_costs > 0], default=float('inf'))
     if self.min_edge_cost == float('inf'):
         self.min_edge_cost = 1
 
+    # Create outcome memoization actor ONLY if stochastic
+    outcome_memo_actors = []
+    if not self.deterministic_outcomes and enable_outcome_caching:
+        num_outcome_shards = min(4, n_workers) if n_workers > 0 else 1
+        outcome_memo_actors = [SharedOutcomeMemoActor.remote() for _ in range(num_outcome_shards)]
+        self.outcome_memo_actors = outcome_memo_actors
+
     # Calculate Initial Alpha (Heuristic) - MOVED TO TOP to support Serial Mode
     initial_alpha = -float('inf')
+    initial_alpha_actions = []
     if enable_alpha_pruning:
         if verbose:
             print("Running heuristic for initial alpha...")
@@ -2655,61 +3146,174 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
                 elif self.attacker_strategy == "canalize":
                     # Heuristic for canalize strategy
                     
-                    # 1. Identify Target Set
-                    # Find all edges that share a node in canalize_objective, but not an edge in canalize_objective.
+                    # 1. Identify Target Nodes (Middle node of canalize objective)
                     canalize_obj = self.state['canalize_objective'][:self.num_both_edges]
                     obj_edges_indices = np.where(canalize_obj == 1)[0]
                     
-                    # Logic to identify nodes in objective
-                    obj_nodes = set()
-                    for idx in obj_edges_indices:
-                        u, v = self.both_edges[idx]
-                        obj_nodes.add(u)
-                        obj_nodes.add(v)
-                        
-                    # Target Set: Intersection(Incident to obj_nodes, Not in obj_edges)
-                    # We iterate through valid actions and check membership
-                    target_set_actions = []
+                    # Get edges in objective
+                    path_edges = [self.both_edges[idx] for idx in obj_edges_indices]
                     
+                    # Find distinct nodes in path
+                    path_nodes = set()
+                    for u, v in path_edges:
+                        path_nodes.add(u)
+                        path_nodes.add(v)
+                    
+                    # Find middle node
+                    # Note: This simple set logic assumes a simple path structure. 
+                    # If path_nodes is small (e.g. 2 nodes), middle might be ambiguous, but prompt says "middle node".
+                    # Let's try to reconstruct order or just pick median of sorted IDs if path is not sequential in storage?
+                    # Better: Pick node with degree >= 2 in the path subgraph? 
+                    # Actually, if we just have edge set, we can count occurrences. Intermediate nodes appear 2x.
+                    # Middle node is roughly the one at len/2 position in the ordered path.
+                    # Since we don't have ordered path here easily, let's use degree count on the path edges.
+                    
+                    node_counts = {}
+                    for u, v in path_edges:
+                        node_counts[u] = node_counts.get(u, 0) + 1
+                        node_counts[v] = node_counts.get(v, 0) + 1
+                        
+                    # Endpoints have degree 1, internal nodes degree 2.
+                    internal_nodes = [n for n, c in node_counts.items() if c >= 2]
+                    
+                    if not internal_nodes:
+                         # Length 1 path? Just take all nodes.
+                         target_nodes = list(path_nodes)
+                    else:
+                         # Just target all internal nodes?
+                         # Prompt: "middle node". Singular.
+                         # If we have [1,2,3,4], internal are 2,3.
+                         # Let's just target ALL nodes in the path to be safe/robust, or try to find "middle".
+                         # Updated Requirement: "edges that connect to the middle node of canalize objective."
+                         # Let's interpret "middle node" as any internal node for now, or pick one.
+                         # Given it's a heuristic, let's target ALL internal nodes.
+                         # EDIT: Re-reading prompt: "middle node". 
+                         # Let's pick one internal node randomly or deterministically?
+                         # Deterministic: Sort internal nodes and pick middle index.
+                         internal_nodes.sort()
+                         if internal_nodes:
+                             mid_idx = len(internal_nodes) // 2
+                             target_nodes = [internal_nodes[mid_idx]]
+                         else:
+                             target_nodes = list(path_nodes)
+                    
+                    target_nodes_set = set(target_nodes)
+
+                    # 2. Identify Target Edges (Connect to middle node)
+                    target_set_actions = []
                     for action in valid_actions:
+                        # Don't target objective edges themselves
                         if canalize_obj[action] == 1:
-                            continue # Skip if in objective
+                            continue
                             
                         u, v = self.both_edges[action]
-                        if u in obj_nodes or v in obj_nodes:
+                        # Check connectivity to target node
+                        if u in target_nodes_set or v in target_nodes_set:
                             target_set_actions.append(action)
                             
-                    # 2. Select Best Action from Target Set
-                    # Interdict edge from target_set with most flow away from nodes in canalize_objective
-                    max_flow_away = -1
+                    # 3. Select Best Action
                     best_action = -1
+                    max_flow = -1
                     
-                    # If target set is empty, fallback to valid_actions? 
-                    # Prompt says "For the remainder of the budget... interdict from target_set". 
-                    # If target_set is empty, we probably can't do anything better than random or max flow.
-                    # Let's fallback to max flow on valid_actions if target_set is exhausted to ensure budget is used.
-                    candidates = target_set_actions if target_set_actions else valid_actions
-                    
-                    for action in candidates:
-                         u, v = self.both_edges[action]
-                         
-                         # Determine flow "away" (out-flow from obj_nodes)
-                         # Check if u is in obj_nodes (flow u->v is departing)
-                         # Check if v is in obj_nodes (flow v->u is departing)
-                         f_away = 0
-                         if u in obj_nodes and v not in obj_nodes:
-                             f_away += flows.get((u, v), 0)
-                         if v in obj_nodes and u not in obj_nodes: # Reverse edge
-                             f_away += flows.get((v, u), 0)
-                             
-                         # If both are in obj_nodes, it's an internal edge (skip or treat as 0)
-                         # But our target_set filtering likely excluded internal edges already if logic was strictly "incident but not in objective"
-                         # However, "not in objective" means edge ID not in path. Edge could connect two obj nodes but not be PART of the path?
-                         # Anyway, "flow away" implies leaving the set of objective nodes.
-                         
-                         if f_away > max_flow_away:
-                             max_flow_away = f_away
-                             best_action = action
+                    # Priority 1: Connects to Middle Node
+                    if target_set_actions:
+                         # Pick one with most flow
+                         for action in target_set_actions:
+                             u, v = self.both_edges[action]
+                             f = flows.get((u, v), 0) + flows.get((v, u), 0)
+                             if f > max_flow:
+                                 max_flow = f
+                                 best_action = action
+                                 
+                    # Priority 2: Connects to First Node (Flow Away)
+                    if best_action == -1:
+                        # Identify First Node
+                        # The start node has degree 1 in path subgraph. 
+                        # We need to distinguish start from end. 
+                        # Assuming flow direction matters? Or just one of the endpoints.
+                        # Since we only have edge sets, we can't definitively say which is "start" without flow context or reconstructing the path graph.
+                        # However, for 'canalize', we want flow TO go through this path.
+                        # The "first node" is the one closer to source.
+                        
+                        endpoints = [n for n, c in node_counts.items() if c == 1]
+                        
+                        # Heuristic to find start: one with lower ID? Or better, one that has more flow COMING INTO it from outside the path?
+                        # Or just pick both endpoints if ambiguous.
+                        # But prompt says "first node". 
+                        # Let's try to deduce from standard path construction (source -> sink). 
+                        # But we don't have that info easily here.
+                        # Let's fallback to checking which endpoint is closer to supersource if possible, or just using both endpoints.
+                        # Re-reading: "flow away from the first node".
+                        # If we assume the path is U -> V -> W, U is first. Flow away from U means edges (U, X) where X is not V.
+                        
+                        # Let's guess the start node as the minimal ID endpoint? 
+                        # In the Env, usually lower IDs are closer to source? Not guaranteed.
+                        # Let's try to find which endpoint is NOT in self.sink_nodes?
+                        
+                        start_node = None
+                        for ep in endpoints:
+                             if ep not in self.sink_nodes and ep not in self.super_sink_nodes:
+                                 start_node = ep
+                                 break
+                        if start_node is None and endpoints:
+                            start_node = endpoints[0]
+                            
+                        if start_node:
+                            # Check if start node is already interdicted (Priority 2 Constraint: only 1 edge)
+                            is_start_interdicted = False
+                            if start_node in self.edge_groups:
+                                for edge in self.edge_groups[start_node]['out'] + self.edge_groups[start_node]['in']:
+                                    idx = self.edge_to_index.get(edge)
+                                    # If any connected edge is interdicted, we consider this priority satisfied
+                                    if idx is not None and (0 <= idx < len(self.state['edge_interdicted'])) and self.state['edge_interdicted'][idx] == 1:
+                                        is_start_interdicted = True
+                                        break
+                                        
+                            if not is_start_interdicted:
+                                # Find edges connected to start_node
+                                start_node_actions = []
+                                for action in valid_actions:
+                                    if canalize_obj[action] == 1: continue
+                                    u, v = self.both_edges[action]
+                                    
+                                    # Check flow direction: Flow AWAY from start_node
+                                    if u == start_node:
+                                        # Forward edge (Start -> V). Check if V is not in path (not next node in objective)
+                                        # Actually, just check if it's connected to start node.
+                                        # Maximize flow on it.
+                                        start_node_actions.append(action)
+                                    elif v == start_node:
+                                        # Reverse edge (U -> Start). If flow is U -> Start, that is flow TOWARDS start.
+                                        # If we consider flow existing on (v, u) i.e. Start -> U.
+                                        start_node_actions.append(action)
+
+                                if start_node_actions:
+                                    max_start_flow = -1
+                                    for action in start_node_actions:
+                                         edge = self.both_edges[action]
+                                         # Get flow specifically AWAY from start_node
+                                         # If edge is (start, X), flow is flows[(start, X)]
+                                         # If edge is (X, start), flow is flows[(start, X)] (reverse key)
+                                         
+                                         current_flow = 0
+                                         if edge[0] == start_node:
+                                             current_flow = flows.get(edge, 0)
+                                         elif edge[1] == start_node:
+                                             current_flow = flows.get((edge[1], edge[0]), 0)
+                                             
+                                         if current_flow > max_start_flow:
+                                             max_start_flow = current_flow
+                                             best_action = action
+
+                    # Priority 3: Zero Sum behavior (Most flow anywhere)
+                    if best_action == -1:
+                        max_flow = -1
+                        for action in valid_actions:
+                             edge = self.both_edges[action]
+                             f = flows.get(edge, 0) + flows.get((edge[1], edge[0]), 0)
+                             if f > max_flow:
+                                 max_flow = f
+                                 best_action = action
 
                 elif self.attacker_strategy == "divert":
                     # Heuristic for divert strategy
@@ -2771,6 +3375,7 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
                     cost = self.state['edge_costs'][best_action]
                     self.state['budget'][0] -= cost
                     current_budget -= cost
+                    initial_alpha_actions.append(self.both_edges[best_action])
                 else:
                     # No good action found or strategy not implemented
                     break
@@ -2780,12 +3385,15 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
                 print(f"Heuristic failed: {e}")
             initial_alpha = -float('inf')
         finally:
+            if initial_alpha > -float('inf'):
+                initial_alpha -= 2.0 # Safety margin for pruning
             # Restore state
             self.state['budget'][0] = old_budget
             self.state['edge_interdicted'][:] = old_interdicted
             
         if verbose:
             print(f"Heuristic found initial alpha: {initial_alpha}")
+            print(f"Heuristic Interdicted Edges: {initial_alpha_actions}")
 
     # SERIAL EXECUTION PATH
     if n_workers <= 0:
@@ -2953,18 +3561,12 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
     else:
         memo_actors = []
 
-    # Create outcome memoization actor ONLY if stochastic
-    outcome_memo_actors = []
-    if not self.deterministic_outcomes and enable_outcome_caching:
-        num_outcome_shards = min(4, n_workers)
-        outcome_memo_actors = [SharedOutcomeMemoActor.remote() for _ in range(num_outcome_shards)]
-    
+    # outcome_memo_actors already created before heuristic
+
     # Create alpha actor
     # When using heuristics, the initial_alpha is a lower bound on the optimal value.
-    # We should subtract a small epsilon to ensure we don't prune branches that are exactly equal 
+    # We should subtract a small epsilon (or larger buffer) to ensure we don't prune branches that are exactly equal 
     # to this initial value due to floating point noise.
-    if initial_alpha > -float('inf'):
-         initial_alpha -= 1e-5
     
     alpha_actor = _SharedAlphaActor.remote(initial_alpha)
     
@@ -3277,6 +3879,7 @@ def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=
     for actor in outcome_memo_actors:
         try: ray.kill(actor)
         except: pass
+    self.outcome_memo_actors = None
 
     try: ray.kill(alpha_actor)
     except: pass
