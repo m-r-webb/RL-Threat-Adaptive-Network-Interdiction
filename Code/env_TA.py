@@ -1270,30 +1270,6 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                   
         return None
 
-    def _find_simple_path(self):
-        """Find a simple path from source to sink."""
-        path_edges = []
-        current_node = random.choice(self.source_nodes)
-        visited = {1}
-        sink = self.super_sink_nodes[0]
-    
-        while current_node not in self.sink_nodes:
-            valid_edges = [e for e in self.edge_groups[current_node]['out'] if e[1] not in visited and e[1] >= current_node - 1]
-        
-            if not valid_edges or len(visited)>self.MAX_PATH_LENGTH:
-                # Restart if stuck
-                current_node = random.choice(self.source_nodes)
-                visited = {1}
-                path_edges = []
-                continue
-        
-            selected_edge = random.choice(valid_edges)
-            path_edges.append(selected_edge)
-            visited.add(selected_edge[1])
-            current_node = selected_edge[1]
-    
-        return set(path_edges)
-
     def _extract_max_flow_path(self, flows):
         """Extract the path with maximum flow from flows dictionary."""
         from_path = []
@@ -1307,135 +1283,6 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             current_node = prev_edge[0]
     
         return list(reversed(from_path))
-
-    def _find_best_alternative_path(self, max_flow_edges, num_samples=10):
-        """Find multiple alternative paths and select the one with the widest bottleneck."""
-        candidates = []
-        
-        # Try to find unique valid alternative paths
-        for _ in range(num_samples):
-            alt_path_set = self._find_single_alternative_path(max_flow_edges)
-            
-            # Check if it's just the original path (failure case)
-            # Note: _find_single_alternative_path returns a set of edges
-            is_original = (alt_path_set == set(max_flow_edges))
-            
-            if not is_original:
-                # Calculate bottleneck
-                min_cap = float('inf')
-                for edge in alt_path_set:
-                    # Only consider edges NOT in the max flow path for bottleneck calculation
-                    if edge in max_flow_edges or (edge[1], edge[0]) in max_flow_edges:
-                        continue
-
-                    # Ignore edges connected to supersink
-                    if edge[1] == self.super_sink_nodes[0] or edge[0] == self.super_sink_nodes[0]:
-                        continue
-
-                    # Find capacity for this edge
-                    idx = self.edge_to_index.get(edge)
-                    if idx is None:
-                        idx = self.edge_to_index.get((edge[1], edge[0]))
-                    
-                    if idx is not None:
-                        cap = self.state['edge_capacity'][idx]
-                        if cap < min_cap:
-                            min_cap = cap
-                
-                candidates.append((min_cap, alt_path_set))
-        
-        if not candidates:
-            return self._find_single_alternative_path(max_flow_edges)
-        
-        # Sort by bottleneck (descending)
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1]
-
-    def _find_single_alternative_path(self, max_flow_edges):
-        """Find an alternative path avoiding specified edges."""
-        adj = {}
-        for u, v in max_flow_edges:
-            adj[u] = v
-
-        # Trace path from source (1) to sink (250)
-        max_flow_path = []
-        current = 1
-        while current != 250:
-            next_node = adj[current]
-            max_flow_path.append((current, next_node))
-            current = next_node
-        
-        # Track attempted breakpoints to avoid infinite loops
-        attempted_breakpoints = set()
-        max_attempts = len(max_flow_path[1:-2])
-    
-        while len(attempted_breakpoints) < max_attempts:
-            # Choose a random breakpoint that hasn't been tried yet
-            available_breakpoints = [bp for bp in max_flow_path[1:-2] if bp not in attempted_breakpoints]
-        
-            if not available_breakpoints:
-                # If all breakpoints have been tried, fall back to original path
-                return set(max_flow_path)
-        
-            breakpoint = random.choice(available_breakpoints)
-            attempted_breakpoints.add(breakpoint)
-        
-            breakpoint_index = max_flow_path.index(breakpoint)
-            path_to_keep = max_flow_path[:breakpoint_index+1]
-            path_to_avoid = max_flow_path[breakpoint_index+1:]
-        
-            # Try to find alternative path from this breakpoint
-            path_edges = set(path_to_keep)
-            current_node = breakpoint[1]
-            sink = self.super_sink_nodes[0]
-            nodes_to_avoid = {edge[1] for edge in path_to_avoid if edge[1] != sink}
-            visited = {1} | {edge[1] for edge in path_to_keep} | nodes_to_avoid
-        
-            stuck_count = 0
-            max_stuck_attempts = 5  # Limit retries before choosing new breakpoint
-        
-            while current_node != sink:
-                valid_edges = []
-                for edge in self.edge_groups[current_node]['out']:
-                    target = edge[1]
-                    if (target not in visited and target >= current_node - 1 and 
-                        edge not in path_to_avoid):
-                
-                        # Check for valid future moves
-                        if target != sink:
-                            future_valid = any(
-                                e not in path_to_avoid and e[1] != current_node and e[1] >= e[0] - 1
-                                for e in self.edge_groups[target]['out']
-                            )
-                            if not future_valid:
-                                continue
-                
-                        valid_edges.append(edge)
-            
-                if not valid_edges or len(path_edges) >= len(max_flow_path) + self.MAX_PATH_LENGTH:
-                    stuck_count += 1
-                    if stuck_count >= max_stuck_attempts:
-                        # This breakpoint doesn't work, try a new one
-                        break
-                
-                    # Try restarting from the breakpoint
-                    current_node = breakpoint[1]
-                    visited = {1} | {edge[1] for edge in path_to_keep} | nodes_to_avoid
-                    path_edges = set(path_to_keep)
-                    continue
-        
-                selected_edge = random.choice(valid_edges)
-
-                path_edges.add(selected_edge)
-                visited.add(selected_edge[1])
-                current_node = selected_edge[1]
-        
-            # If we successfully reached the sink, return the alternative path
-            if current_node == sink:
-                return path_edges
-    
-        # If no alternative path found after trying all breakpoints, return original
-        return set(max_flow_path)
     
     def step(self, action):                                                     
         """Execute one step in the environment based on the given action."""
@@ -2262,4 +2109,3 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         action_mask[:self.num_interdictable] = valid_actions.astype(np.float32)
     
         return action_mask
-
