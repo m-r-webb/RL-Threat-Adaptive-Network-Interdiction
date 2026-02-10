@@ -1177,6 +1177,196 @@ class InterdictionSolverMixin:
 
         return (self.optimal_stochastic_model_IM.objVal, interdicted_edges, interdicted_quantities)
 
+    def solve_heuristic_interdiction(self):
+        """
+        Executes a Greedy Max-Flow Heuristic solver on the current environment state.
+        
+        The heuristic step:
+        1. Calculate stochastic/deterministic flow on edges.
+        2. Calculate heuristic score (Flow * Probability).
+        3. Select best valid edge.
+        4. Step environment.
+        5. Repeat until done.
+        
+        Returns:
+            final_obj (float): Final objective value.
+            actions_taken (list): List of edge tuples interdicted.
+        """
+        actions_taken = []
+        interdictable_edges_list = list(self.both_edges)
+        
+        done = False
+        steps = 0
+        max_steps = int(self.state['budget'][0] * 3) + 20 # Safety margin
+
+        while not done and steps < max_steps:
+             steps += 1
+             
+             # Get valid action mask
+             action_mask = self.mask_fn()
+             valid_actions = np.where(action_mask[:self.num_interdictable] == 1)[0]
+             
+             # Check if no valid actions remain
+             if len(valid_actions) == 0:
+                 # Select "do nothing" action
+                 action = self.num_interdictable 
+                 obs, reward, done, _, _ = self.step(action)
+                 break
+             
+             # Get expected edge flows
+             if self.deterministic_outcomes:
+                 # Deterministic case: solve max flow directly
+                 _, flows = self.solve_max_flow(routing_assumption=self.attacker_strategy)
+             else:
+                 # Stochastic case: get expected flows from stochastic calculation
+                 _, flows = self._calculate_stochastic_objective_and_flow(
+                     strategy_type=self.attacker_strategy, 
+                     return_full_flows=True
+                 )
+             
+             # Calculate expected flow on each valid edge (sum of forward and reverse flow)
+             edge_flows = np.zeros(self.num_interdictable)
+             
+             # Get interdiction probabilities for all interdictable edges
+             interdiction_probs = self.state['edge_interdiction_probability'][:self.num_interdictable]
+             
+             for idx in valid_actions:
+                 edge = interdictable_edges_list[idx]
+                 reverse_edge = (edge[1], edge[0])
+                 forward_flow = flows.get(edge, 0)
+                 reverse_flow = flows.get(reverse_edge, 0)
+                 edge_flows[idx] = forward_flow + reverse_flow
+             
+             masked_values = np.full(self.num_interdictable, -np.inf)
+             
+             # Select the valid action with maximum (expected flow * interdiction probability)
+             
+             if self.attacker_strategy == "zero_sum":
+                 heuristic_values = edge_flows * interdiction_probs
+                 masked_values[valid_actions] = heuristic_values[valid_actions]
+
+             elif self.attacker_strategy == "isolate":
+                  heuristic_values = edge_flows * interdiction_probs
+                  masked_values[valid_actions] = heuristic_values[valid_actions]
+
+             elif self.attacker_strategy == "canalize":
+                  # 1. Identify Target Nodes (Middle node of canalize objective)
+                  canalize_obj = self.state['canalize_objective'][:self.num_both_edges]
+                  obj_edges_indices = np.where(canalize_obj == 1)[0]
+                  
+                  path_edges = [self.both_edges[idx] for idx in obj_edges_indices]
+                  
+                  node_counts = {}
+                  for u, v in path_edges:
+                      node_counts[u] = node_counts.get(u, 0) + 1
+                      node_counts[v] = node_counts.get(v, 0) + 1
+                      
+                  internal_nodes = [n for n, c in node_counts.items() if c >= 2]
+                  
+                  if not internal_nodes:
+                      target_nodes = list(set([u for u,v in path_edges] + [v for u,v in path_edges]))
+                  else:
+                      internal_nodes.sort()
+                      mid_idx = len(internal_nodes) // 2
+                      target_nodes = [internal_nodes[mid_idx]]
+                  
+                  target_nodes_set = set(target_nodes)
+
+                  # 2. Identify Target Edges (Connect to middle node)
+                  target_set_actions = []
+                  for act in valid_actions:
+                      if canalize_obj[act] == 1:
+                          continue
+                      u, v = self.both_edges[act]
+                      if u in target_nodes_set or v in target_nodes_set:
+                          target_set_actions.append(act)
+                          
+                  best_action = -1
+                  max_flow = -1
+                  
+                  # Priority 1: Connects to Middle Node
+                  if target_set_actions:
+                      for act in target_set_actions:
+                          f = edge_flows[act] * interdiction_probs[act]
+                          if f > max_flow:
+                              max_flow = f
+                              best_action = act
+                  
+                  # Priority 2: Connects to First Node (Flow Away)
+                  if best_action == -1:
+                      endpoints = [n for n, c in node_counts.items() if c == 1]
+                      start_node = None
+                      for ep in endpoints:
+                          if ep not in self.sink_nodes and ep not in self.super_sink_nodes:
+                              start_node = ep
+                              break
+                      if start_node is None and endpoints:
+                          start_node = endpoints[0]
+
+                      if start_node:
+                          is_start_interdicted = False
+                          if start_node in self.edge_groups:
+                              for edge in self.edge_groups[start_node]['out'] + self.edge_groups[start_node]['in']:
+                                  idx = self.edge_to_index.get(edge)
+                                  if idx is not None and (0 <= idx < len(self.state['edge_interdicted'])) and self.state['edge_interdicted'][idx] >= 1:
+                                      is_start_interdicted = True
+                                      break
+                          
+                          if not is_start_interdicted:
+                              start_node_actions = []
+                              for act in valid_actions:
+                                  if canalize_obj[act] == 1: continue
+                                  u, v = self.both_edges[act]
+                                  if u == start_node or v == start_node:
+                                      start_node_actions.append(act)
+                              
+                              if start_node_actions:
+                                  max_start_flow = -1
+                                  for act in start_node_actions:
+                                      f = edge_flows[act] * interdiction_probs[act]
+                                      if f > max_start_flow:
+                                          max_start_flow = f
+                                          best_action = act
+
+                  # Priority 3: Zero Sum behavior
+                  if best_action == -1:
+                      heuristic_values = edge_flows * interdiction_probs
+                      masked_values[valid_actions] = heuristic_values[valid_actions]
+                  else:
+                      masked_values[best_action] = float('inf')
+
+             elif self.attacker_strategy == "divert":
+                  # Placeholder - default to max flow heuristic for now
+                  heuristic_values = edge_flows * interdiction_probs
+                  masked_values[valid_actions] = heuristic_values[valid_actions]
+             
+             action = int(np.argmax(masked_values))
+             
+             # Step the environment with selected action
+             obs, reward, done, _, _ = self.step(action)
+
+             # Tally actions
+             if action < self.num_interdictable:
+                 action_key = interdictable_edges_list[action]
+                 actions_taken.append(action_key)
+                 
+             if done:
+                 break
+        
+        # Determine final objective value based on strategy
+        if self.attacker_strategy == "zero_sum":
+            objVal, _ = self._compute_objective_and_flows()
+        elif self.attacker_strategy == "isolate":
+            objVal, _ = self._calculate_isolate_objective_and_flows()
+        elif self.attacker_strategy == "canalize":
+            objVal, _ = self._calculate_canalize_objective_and_flows()
+        elif self.attacker_strategy == "divert":
+            objVal, _ = self._calculate_divert_objective_and_flows()
+        else:
+            objVal, _ = self._compute_objective_and_flows()
+
+        return objVal, actions_taken
+
     # --- Re-add solve_backward_induction_ray method to Mixin ---
     
     def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=None, ray_address=None, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True):
