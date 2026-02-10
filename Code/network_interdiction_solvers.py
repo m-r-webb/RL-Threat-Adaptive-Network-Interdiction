@@ -411,21 +411,59 @@ class InterdictionSolverMixin:
             
             return(self.optimal_model.objVal, interdicted_edges)
         
-        else:
-            # Stochastic outcomes
-            # Use Ray to parallelize SAA if requested (via wrapper)
-            # But here we just run sequentially or use the method arg
-            # Just do standard parallel loop for evaluating candidates if needed, 
-            # OR assume 'monolithic' means SAA Model 1U.
+        else:  #Solve Stochastic Case with Cormican's Formulation      
+            M = 100                       # Number of training episodes
+            N = 700                   # Number of test episodes
+            seed_list = [100, 200, 300]#, 400, 500]
+            best_objective_value = 100000    # Big M Value
+            best_interdicted_edges = []
+            unique_interdicted_sets = []
             
-            # NOTE: solve_optimal_interdiction usually implies finding the best action.
-            # In stochastic case, SAA is the standard method here.
-            
-            # Using SAA
-            tasks = []
-            seeds = [12345 + i for i in range(1)] # Just 1 run for now? Using internal scenarios.
-            # Usually solve_stochastic_max_flow handles the SAA optimization itself.
-            pass
+            # Determine tasks: standard M for all methods (monolithic and decomposition)
+            tasks = [(s, M) for s in seed_list]
+
+            # Test multiple solutions
+            for seed, n_scens in tasks:
+                if self.multiple_interdiction_attempts:
+                    objective_value, interdicted_edges, interdicted_quantities = self.solve_stochastic_max_flow_IM(n_scenarios=n_scens, seed=seed, method=method)
+                    
+                    # Create dense vector for key (values > 1 allowed)
+                    interdiction_vector = np.zeros(len(self.both_edges), dtype=int)
+                    for edge, qty in zip(interdicted_edges, interdicted_quantities):
+                        if edge in self.edge_to_index:
+                            interdiction_vector[self.edge_to_index[edge]] = qty
+                    interdicted_key = tuple(interdiction_vector)
+                    
+                else:
+                    objective_value, interdicted_edges = self.solve_stochastic_max_flow(n_scenarios=n_scens, seed=seed, method=method)
+                    
+                    # Create dense vector for key (binary)
+                    interdiction_vector = np.zeros(len(self.both_edges), dtype=int)
+                    for edge in interdicted_edges:
+                        if edge in self.edge_to_index:
+                            interdiction_vector[self.edge_to_index[edge]] = 1
+                    interdicted_key = tuple(interdiction_vector)
+                    
+                # Check if the set of interdicted edges is unique
+                if interdicted_key not in unique_interdicted_sets:
+                    unique_interdicted_sets.append(interdicted_key)       
+
+                    if self.multiple_interdiction_attempts:
+                        objective_value, interdicted_edges, interdicted_quantities = self.solve_stochastic_max_flow_IM(n_scenarios=N, interdicted_edges=interdicted_edges, interdicted_quantities=interdicted_quantities, method=method)
+                        # Expand for return value
+                        current_solution = []
+                        for e, k in zip(interdicted_edges, interdicted_quantities):
+                            current_solution.extend([e] * k)
+                    else:
+                        # Use fast evaluation for both decomposition and monolithic
+                        objective_value, interdicted_edges = self._eval_fixed_strategy(n_scenarios=N, seed=seed, interdicted_edges=interdicted_edges)
+                        current_solution = interdicted_edges
+
+                    if objective_value < best_objective_value:
+                        best_objective_value = objective_value
+                        best_interdicted_edges = current_solution
+
+            return best_objective_value, best_interdicted_edges
 
     def _create_lp_maxflow_model(self):
         """Create a continuous Max Flow LP model for subproblems."""
