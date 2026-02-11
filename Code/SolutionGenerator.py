@@ -30,7 +30,7 @@ if not ray.is_initialized():
         ignore_reinit_error=True, 
         logging_level='INFO',
         include_dashboard=False,
-        num_cpus=46,
+        num_cpus=46, #46  38
         _temp_dir=os.environ.get('RAY_TMPDIR'), # Add this parameter with a short path
     )
 
@@ -38,16 +38,19 @@ if not ray.is_initialized():
 import env_TA as ce #modified for curriculum learning
 
 #User Determined Settings
-graphName = "UKR"
+graphName = "G15x15"
 env_params = {'deterministic_agent': False,
               'multiple_interdiction_attempts': False,
-              'attacker_strategy': 'divert',  # canalize   isolate   divert  zero_sum
-              'training_budget_range': (15, 30),  #G5x5: zero_sum/isolate: (5,15), canalize/divert: (10,20) G10x10: zero_sum/isolate: (15,30), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (15,25) G15x15: zero_sum: (25,45)
-              'max_path_length': 16  ,  #G5x5: 6,  G10x10: 13, UKR: 16
-              'sample_size': None, #None for exact probability calculation, 2000 for Monte Carlo
+              'attacker_strategy': 'zero_sum',  # canalize   isolate   divert  zero_sum
+              'training_budget_range': (25,45),  #G5x5: zero_sum/isolate: (5,15), canalize/divert: (12,24) G10x10: zero_sum/isolate: (10,20), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (18,30) G15x15: zero_sum/isolate: (25,45)
+              'max_path_length': 2,  #G5x5: 2,  G10x10: 3, UKR: 4
+              'sample_size': None,
+              'penalty_value': -0.01,
              }
-version_date = "01_07" # numeric month_day
-version_type = "bi"  # bi for backward induction or opt for optimal MIP 
+              
+version_date = "02_10" # numeric month_day
+version_type = "opt_d"  # bi for backward induction or opt_m or opt_d for optimal MIP
+opt_method = 'decomposition'  # monolithic,  decomposition
 
 # Number of scenarios to generate
 num_of_scenarios = 500 
@@ -99,14 +102,14 @@ for episode in range(num_of_scenarios):
     env.render(indices = 3)
     if env_params['attacker_strategy'] == "zero_sum":
         start_time = time.perf_counter()
-        if version_type == 'opt':
-            optimal_obj_val, optimal_interdiction_edges = env.solve_optimal_interdiction()
+        if version_type == 'opt_d' or version_type == 'opt_m':
+            optimal_obj_val, optimal_interdiction_edges = env.solve_optimal_interdiction(method=opt_method)  
         elif version_type == 'bi':
-            optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = 38) #38)
+            optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = 38) #38,32)
         end_time = time.perf_counter()
     else:
         start_time = time.perf_counter()
-        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = 38) #38)
+        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = 38) #38,32)
         end_time = time.perf_counter()
     
     solve_time = end_time - start_time
