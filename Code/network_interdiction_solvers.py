@@ -456,7 +456,7 @@ class InterdictionSolverMixin:
                             current_solution.extend([e] * k)
                     else:
                         # Use fast evaluation for both decomposition and monolithic
-                        objective_value, interdicted_edges = self._eval_fixed_strategy(n_scenarios=N, seed=seed, interdicted_edges=interdicted_edges)
+                        objective_value = self._evaluate_solution_stochastic(interdicted_edges)
                         current_solution = interdicted_edges
 
                     if objective_value < best_objective_value:
@@ -465,36 +465,36 @@ class InterdictionSolverMixin:
 
             return best_objective_value, best_interdicted_edges
 
-    def _create_lp_maxflow_model(self):
-        """Create a continuous Max Flow LP model for subproblems."""
-        m = grb.Model("Subproblem_LP", env=self.GUROBI_ENV)
+    def _evaluate_solution_stochastic(self, interdicted_edges):
+        """
+        Evaluate a specific interdiction solution using the environment's 
+        stochastic objective calculation. Wraps _calculate_stochastic_objective_and_flow
+        handling state transitions.
+        """
+        # Backup state
+        old_budget = self.state['budget'][0]
+        old_interdicted = self.state['edge_interdicted'].copy()
         
-        # Continuous flow variables for ALL edges (forward + reverse)
-        flow = m.addVars(self.all_both_edges, lb=0, name="flow")
+        # Apply hypothetical strategy
+        # Reset interdiction
+        self.state['edge_interdicted'] = np.zeros_like(self.state['edge_interdicted'])
         
-        # Flow Conservation
-        m.addConstrs(
-            (grb.quicksum(flow[e] for e in self.edge_groups[n]['out']) == 
-             grb.quicksum(flow[e] for e in self.edge_groups[n]['in'])
-             for n in self.intermediate_nodes), name="conservation"
-        )
+        # Set new interdictions
+        for e in interdicted_edges:
+            idx = self.edge_to_index[e]
+            # Assuming single attempt/level for this interface: set to 1
+            # If multiple attempts are supported, this sets it to 1 attempt.
+            self.state['edge_interdicted'][idx] += 1 
 
-        # Super Source/Sink conservation
-        total_flow = m.addVar(name="total_flow")
-        
-        m.addConstr(grb.quicksum(flow[e] for e in self.edge_groups[1]['out']) - 
-                    grb.quicksum(flow[e] for e in self.edge_groups[1]['in']) == total_flow, name="source_node")
-        
-        m.addConstr(grb.quicksum(flow[e] for e in self.edge_groups[self.super_sink_nodes[0]]['in']) -
-                    grb.quicksum(flow[e] for e in self.edge_groups[self.super_sink_nodes[0]]['out']) == total_flow, name="sink_node")
-        
-        m.setObjective(total_flow, grb.GRB.MAXIMIZE)
-        
-        # Capacity constraints for ALL edges (will be updated)
-        cap_constrs = m.addConstrs((flow[e] <= 0 for e in self.all_both_edges), name="capacity")
-        
-        m.update()
-        return m, cap_constrs, flow
+        try:
+            # Calculate objective (returns expected value)
+            objective, _ = self._calculate_stochastic_objective_and_flow(self.attacker_strategy, return_full_flows=False)
+        finally:
+            # Restore state
+            self.state['budget'][0] = old_budget
+            self.state['edge_interdicted'] = old_interdicted
+            
+        return objective
 
     def _solve_stochastic_decomposition(self, n_scenarios, seed, interdicted_edges):
         np.random.seed(seed)
@@ -522,7 +522,7 @@ class InterdictionSolverMixin:
         master.setObjective(theta, grb.GRB.MINIMIZE)
         
         # 3. Subproblem Prep
-        sub_model, cap_constrs, flow_vars = self._create_lp_maxflow_model()
+        # Use centralized model via solve_max_flow(capacity_dict=...)
         
         # Benders Loop
         LB = -float('inf')
@@ -545,39 +545,36 @@ class InterdictionSolverMixin:
             
             for s in range(n_scenarios):
                 # Update Capacities
+                current_caps = {}
                 for idx, e in enumerate(self.both_edges):
-                    # Cap = Original * (1 - x_hat * outcome)
+                    # Interdiction is successful if attempted (x_hat > 0.5) AND outcome is 1
                     is_blocked = (x_hat[e] > 0.5) and (scenario_outcomes[s, idx] == 1)
                     cap = 0 if is_blocked else self.edges_episode[e].capacity
-                    
-                    # Update Forward
-                    cap_constrs[e].RHS = cap
-                    
-                    # Update Reverse
+                    current_caps[e] = cap
+                    # Reverse edge
                     rev_e = (e[1], e[0])
-                    cap_constrs[rev_e].RHS = cap
+                    current_caps[rev_e] = cap
                 
-                sub_model.optimize()
+                # Solve max flow using environment method
+                sub_obj, flow_dict = self.solve_max_flow(capacity_dict=current_caps)
                 
-                if sub_model.status == grb.GRB.OPTIMAL:
-                    sub_obj = sub_model.ObjVal
-                    total_flow += sub_obj
-                    
-                    # Retrieve primal flows to build Benders cut
-                    for idx, e in enumerate(self.both_edges):
-                         outcome = scenario_outcomes[s, idx]
-                         
-                         # Get flow on forward edge e
-                         f_fwd = flow_vars[e].X
-                         
-                         # Get flow on reverse edge 
-                         rev_e = (e[1], e[0])
-                         f_rev = flow_vars[rev_e].X
-                         
-                         f_total = f_fwd + f_rev
-                         
-                         # Cut Term: - Flow * Outcome * Gamma
-                         cut_term_coefs[e] -= f_total * outcome
+                total_flow += sub_obj
+                
+                # Retrieve flows to build Benders cut
+                for idx, e in enumerate(self.both_edges):
+                     outcome = scenario_outcomes[s, idx]
+                     
+                     # Get flow on forward edge e
+                     f_fwd = flow_dict.get(e, 0)
+                     
+                     # Get flow on reverse edge 
+                     rev_e = (e[1], e[0])
+                     f_rev = flow_dict.get(rev_e, 0)
+                     
+                     f_total = f_fwd + f_rev
+                     
+                     # Cut Term: - Flow * Outcome * Gamma
+                     cut_term_coefs[e] -= f_total * outcome
 
             avg_flow = total_flow / n_scenarios
             UB = avg_flow
@@ -637,8 +634,7 @@ class InterdictionSolverMixin:
         master.setObjective(theta, grb.GRB.MINIMIZE)
         
         # 3. Subproblem Prep
-        sub_model, cap_constrs, flow_vars = self._create_lp_maxflow_model()
-        sub_model.setParam("OutputFlag", 0)
+        # Use centralized model via solve_max_flow
         
         # Benders Loop
         LB = -float('inf')
@@ -660,6 +656,7 @@ class InterdictionSolverMixin:
             
             for s in range(n_scenarios):
                 # Update Capacities
+                current_caps = {}
                 for idx, e in enumerate(self.both_edges):
                     blocked = False
                     if e in interdictable_edge_map:
@@ -671,25 +668,23 @@ class InterdictionSolverMixin:
                                  break
                     
                     cap = 0 if blocked else self.edges_episode[e].capacity
-                    cap_constrs[e].RHS = cap
-                    cap_constrs[(e[1], e[0])].RHS = cap
+                    current_caps[e] = cap
+                    current_caps[(e[1], e[0])] = cap
                 
-                sub_model.optimize()
+                sub_obj, flow_dict = self.solve_max_flow(capacity_dict=current_caps)
                 
-                if sub_model.status == grb.GRB.OPTIMAL:
-                    sub_obj = sub_model.ObjVal
-                    total_flow += sub_obj
+                total_flow += sub_obj
+                
+                # Calculate Coefs
+                for e in self.interdictable_edges:
+                    # Get flow on edge
+                    f_total = flow_dict.get(e, 0) + flow_dict.get((e[1], e[0]), 0)
+                    e_idx = interdictable_edge_map[e]
                     
-                    # Calculate Coefs
-                    for e in self.interdictable_edges:
-                        # Get flow on edge
-                        f_total = flow_vars[e].X + flow_vars[(e[1], e[0])].X
-                        e_idx = interdictable_edge_map[e]
-                        
-                        for k in k_vals:
-                            # If outcome is success, we would block flow
-                            if scenario_outcomes[s, e_idx, k-1] == 1:
-                                cut_term_coefs[e, k] -= f_total
+                    for k in k_vals:
+                        # If outcome is success, we would block flow
+                        if scenario_outcomes[s, e_idx, k-1] == 1:
+                            cut_term_coefs[e, k] -= f_total
 
             avg_flow = total_flow / n_scenarios
             UB = avg_flow
@@ -803,41 +798,6 @@ class InterdictionSolverMixin:
 
         return(self.optimal_stochastic_model.objVal, interdicted_edges)
 
-    def _eval_fixed_strategy(self, n_scenarios, seed, interdicted_edges):
-        """Efficiently evaluate a fixed interdiction strategy by averaging max flows."""
-        np.random.seed(seed)
-        
-        # 1. Generate Scenarios
-        probs = self.state["edge_interdiction_probability"][:self.num_both_edges]
-        scenario_outcomes = np.random.binomial(1, probs, size=(n_scenarios, len(self.both_edges)))
-        
-        # 2. Setup Subproblem (Max Flow LP)
-        sub_model, cap_constrs, _ = self._create_lp_maxflow_model()
-        sub_model.setParam("OutputFlag", 0)
-        
-        # 3. Create blockage map
-        x_fixed = {e: 0 for e in self.both_edges}
-        for e in interdicted_edges:
-            x_fixed[e] = 1
-            
-        total_flow = 0.0
-        
-        for s in range(n_scenarios):
-             # Update Capacities
-            for idx, e in enumerate(self.both_edges):
-                outcome = scenario_outcomes[s, idx]
-                is_blocked = (x_fixed[e] == 1) and (outcome == 1)
-                
-                cap = 0 if is_blocked else self.edges_episode[e].capacity
-                
-                cap_constrs[e].RHS = cap
-                cap_constrs[(e[1], e[0])].RHS = cap
-            
-            sub_model.optimize()
-            if sub_model.status == grb.GRB.OPTIMAL:
-                total_flow += sub_model.ObjVal
-                
-        return total_flow / n_scenarios, interdicted_edges
 
     def _compute_baycik_static_features(self):
         """Compute static topological features for Baycik's methodology."""
@@ -891,7 +851,7 @@ class InterdictionSolverMixin:
             'max_dist_sink': max_dist_sink
         }
 
-    def train_baycik_model(self, pickle_path):
+    def train_baycik_model(self, pickle_path, start_index=0, end_index=None):
         """Train Random Forest model using Baycik's methodology from solution file."""
         with open(pickle_path, 'rb') as f:
             data = pickle.load(f)
@@ -911,7 +871,8 @@ class InterdictionSolverMixin:
         try:
             # We iterate through the saved episodes
             # Note: We limit to valid episodes (where state is not None)
-            for i in tqdm(range(len(states)), desc="Training RF"):
+            limit = end_index if end_index is not None else len(states)
+            for i in tqdm(range(start_index, limit), desc="Training RF"):
                 state = states[i]
                 if state is None: continue
                 
@@ -949,7 +910,8 @@ class InterdictionSolverMixin:
                     
                     cap = state['edge_capacity'][idx]
                     cost = state['edge_costs'][idx]
-                    f_val = flow_dict.get(edge, 0)
+                    f_val = flow_dict.get(edge, 0) + flow_dict.get((edge[1],edge[0]), 0)
+
                     
                     # Extra Features
                     tail_in = static_feats['in_degree'].get(u, 0)
@@ -965,11 +927,11 @@ class InterdictionSolverMixin:
                     norm_cap = cap / max_net_cap
                     
                     prob_success = self.state['edge_interdiction_probability'][idx]
-
+                        
                     # Features: Cost, Flow, Budget, Interdiction Prob + 7 New. (Removed Raw Capacity)
-                    features = [cost, f_val, budget, prob_success,
-                                tail_in, tail_out, head_in, head_out,
-                                norm_d_src, norm_d_sink, norm_cap]
+                    features = [cost, budget, f_val, prob_success,
+                        tail_in, tail_out, head_in, head_out,
+                        norm_d_src, norm_d_sink, norm_cap]
 
                     label = 1 if edge in target_set else 0
                     
@@ -1012,7 +974,7 @@ class InterdictionSolverMixin:
                 
             cap = self.state['edge_capacity'][idx]
             cost = self.state['edge_costs'][idx]
-            f_val = flow_dict.get(edge, 0)
+            f_val = flow_dict.get(edge, 0) + flow_dict.get((edge[1],edge[0]), 0)
             
             # Extra Features
             tail_in = static_feats['in_degree'].get(u, 0)
@@ -1029,44 +991,84 @@ class InterdictionSolverMixin:
             
             prob_success = self.state['edge_interdiction_probability'][idx]
 
-            features = [cost, f_val, budget, prob_success,
+            features = [cost, budget, f_val, prob_success,
                         tail_in, tail_out, head_in, head_out,
                         norm_d_src, norm_d_sink, norm_cap]
             
             # Predict Prob of Class 1
             prob = model.predict_proba([features])[0][1]
-            candidates.append({'edge': edge, 'prob': prob, 'cost': cost})
+            candidates.append({'edge': edge, 'prob': prob, 'cost': cost, 'index': idx})
             
         # Sort by probability descending
         candidates.sort(key=lambda x: x['prob'], reverse=True)
         
         selected_edges = []
-        current_spend = 0
         
-        # Greedy Selection (Knapsack-like)
-        for cand in candidates:
-            if current_spend + cand['cost'] <= budget:
-                selected_edges.append(cand['edge'])
-                current_spend += cand['cost']
+        # Save state before greedy rollout
+        saved_budget = self.state['budget'][0]
+        saved_interdicted = self.state['edge_interdicted'].copy()
         
-        # Evaluate
-        if self.deterministic_outcomes:
-            # Deterministic Evaluation
-            sub, cap_cons, _ = self._create_lp_maxflow_model()
-            sub.setParam("OutputFlag", 0)
+        try:
+            # Greedy Selection (Masked Rollout)
+            done = False
+            selected_indices = set()
             
-            block_set = set(selected_edges)
-            for e in self.both_edges:
-                # If interdicted, 0 capacity
-                cap = 0 if e in block_set else self.edges_episode[e].capacity
-                cap_cons[e].RHS = cap
-                cap_cons[(e[1], e[0])].RHS = cap
+            while not done:
+                # Update mask based on current state
+                if len(selected_edges) == 0:
+                     # Initial priming of flows for mask_fn
+                     # Must update self.reference_flows so cache is correct
+                     try:
+                         if self.attacker_strategy == "zero_sum":
+                              _, self.reference_flows = self._compute_objective_and_flows()
+                         elif self.attacker_strategy == "canalize":
+                              _, self.reference_flows = self._calculate_canalize_objective_and_flows()
+                         elif self.attacker_strategy == "isolate":
+                              _, self.reference_flows = self._calculate_isolate_objective_and_flows()
+                         elif self.attacker_strategy == "divert":
+                              _, self.reference_flows = self._calculate_divert_objective_and_flows()
+                     except Exception:
+                         pass
+
+                     self._cache_flow_array()
                 
-            sub.optimize()
-            objective_value = sub.ObjVal
-        else:
-            # Stochastic Evaluation
-            objective_value, _ = self._eval_fixed_strategy(n_scenarios=500, seed=123, interdicted_edges=selected_edges)
+                mask = self.mask_fn()
+                
+                selected_idx = -1
+                
+                # Filter candidates that are valid and not yet selected
+                for cand in candidates:
+                    idx = cand['index']
+                    
+                    if idx not in selected_indices and mask[idx] == 1:
+                        # Found best valid
+                        selected_edges.append(cand['edge'])
+                        selected_idx = idx
+                        selected_indices.add(idx)
+                        break
+                
+                if selected_idx != -1:
+                    # Execute step to update state and flows (and mask for next iter)
+                    _, _, done, _, _ = self.step(selected_idx)
+                    
+                    # Remove from candidates list to avoid re-checking (optimization)
+                    # Although simple iteration skips it if mask says invalid (already interdicted)
+                    pass 
+                else:
+                    # No valid candidate found in our list 
+                    # (maybe budget exists but only for edges with low prob that we didn't include? 
+                    # logic includes all edges so this means NO valid edges left)
+                    break
+                    
+        finally:
+            # Restore state
+            self.state['budget'][0] = saved_budget
+            self.state['edge_interdicted'] = saved_interdicted
+            # Re-cache flows for restored state
+            self._cache_flow_array()
+
+        # Evaluate
+        objective_value = self._evaluate_solution_stochastic(selected_edges)
             
         return objective_value, selected_edges
 
