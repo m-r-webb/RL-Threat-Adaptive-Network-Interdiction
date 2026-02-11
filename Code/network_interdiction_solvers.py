@@ -892,7 +892,7 @@ class InterdictionSolverMixin:
                 self.state['edge_interdicted'] = np.zeros_like(temp_interdicted)
                 
                 # Solve max flow to get features
-                _, flow_dict = self.solve_max_flow()
+                # _, flow_dict = self.solve_max_flow()
                 
                 # Restore interdictions (though usually 0 at start of episode)
                 self.state['edge_interdicted'] = temp_interdicted
@@ -904,39 +904,95 @@ class InterdictionSolverMixin:
                 current_caps = state['edge_capacity'][:self.num_both_edges]
                 max_net_cap = np.max(current_caps) if len(current_caps) > 0 else 1.0
                 
-                for idx in range(self.num_both_edges):
-                    edge = self.both_edges[idx]
-                    u, v = edge
+                # Iterative Data Expansion:
+                # Iterate until all target edges are added to interdiction set
+                # Recompute features after each addition
+                
+                # Sort target set by some heuristic if needed, or arbitrary.
+                # Here we just iterate through them arbitrarily (set order).
+                # Actually, to be robust, we treat all remaining targets as positives (1)
+                # and pick one to "execute" to move to next state.
+                
+                targets_remaining = list(target_set)
+                random.shuffle(targets_remaining) # Shuffle to randomize trajectory order
+                
+                current_interdicted_indices = set() # Track what we've added in this expansion loop
+                
+                # Outer loop: State trajectory (0 interdicted -> 1 -> ... -> N-1)
+                # We stop when 1 target remains? No, we can train on the last step too (picking the last one).
+                # So we loop len(targets) times.
+                
+                for step_idx in range(len(targets_remaining) + 1):
+                    # 1. Update features for current state
+                    _, flow_dict = self.solve_max_flow()
                     
-                    cap = state['edge_capacity'][idx]
-                    cost = state['edge_costs'][idx]
-                    f_val = flow_dict.get(edge, 0) + flow_dict.get((edge[1],edge[0]), 0)
-
+                    current_budget = self.state['budget'][0]
                     
-                    # Extra Features
-                    tail_in = static_feats['in_degree'].get(u, 0)
-                    tail_out = static_feats['out_degree'].get(u, 0)
-                    head_in = static_feats['in_degree'].get(v, 0)
-                    head_out = static_feats['out_degree'].get(v, 0)
-                    
-                    d_src = static_feats['dist_src'].get(u, static_feats['max_dist_src'])
-                    d_sink = static_feats['dist_sink'].get(v, static_feats['max_dist_sink'])
-                    
-                    norm_d_src = d_src / static_feats['max_dist_src']
-                    norm_d_sink = d_sink / static_feats['max_dist_sink']
-                    norm_cap = cap / max_net_cap
-                    
-                    prob_success = self.state['edge_interdiction_probability'][idx]
+                    # 2. Collect samples for all edges
+                    for idx in range(self.num_both_edges):
+                        # Skip edges already interdicted in this trajectory
+                        # (The environment handles the logic, but for feature extraction loop)
+                        if self.state['edge_interdicted'][idx] == 1:
+                            continue
+                            
+                        edge = self.both_edges[idx]
+                        u, v = edge
                         
-                    # Features: Cost, Flow, Budget, Interdiction Prob + 7 New. (Removed Raw Capacity)
-                    features = [cost, budget, f_val, prob_success,
-                        tail_in, tail_out, head_in, head_out,
-                        norm_d_src, norm_d_sink, norm_cap]
+                        cap = self.state['edge_capacity'][idx]
+                        cost = self.state['edge_costs'][idx]
+                        f_val = flow_dict.get(edge, 0) + flow_dict.get((edge[1],edge[0]), 0)
 
-                    label = 1 if edge in target_set else 0
+                        
+                        # Extra Features
+                        tail_in = static_feats['in_degree'].get(u, 0)
+                        tail_out = static_feats['out_degree'].get(u, 0)
+                        head_in = static_feats['in_degree'].get(v, 0)
+                        head_out = static_feats['out_degree'].get(v, 0)
+                        
+                        d_src = static_feats['dist_src'].get(u, static_feats['max_dist_src'])
+                        d_sink = static_feats['dist_sink'].get(v, static_feats['max_dist_sink'])
+                        
+                        norm_d_src = d_src / static_feats['max_dist_src']
+                        norm_d_sink = d_sink / static_feats['max_dist_sink']
+                        norm_cap = cap / max_net_cap
+                        
+                        prob_success = self.state['edge_interdiction_probability'][idx]
+                            
+                        # Features: Cost, Flow, Budget, Interdiction Prob + 7 New. (Removed Raw Capacity)
+                        features = [cost, f_val, current_budget, prob_success,
+                            tail_in, tail_out, head_in, head_out,
+                            norm_d_src, norm_d_sink, norm_cap]
+
+                        # Label is 1 if edge is in the remaining target set
+                        label = 1 if edge in target_set and edge not in current_interdicted_indices else 0
+                        
+                        X.append(features)
+                        y.append(label)
                     
-                    X.append(features)
-                    y.append(label)
+                    # 3. Transition: Pick next edge from targets to interdict
+                    if step_idx < len(targets_remaining):
+                        next_edge = targets_remaining[step_idx]
+                        next_idx = self.edge_to_index[next_edge]
+                        
+                        # Execute step (updates budget, interdicted status, probabilistically?)
+                        # Since this is training on "optimal" ground truth which assumes successful interdiction usually,
+                        # or at least the attempt.
+                        # We use env.step() to handle budget and state updates correctly.
+                        # Note: step() might fail interdiction if prob < 1. 
+                        # But optimal_solutions usually refers to the set of edges *attempted* that yielded result?
+                        # Or the edges that *should* be cut.
+                        # We force success for feature calculation purposes if we want to simulate the "ideal" trajectory,
+                        # OR we use step() and handle the stochasticity.
+                        # Given 'optimal_solutions' comes from a static solution (likely), we should force it.
+                        
+                        # Direct state update to force "interdicted" behavior for feature flow calc
+                        self.state['edge_interdicted'][next_idx] = 1
+                        self.state['budget'][0] -= self.state['edge_costs'][next_idx]
+                        current_interdicted_indices.add(next_edge)
+                        
+                        # If budget runs out, stop trajectory
+                        if self.state['budget'][0] < 0:
+                            break
                     
         finally:
             self.state = original_state
@@ -947,60 +1003,13 @@ class InterdictionSolverMixin:
         return clf
 
     def solve_baycik_interdiction(self, model):
-        """Solve using Baycik's Random Forest Heuristic."""
-        # 1. Calculate Initial Uninterdicted Flow for Features
-        temp_interdicted = self.state['edge_interdicted'].copy()
-        self.state['edge_interdicted'] = np.zeros_like(temp_interdicted)
-        _, flow_dict = self.solve_max_flow()
-        self.state['edge_interdicted'] = temp_interdicted
-        
+        """Solve using Baycik's Random Forest Heuristic with dynamic re-evaluation."""
         # Static Features
         static_feats = self._compute_baycik_static_features()
         
-        budget = self.state['budget'][0]
-        candidates = []
-        
-        # Max capacity
+        # Max capacity for normalization
         current_caps = self.state['edge_capacity'][:self.num_both_edges]
         max_net_cap = np.max(current_caps) if len(current_caps) > 0 else 1.0
-        
-        for idx in range(self.num_both_edges):
-            edge = self.both_edges[idx]
-            u, v = edge
-            
-            # Skip if already interdicted (if that's possible in usage context)
-            if self.state['edge_interdicted'][idx] == 1:
-                continue
-                
-            cap = self.state['edge_capacity'][idx]
-            cost = self.state['edge_costs'][idx]
-            f_val = flow_dict.get(edge, 0) + flow_dict.get((edge[1],edge[0]), 0)
-            
-            # Extra Features
-            tail_in = static_feats['in_degree'].get(u, 0)
-            tail_out = static_feats['out_degree'].get(u, 0)
-            head_in = static_feats['in_degree'].get(v, 0)
-            head_out = static_feats['out_degree'].get(v, 0)
-            
-            d_src = static_feats['dist_src'].get(u, static_feats['max_dist_src'])
-            d_sink = static_feats['dist_sink'].get(v, static_feats['max_dist_sink'])
-            
-            norm_d_src = d_src / static_feats['max_dist_src']
-            norm_d_sink = d_sink / static_feats['max_dist_sink']
-            norm_cap = cap / max_net_cap
-            
-            prob_success = self.state['edge_interdiction_probability'][idx]
-
-            features = [cost, budget, f_val, prob_success,
-                        tail_in, tail_out, head_in, head_out,
-                        norm_d_src, norm_d_sink, norm_cap]
-            
-            # Predict Prob of Class 1
-            prob = model.predict_proba([features])[0][1]
-            candidates.append({'edge': edge, 'prob': prob, 'cost': cost, 'index': idx})
-            
-        # Sort by probability descending
-        candidates.sort(key=lambda x: x['prob'], reverse=True)
         
         selected_edges = []
         
@@ -1014,57 +1023,84 @@ class InterdictionSolverMixin:
             selected_indices = set()
             
             while not done:
-                # Update mask based on current state
-                if len(selected_edges) == 0:
-                     # Initial priming of flows for mask_fn
-                     # Must update self.reference_flows so cache is correct
-                     try:
-                         if self.attacker_strategy == "zero_sum":
-                              _, self.reference_flows = self._compute_objective_and_flows()
-                         elif self.attacker_strategy == "canalize":
-                              _, self.reference_flows = self._calculate_canalize_objective_and_flows()
-                         elif self.attacker_strategy == "isolate":
-                              _, self.reference_flows = self._calculate_isolate_objective_and_flows()
-                         elif self.attacker_strategy == "divert":
-                              _, self.reference_flows = self._calculate_divert_objective_and_flows()
-                     except Exception:
-                         pass
+                # 1. Update Strategy Flows (for Mask)
+                # We need to ensure mask_fn allows valid actions based on current flow state
+                try:
+                    if self.attacker_strategy == "zero_sum":
+                        _, self.reference_flows = self._compute_objective_and_flows()
+                    elif self.attacker_strategy == "canalize":
+                        _, self.reference_flows = self._calculate_canalize_objective_and_flows()
+                    elif self.attacker_strategy == "isolate":
+                        _, self.reference_flows = self._calculate_isolate_objective_and_flows()
+                    elif self.attacker_strategy == "divert":
+                        _, self.reference_flows = self._calculate_divert_objective_and_flows()
+                except Exception:
+                    # Fallback check
+                    pass
 
-                     self._cache_flow_array()
-                
+                self._cache_flow_array()
                 mask = self.mask_fn()
                 
-                selected_idx = -1
+                # 2. Update Feature Flows (Standard Zero Sum for Features consistency with Train)
+                # If strategy is zero_sum, we technically computed this above.
+                flow_dict = self.reference_flows
+                                
+                current_budget = self.state['budget'][0]
                 
-                # Filter candidates that are valid and not yet selected
-                for cand in candidates:
-                    idx = cand['index']
-                    
-                    if idx not in selected_indices and mask[idx] == 1:
-                        # Found best valid
-                        selected_edges.append(cand['edge'])
-                        selected_idx = idx
-                        selected_indices.add(idx)
-                        break
+                best_candidate_idx = -1
+                best_prob = -1.0
                 
-                if selected_idx != -1:
-                    # Execute step to update state and flows (and mask for next iter)
-                    _, _, done, _, _ = self.step(selected_idx)
+                # 3. Score candidates
+                for idx in range(self.num_both_edges):
+                    if mask[idx] == 0: continue
+                    if idx in selected_indices: continue
+                        
+                    edge = self.both_edges[idx]
+                    u, v = edge
                     
-                    # Remove from candidates list to avoid re-checking (optimization)
-                    # Although simple iteration skips it if mask says invalid (already interdicted)
-                    pass 
+                    cap = self.state['edge_capacity'][idx]
+                    cost = self.state['edge_costs'][idx]
+                    
+                    # Consistent with train_baycik_model
+                    f_val = flow_dict.get(edge, 0) + flow_dict.get((edge[1],edge[0]), 0)
+                    
+                    tail_in = static_feats['in_degree'].get(u, 0)
+                    tail_out = static_feats['out_degree'].get(u, 0)
+                    head_in = static_feats['in_degree'].get(v, 0)
+                    head_out = static_feats['out_degree'].get(v, 0)
+                    
+                    d_src = static_feats['dist_src'].get(u, static_feats['max_dist_src'])
+                    d_sink = static_feats['dist_sink'].get(v, static_feats['max_dist_sink'])
+                    
+                    norm_d_src = d_src / static_feats['max_dist_src']
+                    norm_d_sink = d_sink / static_feats['max_dist_sink']
+                    norm_cap = cap / max_net_cap
+                    
+                    prob_success = self.state['edge_interdiction_probability'][idx]
+
+                    # Consistent Order with train_baycik_model: Cost, Flow, Budget...
+                    features = [cost, f_val, current_budget, prob_success,
+                                tail_in, tail_out, head_in, head_out,
+                                norm_d_src, norm_d_sink, norm_cap]
+                    
+                    # Predict
+                    prob = model.predict_proba([features])[0][1]
+                    
+                    if prob > best_prob:
+                        best_prob = prob
+                        best_candidate_idx = idx
+
+                if best_candidate_idx != -1:
+                    selected_edges.append(self.both_edges[best_candidate_idx])
+                    selected_indices.add(best_candidate_idx)
+                    _, _, done, _, _ = self.step(best_candidate_idx)
                 else:
-                    # No valid candidate found in our list 
-                    # (maybe budget exists but only for edges with low prob that we didn't include? 
-                    # logic includes all edges so this means NO valid edges left)
                     break
                     
         finally:
             # Restore state
             self.state['budget'][0] = saved_budget
             self.state['edge_interdicted'] = saved_interdicted
-            # Re-cache flows for restored state
             self._cache_flow_array()
 
         # Evaluate
