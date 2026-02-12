@@ -1863,12 +1863,17 @@ class InterdictionSolverMixin:
         max_budget = self.state['budget'][0]
         budget_levels = int(max_budget // self.min_edge_cost) if self.min_edge_cost > 0 else 1
 
+        # Optimization: Put large static data in Ray object store once to avoid repeated serialization
+        nodes_ref = ray.put(self.nodes)
+        edges_ref = ray.put(self.edges_reset)
+        state_ref = ray.put(state_snapshot)
+
         workers = [
             _RemoteEnvWorker.remote(
-                self.nodes,
-                self.edges_reset,
+                nodes_ref,
+                edges_ref,
                 seed,
-                state_snapshot,
+                state_ref,
                 self.attacker_strategy,
                 self.min_edge_cost,
                 self.num_both_edges,
