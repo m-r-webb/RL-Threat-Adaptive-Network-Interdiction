@@ -922,7 +922,7 @@ class InterdictionSolverMixin:
                 # We stop when 1 target remains? No, we can train on the last step too (picking the last one).
                 # So we loop len(targets) times.
                 
-                for step_idx in range(len(targets_remaining) + 1):
+                for step_idx in range(len(targets_remaining) ):
                     # 1. Update features for current state
                     _, flow_dict = self.solve_max_flow()
                     
@@ -1215,6 +1215,68 @@ class InterdictionSolverMixin:
 
         return (self.optimal_stochastic_model_IM.objVal, interdicted_edges, interdicted_quantities)
 
+    def calculate_action_heuristics(self, valid_actions, flows, remaining_budget):
+        """
+        Calculate heuristic values for a batch of actions.
+        Returns array of heuristic values aligned with valid_actions.
+        """
+        # 1. Identify valid projection edges (similar to mask_fn but without flow checks)
+        # Vectorized checks on state
+        costs = self.state['edge_costs'][:self.num_interdictable]
+        # Basic validity constraints
+        has_prob = self.state['edge_interdiction_probability'][:self.num_interdictable] > 0
+        limit_ok = (self.state['edge_interdicted'][:self.num_interdictable] + 1) <= self.max_interdictions
+        
+        # Strategy-specific target constraints
+        if self.attacker_strategy == 'canalize':
+            strategy_mask = self.state['canalize_objective'][:self.num_interdictable] != 1
+        elif self.attacker_strategy == 'divert':
+            strategy_mask = self.state['divert_to_objective'][:self.num_interdictable] != 1
+            # Divert specific: must enforce divert_from sequence
+            from_path_interdicted = np.any((self.state['edge_interdicted'][:self.num_interdictable] > 0) & 
+                                            (self.state['divert_from_objective'][:self.num_interdictable] == 1))
+            if not from_path_interdicted:
+                is_target = self.state['divert_from_objective'][:self.num_interdictable] == 1
+                strategy_mask = strategy_mask & is_target
+        else:
+            strategy_mask = np.ones(self.num_interdictable, dtype=bool)
+
+        # We assume we can afford the edge eventually, so we check if cost <= remaining_budget?
+        # Actually, for the "projection" max benefit, we look at edges we could theoretically afford.
+        # But max_benefit is applied to *future* moves.
+        # Let's simple check if edge is affordable within current budget as a proxy for "reachable".
+        affordable = costs <= remaining_budget
+        
+        projection_mask = affordable & has_prob & limit_ok & strategy_mask
+        
+        # 2. Get Max Projected Benefit for future moves
+        if np.any(projection_mask):
+            caps_proj = self.state['edge_capacity'][:self.num_interdictable]
+            probs_proj = self.state['edge_interdiction_probability'][:self.num_interdictable]
+            
+            # Use max expected value (prob * cap) for future moves
+            max_future_benefit = np.max((caps_proj * probs_proj)[projection_mask])
+        else:
+            max_future_benefit = 0.0
+
+        # 3. Calculate heuristics for valid_actions
+        action_costs = self.state['edge_costs'][valid_actions]
+        # Added epsilon to prevent floating point floor errors from underestimating moves
+        future_moves = np.floor((remaining_budget - action_costs + 1e-9) / self.min_edge_cost)
+        
+        probs = self.state['edge_interdiction_probability'][valid_actions]
+        
+        # Calculate Current Flow on the candidate edges
+        current_flow_vals = np.array([
+            flows.get(self.both_edges[a], 0) + flows.get((self.both_edges[a][1], self.both_edges[a][0]), 0)
+            for a in valid_actions
+        ])
+        
+        # User requested formula: prop*flow +(future_moves*max(probs*caps))
+        heuristics = (probs * current_flow_vals) + (future_moves * max_future_benefit)
+        
+        return heuristics
+    
     def solve_heuristic_interdiction(self):
         """
         Executes a Greedy Max-Flow Heuristic solver on the current environment state.
