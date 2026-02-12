@@ -169,8 +169,6 @@ class _RemoteEnvWorker:
                                 local_alpha_cache = remote_val
                     except Exception:
                         pass
-                # If time hasn't passed, we keep accumulating local_counter.
-                # This efficiently batches "bursty" progress (like cache hits).
 
         def dp_local(rem_budget, inter_state, d, alpha=-float('inf')):
             nonlocal local_counter, local_alpha_cache
@@ -188,7 +186,6 @@ class _RemoteEnvWorker:
                 return memo_local[key]
 
             # 2) check centralized memo (SHARDED)
-            t_start = time.perf_counter()
             shared_val = None
             target_actor = None
             
@@ -218,8 +215,6 @@ class _RemoteEnvWorker:
             self.env.state['edge_interdicted'][:] = inter_state
 
             # terminal objective
-            t_start = time.perf_counter()
-
             # Capture flows to update environment state for mask_fn
             current_flows = None
             
@@ -1215,55 +1210,99 @@ class InterdictionSolverMixin:
 
         return (self.optimal_stochastic_model_IM.objVal, interdicted_edges, interdicted_quantities)
 
-    def calculate_action_heuristics(self, valid_actions, flows, remaining_budget):
+    def calculate_action_heuristics(self, valid_actions, flows, remaining_budget, include_projection=True):
         """
         Calculate heuristic values for a batch of actions.
         Returns array of heuristic values aligned with valid_actions.
         """
-        # 1. Identify valid projection edges (similar to mask_fn but without flow checks)
-        # Vectorized checks on state
-        costs = self.state['edge_costs'][:self.num_interdictable]
-        # Basic validity constraints
-        has_prob = self.state['edge_interdiction_probability'][:self.num_interdictable] > 0
-        limit_ok = (self.state['edge_interdicted'][:self.num_interdictable] + 1) <= self.max_interdictions
-        
-        # Strategy-specific target constraints
-        if self.attacker_strategy == 'canalize':
-            strategy_mask = self.state['canalize_objective'][:self.num_interdictable] != 1
-        elif self.attacker_strategy == 'divert':
-            strategy_mask = self.state['divert_to_objective'][:self.num_interdictable] != 1
-            # Divert specific: must enforce divert_from sequence
-            from_path_interdicted = np.any((self.state['edge_interdicted'][:self.num_interdictable] > 0) & 
-                                            (self.state['divert_from_objective'][:self.num_interdictable] == 1))
-            if not from_path_interdicted:
-                is_target = self.state['divert_from_objective'][:self.num_interdictable] == 1
-                strategy_mask = strategy_mask & is_target
-        else:
-            strategy_mask = np.ones(self.num_interdictable, dtype=bool)
+        projected_values = np.zeros(len(valid_actions))
 
-        # We assume we can afford the edge eventually, so we check if cost <= remaining_budget?
-        # Actually, for the "projection" max benefit, we look at edges we could theoretically afford.
-        # But max_benefit is applied to *future* moves.
-        # Let's simple check if edge is affordable within current budget as a proxy for "reachable".
-        affordable = costs <= remaining_budget
-        
-        projection_mask = affordable & has_prob & limit_ok & strategy_mask
-        
-        # 2. Get Max Projected Benefit for future moves
-        if np.any(projection_mask):
-            caps_proj = self.state['edge_capacity'][:self.num_interdictable]
-            probs_proj = self.state['edge_interdiction_probability'][:self.num_interdictable]
-            
-            # Use max expected value (prob * cap) for future moves
-            max_future_benefit = np.max((caps_proj * probs_proj)[projection_mask])
-        else:
-            max_future_benefit = 0.0
+        if include_projection:
+             # Ensure min_edge_cost is available
+             if not hasattr(self, 'min_edge_cost') or self.min_edge_cost <= 0:
+                real_edge_costs = self.state['edge_costs'][:self.num_interdictable]
+                pos_costs = real_edge_costs[real_edge_costs > 0]
+                self.min_edge_cost = np.min(pos_costs) if len(pos_costs) > 0 else 1.0
 
-        # 3. Calculate heuristics for valid_actions
-        action_costs = self.state['edge_costs'][valid_actions]
-        # Added epsilon to prevent floating point floor errors from underestimating moves
-        future_moves = np.floor((remaining_budget - action_costs + 1e-9) / self.min_edge_cost)
-        
+             # 1. Identify valid projection edges (similar to mask_fn but without flow checks)
+             costs = self.state['edge_costs'][:self.num_interdictable]
+             # Basic validity constraints
+             has_prob = self.state['edge_interdiction_probability'][:self.num_interdictable] > 0
+             limit_ok = (self.state['edge_interdicted'][:self.num_interdictable] + 1) <= self.max_interdictions
+             
+             # Strategy-specific target constraints
+             if self.attacker_strategy == 'canalize':
+                 strategy_mask = self.state['canalize_objective'][:self.num_interdictable] != 1
+             elif self.attacker_strategy == 'divert':
+                 strategy_mask = self.state['divert_to_objective'][:self.num_interdictable] != 1
+                 # Divert specific: must enforce divert_from sequence
+                 from_path_interdicted = np.any((self.state['edge_interdicted'][:self.num_interdictable] > 0) & 
+                                                 (self.state['divert_from_objective'][:self.num_interdictable] == 1))
+                 if not from_path_interdicted:
+                     is_target = self.state['divert_from_objective'][:self.num_interdictable] == 1
+                     strategy_mask = strategy_mask & is_target
+             else:
+                 strategy_mask = np.ones(self.num_interdictable, dtype=bool)
+
+             # We check if edge is affordable within current budget
+             affordable = costs <= remaining_budget
+             
+             projection_mask = affordable & has_prob & limit_ok & strategy_mask
+             
+             # 2. Get Sorted Future Benefits
+             projection_indices = np.where(projection_mask)[0]
+             
+             if len(projection_indices) > 0:
+                 caps_proj = self.state['edge_capacity'][projection_indices]
+                 probs_proj = self.state['edge_interdiction_probability'][projection_indices]
+                 benefits = caps_proj * probs_proj
+                 
+                 # Sort descending
+                 sorted_idx = np.argsort(-benefits)
+                 sorted_benefits = benefits[sorted_idx]
+                 sorted_global_indices = projection_indices[sorted_idx]
+                 
+                 # Rank Lookup (Map global edge index -> rank in sorted list)
+                 # Use self.num_both_edges as size limit to handle any valid_action index safely
+                 rank_lookup = np.full(int(self.num_both_edges), -1, dtype=int)
+                 # Only populate for valid projection indices that fit
+                 valid_mask_indices = sorted_global_indices < self.num_both_edges
+                 rank_lookup[sorted_global_indices[valid_mask_indices]] = np.arange(len(sorted_global_indices))[valid_mask_indices]
+                 
+                 # Precompute cumulative sum (prefix sum) for fast range summation
+                 # cumsum[k] = sum of top k items
+                 cumsum_benefits = np.zeros(len(sorted_benefits) + 1)
+                 np.cumsum(sorted_benefits, out=cumsum_benefits[1:])
+                 
+                 max_available = len(sorted_benefits)
+                 
+                 # 3. Calculate Projected Value per Action
+                 action_costs = self.state['edge_costs'][valid_actions]
+                 future_moves_arr = np.floor((remaining_budget - action_costs + 1e-9) / self.min_edge_cost).astype(int)
+                 
+                 for i, action in enumerate(valid_actions):
+                     n = future_moves_arr[i]
+                     if n <= 0:
+                         continue
+                         
+                     # Check if action is in the sorted list (and what its rank is)
+                     action_rank = rank_lookup[action] if action < len(rank_lookup) else -1
+                     
+                     if action_rank != -1 and action_rank < n:
+                         # Action is in the top n set.
+                         # We take the top n+1 items, minus the action itself.
+                         # This effectively takes the top n ignoring the action we just took.
+                         count = min(n + 1, max_available)
+                         val = cumsum_benefits[count] - sorted_benefits[action_rank]
+                         projected_values[i] = val
+                     else:
+                         # Action is not in the top n set (or not in available list).
+                         # We take the top n items directly.
+                         count = min(n, max_available)
+                         val = cumsum_benefits[count]
+                         projected_values[i] = val
+
+        # 4. Calculate heuristics for valid_actions
         probs = self.state['edge_interdiction_probability'][valid_actions]
         
         # Calculate Current Flow on the candidate edges
@@ -1272,8 +1311,7 @@ class InterdictionSolverMixin:
             for a in valid_actions
         ])
         
-        # User requested formula: prop*flow +(future_moves*max(probs*caps))
-        heuristics = (probs * current_flow_vals) + (future_moves * max_future_benefit)
+        heuristics = (probs * current_flow_vals) + projected_values
         
         return heuristics
     
@@ -1324,30 +1362,17 @@ class InterdictionSolverMixin:
                      return_full_flows=True
                  )
              
-             # Calculate expected flow on each valid edge (sum of forward and reverse flow)
-             edge_flows = np.zeros(self.num_interdictable)
-             
-             # Get interdiction probabilities for all interdictable edges
-             interdiction_probs = self.state['edge_interdiction_probability'][:self.num_interdictable]
-             
-             for idx in valid_actions:
-                 edge = interdictable_edges_list[idx]
-                 reverse_edge = (edge[1], edge[0])
-                 forward_flow = flows.get(edge, 0)
-                 reverse_flow = flows.get(reverse_edge, 0)
-                 edge_flows[idx] = forward_flow + reverse_flow
-             
              masked_values = np.full(self.num_interdictable, -np.inf)
              
              # Select the valid action with maximum (expected flow * interdiction probability)
-             
+             current_heuristics = self.calculate_action_heuristics(valid_actions, flows, self.state['budget'][0], include_projection=False)
+             masked_values[valid_actions] = current_heuristics
+
              if self.attacker_strategy == "zero_sum":
-                 heuristic_values = edge_flows * interdiction_probs
-                 masked_values[valid_actions] = heuristic_values[valid_actions]
+                 pass
 
              elif self.attacker_strategy == "isolate":
-                  heuristic_values = edge_flows * interdiction_probs
-                  masked_values[valid_actions] = heuristic_values[valid_actions]
+                  pass
 
              elif self.attacker_strategy == "canalize":
                   # 1. Identify Target Nodes (Middle node of canalize objective)
@@ -1387,7 +1412,7 @@ class InterdictionSolverMixin:
                   # Priority 1: Connects to Middle Node
                   if target_set_actions:
                       for act in target_set_actions:
-                          f = edge_flows[act] * interdiction_probs[act]
+                          f = masked_values[act]
                           if f > max_flow:
                               max_flow = f
                               best_action = act
@@ -1423,22 +1448,20 @@ class InterdictionSolverMixin:
                               if start_node_actions:
                                   max_start_flow = -1
                                   for act in start_node_actions:
-                                      f = edge_flows[act] * interdiction_probs[act]
+                                      f = masked_values[act]
                                       if f > max_start_flow:
                                           max_start_flow = f
                                           best_action = act
 
                   # Priority 3: Zero Sum behavior
                   if best_action == -1:
-                      heuristic_values = edge_flows * interdiction_probs
-                      masked_values[valid_actions] = heuristic_values[valid_actions]
+                      pass
                   else:
                       masked_values[best_action] = float('inf')
 
              elif self.attacker_strategy == "divert":
                   # Placeholder - default to max flow heuristic for now
-                  heuristic_values = edge_flows * interdiction_probs
-                  masked_values[valid_actions] = heuristic_values[valid_actions]
+                  pass
              
              action = int(np.argmax(masked_values))
              
@@ -1469,7 +1492,7 @@ class InterdictionSolverMixin:
 
     # --- Re-add solve_backward_induction_ray method to Mixin ---
     
-    def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=None, ray_address=None, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True):
+    def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=None, ray_address=None, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, rl_model_path=None):
         """
         Parallelized backward induction using Ray with Adaptive Frontier Expansion.
         """
@@ -1501,10 +1524,103 @@ class InterdictionSolverMixin:
             outcome_memo_actors = [SharedOutcomeMemoActor.remote() for _ in range(num_outcome_shards)]
             self.outcome_memo_actors = outcome_memo_actors
 
-        # Calculate Initial Alpha (Heuristic) - MOVED TO TOP to support Serial Mode
+        # Calculate Initial Alpha (Heuristic or RL)
         initial_alpha = -float('inf')
         initial_alpha_actions = []
-        if enable_alpha_pruning:
+
+        if rl_model_path:
+            if verbose:
+                print(f"Loading RL model from {rl_model_path} for initial alpha...")
+            try:
+                # Save state
+                old_budget = self.state['budget'][0]
+                old_interdicted = self.state['edge_interdicted'].copy()
+                
+                # Load Model
+                agent = None
+                if "MaskablePPO" in rl_model_path:
+                    from sb3_contrib import MaskablePPO
+                    agent = MaskablePPO.load(rl_model_path)
+                elif "PPO" in rl_model_path:
+                    from stable_baselines3 import PPO
+                    agent = PPO.load(rl_model_path, env=self)
+                elif "DQN" in rl_model_path:
+                    from stable_baselines3 import DQN
+                    agent = DQN.load(rl_model_path, env=self)
+                elif "A2C" in rl_model_path:
+                    from stable_baselines3 import A2C
+                    agent = A2C.load(rl_model_path, env=self)
+                else:
+                    if verbose: print("Warning: Unknown model type in path. Trying PPO.")
+                    from stable_baselines3 import PPO
+                    agent = PPO.load(rl_model_path, env=self)
+
+                # Run Episode
+                done = False
+                while not done:
+                    # Update flows for mask calculation
+                    if self.attacker_strategy == "zero_sum":
+                         _, self.reference_flows = self._compute_objective_and_flows()
+                    elif self.attacker_strategy == 'canalize':
+                         _, self.reference_flows = self._calculate_canalize_objective_and_flows()
+                    elif self.attacker_strategy == 'isolate':
+                         _, self.reference_flows = self._calculate_isolate_objective_and_flows()
+                    elif self.attacker_strategy == 'divert':
+                         _, self.reference_flows = self._calculate_divert_objective_and_flows()
+                    
+                    self._cache_flow_array()
+
+                    # Get observation
+                    # Assuming observation dict matches state or is part of it. 
+                    # The env_TA.py usually returns the state dict as obs.
+                    obs = self.state 
+                    
+                    if "MaskablePPO" in rl_model_path:
+                        action_masks = self.mask_fn()
+                        action, _ = agent.predict(obs, action_masks=action_masks, deterministic=True)
+                    else:
+                        action, _ = agent.predict(obs, deterministic=True)
+
+                    # Step
+                    # Since we are In the env, we can just call step() directly?
+                    # self.step() might expect self to be a Gym Env.
+                    # We are in a Mixin, but the class using it is CustomEnv(gym.Env). 
+                    # So self.step(int(action)) should work.
+                    
+                    _, _, done, _, _ = self.step(int(action))
+                    
+                    if int(action) < self.num_interdictable:
+                        initial_alpha_actions.append(self.both_edges[int(action)])
+
+                # Get final objective
+                if self.attacker_strategy == "zero_sum":
+                    obj_val, _ = self._compute_objective_and_flows()
+                    obj_val = -obj_val
+                elif self.attacker_strategy == "isolate":
+                    obj_val, _ = self._calculate_isolate_objective_and_flows()
+                    obj_val = -obj_val
+                elif self.attacker_strategy == "canalize":
+                    obj_val, _ = self._calculate_canalize_objective_and_flows()
+                elif self.attacker_strategy == "divert":
+                    obj_val, _ = self._calculate_divert_objective_and_flows()
+                else:
+                    obj_val = -float('inf')
+
+                initial_alpha = obj_val
+                
+                if verbose:
+                    print(f"RL Model found initial alpha: {initial_alpha}")
+
+            except Exception as e:
+                if verbose:
+                    print(f"RL Model execution failed: {e}. Falling back to heuristic.")
+                rl_model_path = None # Trigger fallback below if needed
+            finally:
+                # Restore state
+                self.state['budget'][0] = old_budget
+                self.state['edge_interdicted'][:] = old_interdicted
+
+        if enable_alpha_pruning and not rl_model_path:
             if verbose:
                 print("Running heuristic for initial alpha...")
             
