@@ -146,6 +146,8 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         # Optimized to use pre-computed reverse keys
         flows = self.reference_flows
         
+        if flows is None: flows = {}
+
         self.cached_flow_array = np.array(
             [flows.get(e, 0) + flows.get(re, 0) for e, re in zip(self.both_edges, self.reverse_edges_list)], 
             dtype=np.float32
@@ -1560,25 +1562,52 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                 self.outcome_memo_actors[idx].set_batch.remote(keys, vals)
 
         # 5. Compute weighted averages using Local Cache (which is now fully populated)
-        weighted_objective = 0.0
-        weighted_flows = defaultdict(float)
         
-        for outcome in unique_outcomes:
-            result = working_cache[outcome]  #(outcome, strategy_type)
-            weight = outcome_weights[outcome]
-            
-            weighted_objective += result['objective'] * weight
-            
-            if 'nonzero_flow_indices' in result:
-                # Reconstruct flow as 1 for these indices
-                for idx in result['nonzero_flow_indices']:
-                    edge = self.both_edges[idx]
-                    weighted_flows[edge] += 1.0 * weight
-            elif 'flows' in result:
-                for edge, flow in result['flows'].items():
-                    weighted_flows[edge] += flow * weight
+        # VECTORIZED IMPLEMENTATION
+        # Convert map to lists for indexing
+        ordered_outcomes = list(unique_outcomes)
+        weights = np.array([outcome_weights[o] for o in ordered_outcomes])
+        
+        # Extract objectives -- Handle case where objective might be missing/error (though unlikely in strict flow)
+        objectives = np.array([working_cache[o]['objective'] for o in ordered_outcomes])
+        weighted_objective = np.dot(objectives, weights)
+        
+        # Vectorized Flow Accumulation
+        # Shape: (num_outcomes, num_edges). Using num_both_edges to map to canonical edges.
+        flow_matrix = np.zeros((len(ordered_outcomes), self.num_both_edges))
+        edge_to_idx = self.edge_to_index # Local cache
+
+        for i, outcome in enumerate(ordered_outcomes):
+            res = working_cache[outcome]
+            if 'nonzero_flow_indices' in res and res['nonzero_flow_indices']:
+                # Input is indices of self.both_edges
+                flow_matrix[i, res['nonzero_flow_indices']] = 1.0 
+            elif 'flows' in res:
+                for edge, val in res['flows'].items():
+                    if val <= 1e-9: continue
+                    # Map edge to index
+                    idx = edge_to_idx.get(edge)
+                    if idx is not None:
+                        flow_matrix[i, idx] += val
+                    else:
+                        # Map synthetic reverse rule usage to primary edge for capacity tracking
+                        idx = edge_to_idx.get((edge[1], edge[0]))
+                        if idx is not None:
+                            flow_matrix[i, idx] += val
+
+        # Collapse rows weighted by outcome probability
+        # Shape: (num_edges,)
+        final_flows = np.dot(weights, flow_matrix)
+        
+        # Reconstruct result dictionary efficiently
+        # Only include non-zero flows
+        nonzero_indices = np.where(final_flows > 1e-9)[0]
+        weighted_flows = {
+            self.both_edges[i]: final_flows[i] 
+            for i in nonzero_indices
+        }
     
-        return weighted_objective, dict(weighted_flows)
+        return weighted_objective, weighted_flows
     
     def _compute_objective_and_flows(self, deterministic_mode=None):
         """Calculate the max flow objective and edge flows."""
