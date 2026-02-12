@@ -170,9 +170,18 @@ class _RemoteEnvWorker:
                     except Exception:
                         pass
 
-        def dp_local(rem_budget, inter_state, d, alpha=-float('inf')):
+        # INITIALIZE STATE ONCE (Optimization: Avoid copying state at every node)
+        self.env.state['budget'][0] = remaining_budget
+        self.env.state['edge_interdicted'][:] = interdicted_state
+
+        def dp_local(d, alpha=-float('inf')):
             nonlocal local_counter, local_alpha_cache
-            key = inter_state[:self.num_both_edges].tobytes()
+            
+            # Read current state directly from env (already synchronized)
+            # Use slice for key generation
+            current_interdicted = self.env.state['edge_interdicted']
+            key = current_interdicted[:self.num_both_edges].tobytes()
+            rem_budget = self.env.state['budget'][0]
             
             # Incorporate global knowledge
             alpha = max(alpha, local_alpha_cache)
@@ -207,12 +216,7 @@ class _RemoteEnvWorker:
                 maybe_flush_progress()
                 return shared_val
 
-            # save/restore small pieces of state
-            old_budget = self.env.state['budget'][0]
-            old_interdicted = self.env.state['edge_interdicted'].copy()
-
-            self.env.state['budget'][0] = rem_budget
-            self.env.state['edge_interdicted'][:] = inter_state
+            # NO STATE SAVE/RESTORE NEEDED HERE - State is already set
 
             # terminal objective
             # Capture flows to update environment state for mask_fn
@@ -238,10 +242,6 @@ class _RemoteEnvWorker:
 
             # base case
             if rem_budget < self.min_edge_cost or d >= self.max_depth_inner:
-                # restore
-                self.env.state['budget'][0] = old_budget
-                self.env.state['edge_interdicted'][:] = old_interdicted
-
                 memo_local[key] = (final_objective, [])
                 # Count the volume of the skipped subtree (leaves)
                 volume = int(int(self.num_both_edges) ** max(0, self.budget_levels - d))
@@ -257,9 +257,6 @@ class _RemoteEnvWorker:
 
             action_mask = self.env.mask_fn()
 
-            # restore
-            self.env.state['budget'][0] = old_budget
-            self.env.state['edge_interdicted'][:] = old_interdicted
             valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
 
             # Report the discovery of invalid actions as progress using estimated subtree sizes
@@ -293,15 +290,8 @@ class _RemoteEnvWorker:
 
             if self.enable_alpha_pruning:
                 # Heuristic sorting for pruning
-                # Temporarily set state for calculate_action_heuristics to see current interdictions
-                self.env.state['budget'][0] = rem_budget
-                self.env.state['edge_interdicted'][:] = inter_state
-                
+                # Optimization: State is already set correctly, just call heuristics
                 heuristics = self.env.calculate_action_heuristics(valid_actions, current_flows, rem_budget)
-                
-                # Restore
-                self.env.state['budget'][0] = old_budget
-                self.env.state['edge_interdicted'][:] = old_interdicted
                 
                 # Sort descending
                 sorted_indices = np.argsort(-heuristics)
@@ -312,25 +302,26 @@ class _RemoteEnvWorker:
                 # Pruning
                 if self.enable_alpha_pruning:
                      # Pruning condition using the new consolidated heuristic
-                     # Added tolerace (1e-6) to tolerate floating point errors
                      if final_objective + heuristics[i] < alpha - 1e-6:
                          skipped_actions = len(valid_actions) - i
                          est_per_skipped = int(self.num_both_edges ** max(0, self.budget_levels - (d + 1)))
                          local_counter += skipped_actions * est_per_skipped
                          maybe_flush_progress()
-                         #break  # ADD BACK
                          # Do not memoize results from pruned nodes as they may be valid for lower alphas
                          return best_reward, best_seq
 
-                # Apply move in-place
-                inter_state[action] += 1
-                new_budget = rem_budget - self.env.state['edge_costs'][action]
+                # PROPOSED OPTIMIZATION: Incremental Update
+                # No copying, just modify in place
+                self.env.state['edge_interdicted'][action] += 1
+                cost = self.env.state['edge_costs'][action]
+                self.env.state['budget'][0] -= cost
                 
                 # Recurse
-                fut_reward, fut_seq = dp_local(new_budget, inter_state, d + 1, alpha)
+                fut_reward, fut_seq = dp_local(d + 1, alpha)
                 
-                # Backtrack (Revert move)
-                inter_state[action] -= 1
+                # Backtrack (Incremental Revert)
+                self.env.state['edge_interdicted'][action] -= 1
+                self.env.state['budget'][0] += cost
                 
                 if fut_reward > best_reward:
                     best_reward = fut_reward
@@ -341,10 +332,11 @@ class _RemoteEnvWorker:
                     if alpha > local_alpha_cache:
                         local_alpha_cache = alpha
                         if self.alpha_actor:
-                            self.alpha_actor.update.remote(alpha)
+                            try:
+                                self.alpha_actor.update.remote(alpha)
+                            except: pass
 
             memo_local[key] = (best_reward, best_seq)
-            # Do NOT increment local_counter here for internal nodes
             
             # publish result to central memo (best-effort, async)
             if target_actor is not None:
@@ -355,7 +347,7 @@ class _RemoteEnvWorker:
 
             return best_reward, best_seq
 
-        result = dp_local(remaining_budget, interdicted_state.copy(), depth)
+        result = dp_local(depth)
         # flush any remaining progress
         if self.progress_actor is not None and local_counter > 0:
             try:
