@@ -1210,12 +1210,6 @@ class InterdictionSolverMixin:
         projected_values = np.zeros(len(valid_actions))
 
         if include_projection:
-             # Ensure min_edge_cost is available
-             if not hasattr(self, 'min_edge_cost') or self.min_edge_cost <= 0:
-                real_edge_costs = self.state['edge_costs'][:self.num_interdictable]
-                pos_costs = real_edge_costs[real_edge_costs > 0]
-                self.min_edge_cost = np.min(pos_costs) if len(pos_costs) > 0 else 1.0
-
              # 1. Identify valid projection edges (similar to mask_fn but without flow checks)
              costs = self.state['edge_costs'][:self.num_interdictable]
              # Basic validity constraints
@@ -1272,27 +1266,39 @@ class InterdictionSolverMixin:
                  action_costs = self.state['edge_costs'][valid_actions]
                  future_moves_arr = np.floor((remaining_budget - action_costs + 1e-9) / self.min_edge_cost).astype(int)
                  
-                 for i, action in enumerate(valid_actions):
-                     n = future_moves_arr[i]
-                     if n <= 0:
-                         continue
-                         
-                     # Check if action is in the sorted list (and what its rank is)
-                     action_rank = rank_lookup[action] if action < len(rank_lookup) else -1
-                     
-                     if action_rank != -1 and action_rank < n:
-                         # Action is in the top n set.
-                         # We take the top n+1 items, minus the action itself.
-                         # This effectively takes the top n ignoring the action we just took.
-                         count = min(n + 1, max_available)
-                         val = cumsum_benefits[count] - sorted_benefits[action_rank]
-                         projected_values[i] = val
-                     else:
-                         # Action is not in the top n set (or not in available list).
-                         # We take the top n items directly.
-                         count = min(n, max_available)
-                         val = cumsum_benefits[count]
-                         projected_values[i] = val
+                 # Fully Vectorized Logic replacing Python Loop
+                 # Get ranks for all valid actions using the lookup table
+                 # Ensure valid_actions are within bounds for rank_lookup
+                 safe_valid_actions = np.where(valid_actions < len(rank_lookup), valid_actions, 0)
+                 action_ranks = rank_lookup[safe_valid_actions]
+                 
+                 # Handle any valid_actions that were out of bounds (shouldn't happen for valid projection space but safe to check)
+                 # If valid_action >= num_both_edges, its rank is definitely -1 (not in projection list)
+                 if len(rank_lookup) < self.num_both_edges: 
+                     # This check handles edge cases where rank_lookup might be smaller than full range
+                     out_of_bounds = valid_actions >= len(rank_lookup)
+                     action_ranks[out_of_bounds] = -1
+
+                 # Create logical mask: Is the action considered part of the "top n"?
+                 # Condition: It has a valid rank (> -1) AND its rank (0-indexed) is less than n (count)
+                 in_top_set_mask = (action_ranks != -1) & (action_ranks < future_moves_arr)
+                 
+                 # Case A: Action IS in the top N set.
+                 # We sum the top (n+1) items, then subtract the specific action's value.
+                 # np.clip to ensure we don't exceed available items
+                 idxs_in = np.clip(future_moves_arr + 1, 0, max_available)
+                 
+                 # Use maximum(rank, 0) to avoid -1 indexing (safe because masked out later if rank is -1)
+                 safe_ranks = np.maximum(action_ranks, 0)
+                 vals_in = cumsum_benefits[idxs_in] - sorted_benefits[safe_ranks]
+                 
+                 # Case B: Action IS NOT in the top N set.
+                 # We simply sum the top n items.
+                 idxs_out = np.clip(future_moves_arr, 0, max_available)
+                 vals_out = cumsum_benefits[idxs_out]
+                 
+                 # Select value based on mask
+                 projected_values = np.where(in_top_set_mask, vals_in, vals_out)
 
         # 4. Calculate heuristics for valid_actions
         probs = self.state['edge_interdiction_probability'][valid_actions]
@@ -1502,12 +1508,6 @@ class InterdictionSolverMixin:
         self.enable_outcome_caching = enable_outcome_caching
         if self.enable_outcome_caching:
              self.local_outcome_cache = {}
-
-        # precompute min edge cost etc
-        real_edge_costs = self.state['edge_costs'][:self.num_both_edges]
-        self.min_edge_cost = min(real_edge_costs[real_edge_costs > 0], default=float('inf'))
-        if self.min_edge_cost == float('inf'):
-            self.min_edge_cost = 1
 
         # Create outcome memoization actor ONLY if stochastic
         outcome_memo_actors = []

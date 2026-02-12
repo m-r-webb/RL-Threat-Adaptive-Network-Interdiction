@@ -146,8 +146,6 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         # Optimized to use pre-computed reverse keys
         flows = self.reference_flows
         
-        if flows is None: flows = {}
-
         self.cached_flow_array = np.array(
             [flows.get(e, 0) + flows.get(re, 0) for e, re in zip(self.both_edges, self.reverse_edges_list)], 
             dtype=np.float32
