@@ -146,6 +146,11 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         # Optimized to use pre-computed reverse keys
         flows = self.reference_flows
         
+        # ADDED: Support for pre-calculated flow arrays (Optimized path)
+        if isinstance(flows, np.ndarray):
+            self.cached_flow_array = flows
+            return
+
         self.cached_flow_array = np.array(
             [flows.get(e, 0) + flows.get(re, 0) for e, re in zip(self.both_edges, self.reverse_edges_list)], 
             dtype=np.float32
@@ -476,8 +481,12 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
     
         # Remove old capacity constraints if they exist
         if hasattr(self, 'forward_cons'):
-            self.maxflow_model.remove(self.forward_cons)
-            self.maxflow_model.remove(self.reverse_cons)
+             if isinstance(self.forward_cons, dict) and not isinstance(self.forward_cons, grb.tupledict):
+                 for c in self.forward_cons.values(): self.maxflow_model.remove(c)
+                 for c in self.reverse_cons.values(): self.maxflow_model.remove(c)
+             else:
+                 self.maxflow_model.remove(self.forward_cons)
+                 self.maxflow_model.remove(self.reverse_cons)
 
         # Single batch addition for forward constraints
         self.forward_cons = self.maxflow_model.addConstrs((
@@ -490,40 +499,65 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
 
     def _update_capacity_constraints_from_dict(self, capacity_dict):
         """
-        Update capacity constraints using provided capacity dictionary.
-        Optimized for batch processing.
-    
-        Parameters:
-        -----------
-        capacity_dict : dict
-            Mapping from edge tuple to capacity value
+        Update capacity constraints using Variable Upper Bounds (UB).
+        Optimized logic:
+        1. Static constraints enforce directionality: Flow[e] <= MaxCap * Used[e]
+        2. Dynamic UB enforces capacity: Flow[e] <= CurrentCap
+        
+        This avoids creating/modifying linear constraints in Python loops entirely during updates.
         """
-        if hasattr(self, 'forward_cons'):
-            # Check if forward_cons is a dict of constraints or a tupledict
-            if isinstance(self.forward_cons, dict) and not isinstance(self.forward_cons, grb.tupledict):
-                for c in self.forward_cons.values():
-                    self.maxflow_model.remove(c)
-                for c in self.reverse_cons.values():
-                    self.maxflow_model.remove(c)
-            else:
-                self.maxflow_model.remove(self.forward_cons)
-                self.maxflow_model.remove(self.reverse_cons)
+        # 1. Initialize Static Constraints (One-time setup)
+        if not getattr(self, 'static_capacity_constraints_setup', False):
+            # Clean up old constraints if they exist
+            if hasattr(self, 'forward_cons'):
+                 if isinstance(self.forward_cons, dict) and not isinstance(self.forward_cons, grb.tupledict):
+                     for c in self.forward_cons.values(): self.maxflow_model.remove(c)
+                     for c in self.reverse_cons.values(): self.maxflow_model.remove(c)
+                 else:
+                     try: self.maxflow_model.remove(self.forward_cons)
+                     except: pass
+                     try: self.maxflow_model.remove(self.reverse_cons)
+                     except: pass
+            
+            self.forward_cons = {}
+            self.reverse_cons = {}
 
-        self.maxflow_model.update() # FORCE UPDATE TO CLEAR
+            # Create Static Directionality Constraints (Big-M style)
+            # We use the max possible capacity to ensure this never restricts valid flow
+            # The strict capacity will be enforced by the Variable UB.
+            max_cap = float(self.DEFAULT_EDGE_CAPACITY_RANGE[1])
+            if max_cap <= 0: max_cap = 100.0 # Safety fallback
 
-        self.forward_cons = {
-            e: self.maxflow_model.addConstr(
-                self.flow_var[e] <= capacity_dict.get(e, 0) * self.edge_used[e],
-                name=f"flow_capacity_forward_{e}"
-            ) for e in self.both_edges
-        }
+            # Create constraints for all edges once
+            for e in self.both_edges:
+                self.maxflow_model.addConstr(
+                    self.flow_var[e] - max_cap * self.edge_used[e] <= 0,
+                    name=f"static_dir_fwd"
+                )
+                self.maxflow_model.addConstr(
+                    self.flow_var[(e[1], e[0])] - max_cap * self.edge_used[(e[1], e[0])] <= 0,
+                    name=f"static_dir_rev"
+                )
+            
+            self.static_capacity_constraints_setup = True
+            self.maxflow_model.update()
 
-        self.reverse_cons = {
-            e: self.maxflow_model.addConstr(
-                self.flow_var[(e[1],e[0])] <= capacity_dict.get(e, 0) * self.edge_used[(e[1],e[0])],
-                name=f"flow_capacity_reverse_{e}"
-            ) for e in self.both_edges
-        }        
+        # 2. Batch Update Variable Upper Bounds
+        # This is extremely fast (O(1) python call wrapping C loop)
+        
+        # Prepare lists aligned with self.both_edges
+        edges_list = self.both_edges
+        
+        # Collect variables
+        fwd_vars = [self.flow_var[e] for e in edges_list]
+        rev_vars = [self.flow_var[(e[1], e[0])] for e in edges_list]
+        
+        # Collect new capacities (aligned with edges_list)
+        new_caps = [capacity_dict.get(e, 0) for e in edges_list]
+        
+        # Apply Batch Update
+        self.maxflow_model.setAttr("UB", fwd_vars, new_caps)
+        self.maxflow_model.setAttr("UB", rev_vars, new_caps)      
         
     def _set_strategy_objectives(self, routing_assumption):
         """Set hierarchical objectives based on attacker strategy."""
@@ -846,6 +880,9 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
     def _cleanup_models(self):
         """Clean up any existing Gurobi models to free resources."""
         models_to_cleanup = ['master_model', 'sub_model', 'optimal_stochastic_model', 'optimal_stochastic_model_IM']
+        
+        # Reset optimizations flags
+        self.static_capacity_constraints_setup = False
     
         for model_name in models_to_cleanup:
             if hasattr(self, model_name):
@@ -1345,15 +1382,23 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             reward = self.PENALTY_VALUE
         return reward
 
+    def _flows_dict_to_array(self, flows_dict):
+        """Convert a flow dictionary to a compact float32 array aligned with self.both_edges."""
+        if not flows_dict:
+            return np.zeros(self.num_both_edges, dtype=np.float32)
+        
+        # Use cached flow array logic logic explicitly here to create standard serialized format
+        # Sum of forward and reverse flow for each edge index
+        return np.array(
+            [flows_dict.get(e, 0) + flows_dict.get(re, 0) for e, re in zip(self.both_edges, self.reverse_edges_list)], 
+            dtype=np.float32
+        )
+
     def _calculate_stochastic_objective_and_flow(self, strategy_type="zero_sum", return_full_flows=False):
         """
         Optimized stochastic calculation: group by unique outcomes and weight by probability.
-    
-        This method:
-        1. Samples interdiction outcomes (success/failure) based on probabilities
-        2. Groups identical outcomes together
-        3. Solves max flow once per unique outcome
-        4. Computes weighted average based on outcome frequencies
+        
+        Optimized for Serialization: Stores and returns numpy arrays for flows when return_full_flows=True.
         """
         # Extract interdiction probabilities
         probs = self.state['edge_interdiction_probability'][:self.num_both_edges]
@@ -1369,14 +1414,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             num_interdicted = len(interdicted_indices)
             
             # Calculate success probabilities for interdicted edges
-            # P(success) = 1 - (1 - p)^k
             edge_success_probs = 1 - (1 - probs[interdicted_indices]) ** interdicted[interdicted_indices]
-            
-            # Use deterministic iteration order by sorting indices (though indices are already sorted from np.where)
-            # interdicted_indices is already sorted
-            
-            # Enforce deterministic ordering of product generation
-            # outcome_combo will be e.g., (0,0,0), (0,0,1)... in deterministic order
             
             for outcome_combo in product([0, 1], repeat=num_interdicted):
                 outcome_array = np.zeros(self.num_both_edges, dtype=int)
@@ -1393,33 +1431,24 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                 
                 outcome = tuple(outcome_array)
                 unique_outcomes.append(outcome)
-                # Ensure probabilities are consistently rounded to avoid minor drift
                 outcome_weights[outcome] = float(np.round(prob, 10))
         
-            # Sort outcomes to ensure deterministic summation order
             unique_outcomes.sort()
         else:
             # Sample interdiction outcomes
             outcome_samples = []
             for _ in range(total_samples):
-                # For each edge, determine if interdiction succeeds based on probability
-                
-                # Create outcome tuple (which edges are successfully interdicted)
                 if self.multiple_interdiction_attempts:
-                    # Add to existing interdiction count
                     failure_probs = ((1 - probs) ** interdicted)
                     success = np.random.binomial(1, 1-failure_probs)
-                    outcome = tuple(np.minimum(interdicted, success)) #tuple(interdicted + success)
+                    outcome = tuple(np.minimum(interdicted, success)) 
                 else:
                     success = np.random.binomial(1, probs)
-                    # Binary: either interdicted or not
                     outcome = tuple(np.minimum(interdicted, success))
             
                 outcome_samples.append(outcome)
         
-            # Count unique outcomes and their frequencies
             outcome_counts = Counter(outcome_samples)
-            # Sort outcomes to ensure deterministic summation order
             unique_outcomes = sorted(list(outcome_counts.keys()))
             outcome_weights = {outcome: count / total_samples for outcome, count in outcome_counts.items()}
 
@@ -1429,10 +1458,12 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         # 1. Check Local Cache
         if self.enable_outcome_caching:
             for outcome in unique_outcomes:
-                # Check if outcome is in cache AND meets data requirements (ie flows vs no flows)
                 is_valid_hit = outcome in self.local_outcome_cache
-                if is_valid_hit and return_full_flows and 'flows' not in self.local_outcome_cache[outcome]:
-                    is_valid_hit = False
+                # Check for cached flow array OR basic indices
+                if is_valid_hit and return_full_flows:
+                    cached_item = self.local_outcome_cache[outcome]
+                    if 'flow_array' not in cached_item and 'flows' not in cached_item:
+                         is_valid_hit = False
                 
                 if not is_valid_hit:
                     outcomes_needed_from_central.append(outcome)
@@ -1445,14 +1476,11 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             import zlib
             num_shards = len(self.outcome_memo_actors)
             
-            # Group keys by shard
             shard_keys = defaultdict(list)
             for outcome in outcomes_needed_from_central:
-                # Use stable hash
                 shard_idx = zlib.adler32(str(outcome).encode()) % num_shards
                 shard_keys[shard_idx].append(outcome)
             
-            # Batch fetch from Ray (parallel)
             futures = []
             shard_indices = []
             for idx, keys in shard_keys.items():
@@ -1462,17 +1490,15 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             if futures:
                 all_results = ray.get(futures)
                 
-                # Process results
                 for i, results in enumerate(all_results):
                     keys = shard_keys[shard_indices[i]]
                     for outcome, res in zip(keys, results):
-                        # Check if remote result is valid
                         is_valid_result = res is not None
-                        if is_valid_result and return_full_flows and 'flows' not in res:
+                        if is_valid_result and return_full_flows and 'flow_array' not in res and 'flows' not in res:
                             is_valid_result = False
                             
                         if is_valid_result:
-                            self.local_outcome_cache[outcome] = res #(outcome, strategy_type)
+                            self.local_outcome_cache[outcome] = res 
                         else:
                             outcomes_to_solve.append(outcome)
         else:
@@ -1481,15 +1507,12 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
 
         # 3. Solve Max Flow for truly missing outcomes
         new_results_for_central = {}
-        
-        # Determine where to store results for this calculation step
         if self.enable_outcome_caching:
             working_cache = self.local_outcome_cache
         else:
             working_cache = {}
 
         for outcome in outcomes_to_solve:
-            #print("Outcome: ", outcome)
             # Convert outcome to capacity dict
             capacity_dict = {}
             for idx, edge in enumerate(self.both_edges):
@@ -1500,7 +1523,6 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             # Solve max flow
             obj, flows = self.solve_max_flow(capacity_dict, routing_assumption=strategy_type)
         
-            # Calculate strategy-specific objective
             if strategy_type == "zero_sum":
                 objective = obj
             elif strategy_type == "canalize":                
@@ -1510,25 +1532,20 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                 objective = self._calculate_target_edge_flow(flows, 'isolate_objective')
             elif strategy_type == "divert":
                 from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
-                
                 to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
-                diverted_flow_from = (self.reference_start_flows[0] - from_flow)
-                diverted_flow_to = (to_flow - self.reference_start_flows[1])
-                objective = np.min([diverted_flow_from, diverted_flow_to])
-                #print("From, To flows, Obj: ", from_flow, ", ", to_flow, ", ", objective)
+                objective = np.min([(self.reference_start_flows[0] - from_flow), (to_flow - self.reference_start_flows[1])])
 
             res = {
                 'objective': objective
             }
             
             if return_full_flows:
-                res['flows'] = flows
+                # OPTIMIZATION: Convert dict to array immediately for storage
+                res['flow_array'] = self._flows_dict_to_array(flows)
             else:
-                # Compression logic
                 if self.state['budget'][0] < self.min_edge_cost:
                     res['nonzero_flow_indices'] = []
                 else:
-                    # Store indices where flow > 0
                     indices = []
                     for edge, flow in flows.items():
                         if flow > 0:
@@ -1538,17 +1555,15 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                                 indices.append(self.edge_to_index[(edge[1], edge[0])])
                     res['nonzero_flow_indices'] = sorted(list(set(indices)))
             
-            # Update local/working cache
-            working_cache[outcome] = res #(outcome, strategy_type)
-            # Queue for central update
+            working_cache[outcome] = res 
             new_results_for_central[outcome] = res
             
-        # 4. Update Central Cache (Async / Fire-and-forget)
+        # 4. Update Central Cache (Async)
         if self.enable_outcome_caching and new_results_for_central and self.outcome_memo_actors:
             import zlib
             num_shards = len(self.outcome_memo_actors)
             
-            shard_updates = defaultdict(lambda: ([], [])) # (keys, values)
+            shard_updates = defaultdict(lambda: ([], []))
             
             for outcome, res in new_results_for_central.items():
                 shard_idx = zlib.adler32(str(outcome).encode()) % num_shards
@@ -1559,53 +1574,57 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             for idx, (keys, vals) in shard_updates.items():
                 self.outcome_memo_actors[idx].set_batch.remote(keys, vals)
 
-        # 5. Compute weighted averages using Local Cache (which is now fully populated)
+        # 5. Compute weighted averages
         
-        # VECTORIZED IMPLEMENTATION
-        # Convert map to lists for indexing
         ordered_outcomes = list(unique_outcomes)
         weights = np.array([outcome_weights[o] for o in ordered_outcomes])
-        
-        # Extract objectives -- Handle case where objective might be missing/error (though unlikely in strict flow)
         objectives = np.array([working_cache[o]['objective'] for o in ordered_outcomes])
         weighted_objective = np.dot(objectives, weights)
         
-        # Vectorized Flow Accumulation
-        # Shape: (num_outcomes, num_edges). Using num_both_edges to map to canonical edges.
-        flow_matrix = np.zeros((len(ordered_outcomes), self.num_both_edges))
-        edge_to_idx = self.edge_to_index # Local cache
+        # If not requesting flows, we are done
+        if not return_full_flows:
+             return weighted_objective, {}
 
-        for i, outcome in enumerate(ordered_outcomes):
-            res = working_cache[outcome]
-            if 'nonzero_flow_indices' in res and res['nonzero_flow_indices']:
-                # Input is indices of self.both_edges
-                flow_matrix[i, res['nonzero_flow_indices']] = 1.0 
-            elif 'flows' in res:
-                for edge, val in res['flows'].items():
-                    if val <= 1e-9: continue
-                    # Map edge to index
-                    idx = edge_to_idx.get(edge)
-                    if idx is not None:
-                        flow_matrix[i, idx] += val
-                    else:
-                        # Map synthetic reverse rule usage to primary edge for capacity tracking
-                        idx = edge_to_idx.get((edge[1], edge[0]))
+        # Optimized Vectorized Flow Accumulation
+        # We accumulate directly into array format
+        final_flow_array = np.zeros(self.num_both_edges, dtype=np.float32)
+        
+        # Stack all flow arrays: (n_outcomes, n_edges)
+        # Verify first item has 'flow_array'
+        first_res = working_cache[ordered_outcomes[0]]
+        
+        if 'flow_array' in first_res:
+            # Fast path: All items have flow_array
+            # Efficient stacking
+            all_flow_arrays = np.vstack([working_cache[o]['flow_array'] for o in ordered_outcomes])
+            final_flow_array = np.dot(weights, all_flow_arrays)
+            
+            # Return array directly instead of dict
+            return weighted_objective, final_flow_array
+            
+        else:
+             # Legacy/Fallback path involving dicts or indices
+             # ... (Should not be hit if return_full_flows=True logic above worked)
+             flow_matrix = np.zeros((len(ordered_outcomes), self.num_both_edges))
+             edge_to_idx = self.edge_to_index 
+
+             for i, outcome in enumerate(ordered_outcomes):
+                res = working_cache[outcome]
+                if 'nonzero_flow_indices' in res and res['nonzero_flow_indices']:
+                    flow_matrix[i, res['nonzero_flow_indices']] = 1.0 
+                elif 'flows' in res:
+                    for edge, val in res['flows'].items():
+                        if val <= 1e-9: continue
+                        idx = edge_to_idx.get(edge)
                         if idx is not None:
                             flow_matrix[i, idx] += val
-
-        # Collapse rows weighted by outcome probability
-        # Shape: (num_edges,)
-        final_flows = np.dot(weights, flow_matrix)
-        
-        # Reconstruct result dictionary efficiently
-        # Only include non-zero flows
-        nonzero_indices = np.where(final_flows > 1e-9)[0]
-        weighted_flows = {
-            self.both_edges[i]: final_flows[i] 
-            for i in nonzero_indices
-        }
-    
-        return weighted_objective, weighted_flows
+                        else:
+                            idx = edge_to_idx.get((edge[1], edge[0]))
+                            if idx is not None:
+                                flow_matrix[i, idx] += val
+                                
+             final_flow_array = np.dot(weights, flow_matrix)
+             return weighted_objective, final_flow_array
     
     def _compute_objective_and_flows(self, deterministic_mode=None):
         """Calculate the max flow objective and edge flows."""
@@ -1614,11 +1633,12 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         
         if deterministic_mode:
             objective, flows = self.solve_max_flow()
+            # Consistent API: Convert to array
+            return objective, self._flows_dict_to_array(flows)
         else:
             # Stochastic outcome calculation
-            objective, flows = self._calculate_stochastic_objective_and_flow('zero_sum', return_full_flows=True)
-    
-        return objective, flows
+            objective, flows_array = self._calculate_stochastic_objective_and_flow('zero_sum', return_full_flows=True)
+            return objective, flows_array
 
     def _calculate_canalize_objective_and_flows(self):
         """Calculate objective for canalize strategy (flow through specific path)."""
@@ -1626,11 +1646,10 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             _, flows = self.solve_max_flow(routing_assumption = 'canalize')
             target_path_flow = self._calculate_target_path_flow(flows, 'canalize_objective')
             objective = (target_path_flow - getattr(self, 'reference_start_flow', 0))
-            return objective, flows
+            return objective, self._flows_dict_to_array(flows)
         else:
-            # Stochastic calculation - returns mean objective directly
-            objective, mean_flows = self._calculate_stochastic_objective_and_flow('canalize', return_full_flows=True)
-            return objective, mean_flows
+            objective, mean_flows_array = self._calculate_stochastic_objective_and_flow('canalize', return_full_flows=True)
+            return objective, mean_flows_array
         
     def _calculate_canalize_reward(self):
         """Calculate reward for canalize strategy (force flow through specific path)."""
@@ -1648,11 +1667,10 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         if self.deterministic_outcomes:
             _, flows = self.solve_max_flow(routing_assumption = 'isolate')
             target_node_flow = self._calculate_target_edge_flow(flows, 'isolate_objective')
-            return target_node_flow, flows
+            return target_node_flow, self._flows_dict_to_array(flows)
         else:
-            # Stochastic calculation - returns mean objective directly
-            objective, mean_flows = self._calculate_stochastic_objective_and_flow('isolate', return_full_flows=True)
-            return objective, mean_flows
+            objective, mean_flows_array = self._calculate_stochastic_objective_and_flow('isolate', return_full_flows=True)
+            return objective, mean_flows_array
         
     def _calculate_isolate_reward(self):
         """Calculate reward for isolate strategy (reduce flow to specific nodes)."""
@@ -1678,12 +1696,11 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             diverted_flow_to = (to_flow - self.reference_start_flows[1]) 
             objective = np.min([diverted_flow_from,diverted_flow_to])
             
-            return objective, flows
+            return objective, self._flows_dict_to_array(flows)
         else:
             # Stochastic calculation - returns mean objectives directly
-            mean_objective, mean_flows = self._calculate_stochastic_objective_and_flow('divert', return_full_flows=True)
-            # Return as tuple to maintain consistent interface with reward calculation
-            return mean_objective, mean_flows
+            mean_objective, mean_flows_array = self._calculate_stochastic_objective_and_flow('divert', return_full_flows=True)
+            return mean_objective, mean_flows_array
 
     def _calculate_divert_reward(self):
         """Calculate reward for divert strategy (redirect flow from one path to another)."""

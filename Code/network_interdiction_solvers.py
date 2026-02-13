@@ -132,6 +132,13 @@ class _RemoteEnvWorker:
         self.progress_granularity = int(progress_granularity)
         self.budget_levels = int(budget_levels)
 
+        # PRE-COMPUTE HEURISTIC BASE VALUES (Optimization)
+        # This avoids multiplying capacity * probability at every node
+        self.env.heuristic_base_values = (
+            self.env.state['edge_capacity'][:self.num_both_edges] * 
+            self.env.state['edge_interdiction_probability'][:self.num_both_edges]
+        )
+
     def evaluate_subtree(self, remaining_budget, interdicted_state, depth):
         import numpy as np, ray as _ray, time, zlib # Added zlib for stable hashing
         memo_local = {}
@@ -1239,9 +1246,13 @@ class InterdictionSolverMixin:
              projection_indices = np.where(projection_mask)[0]
              
              if len(projection_indices) > 0:
-                 caps_proj = self.state['edge_capacity'][projection_indices]
-                 probs_proj = self.state['edge_interdiction_probability'][projection_indices]
-                 benefits = caps_proj * probs_proj
+                 # OPTIMIZATION: Use pre-computed base values if available
+                 if hasattr(self, 'heuristic_base_values'):
+                     benefits = self.heuristic_base_values[projection_indices]
+                 else:
+                     caps_proj = self.state['edge_capacity'][projection_indices]
+                     probs_proj = self.state['edge_interdiction_probability'][projection_indices]
+                     benefits = caps_proj * probs_proj
                  
                  # Sort descending
                  sorted_idx = np.argsort(-benefits)
@@ -1304,10 +1315,13 @@ class InterdictionSolverMixin:
         probs = self.state['edge_interdiction_probability'][valid_actions]
         
         # Calculate Current Flow on the candidate edges
-        current_flow_vals = np.array([
-            flows.get(self.both_edges[a], 0) + flows.get((self.both_edges[a][1], self.both_edges[a][0]), 0)
-            for a in valid_actions
-        ])
+        if isinstance(flows, np.ndarray):
+            current_flow_vals = flows[valid_actions]
+        else:
+            current_flow_vals = np.array([
+                flows.get(self.both_edges[a], 0) + flows.get((self.both_edges[a][1], self.both_edges[a][0]), 0)
+                for a in valid_actions
+            ])
         
         heuristics = (probs * current_flow_vals) + projected_values
         
@@ -1948,7 +1962,7 @@ class InterdictionSolverMixin:
         
         # Target number of tasks to generate (e.g., 4x workers ensures good balancing)
         # TWEAK THIS: Higher = more small tasks (better balancing, more overhead)
-        TARGET_TASKS = n_workers * 10 
+        TARGET_TASKS = n_workers * 50 
         
         # Local memoization for the driver expansion phase
         memo_driver = {}
