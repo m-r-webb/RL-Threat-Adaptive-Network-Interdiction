@@ -1527,7 +1527,7 @@ class InterdictionSolverMixin:
         # Create outcome memoization actor ONLY if stochastic
         outcome_memo_actors = []
         if not self.deterministic_outcomes and enable_outcome_caching:
-            num_outcome_shards = min(4, n_workers) if n_workers > 0 else 1
+            num_outcome_shards = min(10, n_workers) if n_workers > 0 else 1
             outcome_memo_actors = [SharedOutcomeMemoActor.remote() for _ in range(num_outcome_shards)]
             self.outcome_memo_actors = outcome_memo_actors
 
