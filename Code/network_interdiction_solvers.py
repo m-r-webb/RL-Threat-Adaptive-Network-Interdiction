@@ -75,7 +75,7 @@ class _RemoteEnvWorker:
                  num_both_edges, deterministic_outcomes, multiple_interdiction_attempts,
                  progress_actor=None, memo_actors=None, budget_levels=1, progress_granularity=50,
                  max_depth_inner=100, outcome_memo_actor=None, outcome_memo_actors=None, alpha_actor=None,
-                 enable_outcome_caching=True, enable_alpha_pruning=True):
+                 enable_outcome_caching=True, enable_alpha_pruning=True, sample_size=1000):
         """
         Worker now accepts a progress_actor handle, a shared memo_actor handle,
         and budget_levels so it can estimate progress for invalid actions.
@@ -93,7 +93,8 @@ class _RemoteEnvWorker:
                              multiple_interdiction_attempts=multiple_interdiction_attempts,
                              attacker_strategy=attacker_strategy,
                              outcome_memo_actor=None,
-                             outcome_memo_actors=None)
+                             outcome_memo_actors=None,
+                             sample_size=sample_size)
         
         # Set config flag
         self.env.enable_outcome_caching = enable_outcome_caching
@@ -1901,7 +1902,8 @@ class InterdictionSolverMixin:
                 outcome_memo_actors=outcome_memo_actors,
                 alpha_actor=alpha_actor,
                 enable_outcome_caching=enable_outcome_caching,
-                enable_alpha_pruning=enable_alpha_pruning
+                enable_alpha_pruning=enable_alpha_pruning,
+                sample_size=self.SAMPLE_SIZE
             )
             for _ in range(n_workers)
         ]
