@@ -1548,19 +1548,8 @@ class InterdictionSolverMixin:
                 if "MaskablePPO" in rl_model_path:
                     from sb3_contrib import MaskablePPO
                     agent = MaskablePPO.load(rl_model_path)
-                elif "PPO" in rl_model_path:
-                    from stable_baselines3 import PPO
-                    agent = PPO.load(rl_model_path, env=self)
-                elif "DQN" in rl_model_path:
-                    from stable_baselines3 import DQN
-                    agent = DQN.load(rl_model_path, env=self)
-                elif "A2C" in rl_model_path:
-                    from stable_baselines3 import A2C
-                    agent = A2C.load(rl_model_path, env=self)
                 else:
                     if verbose: print("Warning: Unknown model type in path. Trying PPO.")
-                    from stable_baselines3 import PPO
-                    agent = PPO.load(rl_model_path, env=self)
 
                 # Run Episode
                 done = False
