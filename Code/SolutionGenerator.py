@@ -24,13 +24,13 @@ import seaborn as sns
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 import ray
-if not ray.is_initialized():
+        if not ray.is_initialized():
     ray.init(
         address=None, 
         ignore_reinit_error=True, 
         logging_level='INFO',
         include_dashboard=False,
-        num_cpus=46, #46  38
+        num_cpus=40, #46  38
         _temp_dir=os.environ.get('RAY_TMPDIR'), # Add this parameter with a short path
     )
 
@@ -38,19 +38,32 @@ if not ray.is_initialized():
 import env_TA as ce #modified for curriculum learning
 
 #User Determined Settings
-graphName = "G15x15"
+graphName = "UKR"
 env_params = {'deterministic_agent': False,
               'multiple_interdiction_attempts': False,
               'attacker_strategy': 'zero_sum',  # canalize   isolate   divert  zero_sum
-              'training_budget_range': (25,45),  #G5x5: zero_sum/isolate: (5,15), canalize/divert: (12,24) G10x10: zero_sum/isolate: (10,20), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (18,30) G15x15: zero_sum/isolate: (25,45)
+              'training_budget_range': (10,20),  #G5x5: zero_sum/isolate: (5,15), canalize/divert: (12,24) G10x10: zero_sum/isolate: (10,20), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (18,30) G15x15: zero_sum/isolate: (25,45)
               'max_path_length': 2,  #G5x5: 2,  G10x10: 3, UKR: 4
               'sample_size': None,
               'penalty_value': -0.01,
              }
               
 version_date = "02_10" # numeric month_day
-version_type = "opt_d"  # bi for backward induction or opt_m or opt_d for optimal MIP
-opt_method = 'decomposition'  # monolithic,  decomposition
+version_type = "bi"  # bi for backward induction or opt_m or opt_d for optimal MIP
+
+if version_type == "opt_m":
+    opt_method = 'monolithic'  
+elif version_type == "opt_d":
+    opt_method = 'decomposition'
+
+# LOAD Previous saved model
+current_dir = os.getcwd()
+models_dir = os.path.join(current_dir, '..', 'Trained_RL_Models')
+model_name = "UKR_S_MaskablePPO_zero_sum_B_v01_04"
+model_timesteps = None #17640000 #None #4830000 #None #          # Set a number, 1512000, or  None
+if model_timesteps == None:
+    model_path = f"{models_dir}/{model_name}/best_model"
+else:    model_path = f"{models_dir}/{model_name}/{model_name}_{model_timesteps}_steps"
 
 # Number of scenarios to generate
 num_of_scenarios = 500 
@@ -90,6 +103,10 @@ edge_filename = f"{graphName}_Edges.csv"  # Dynamically include graphName
 nodes, edges = ce.create_nodes_edges(node_filename, edge_filename)
 
 # Load Environment
+# Ensure environment variables are set before creating environment (Env sets them on import, but good to be sure)
+# Especially for Gurobi to use single thread per environment
+# env = ce.CustomEnv(nodes, edges, **env_params)
+# Update: Env creation is done inside the loop for Ray initialization check safety? No, Env is created here.
 env = ce.CustomEnv(nodes, edges, **env_params)
 
 optimal_obj_vals = [np.nan] * num_of_scenarios
@@ -98,31 +115,49 @@ optimal_solution_times = [np.nan] * num_of_scenarios
 all_states = [None] * num_of_scenarios  # Add this line to store states
 
 for episode in range(num_of_scenarios):
-    obs = env.reset(seed=episode)
-    env.render(indices = 3)
-    if env_params['attacker_strategy'] == "zero_sum":
-        start_time = time.perf_counter()
-        if version_type == 'opt_d' or version_type == 'opt_m':
-            optimal_obj_val, optimal_interdiction_edges = env.solve_optimal_interdiction(method=opt_method)  
-        elif version_type == 'bi':
-            optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = 38) #38,32)
-        end_time = time.perf_counter()
-    else:
-        start_time = time.perf_counter()
-        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = 38) #38,32)
-        end_time = time.perf_counter()
+    try:
+        obs = env.reset(seed=episode)
+        env.render(indices = 3)
+        if env_params['attacker_strategy'] == "zero_sum":
+            start_time = time.perf_counter()
+            if version_type == 'opt_m':
+                optimal_obj_val, optimal_interdiction_edges = env.solve_optimal_interdiction(method=opt_method) 
+     #           optimal_obj_val, optimal_interdiction_edges = env.solve_exact_monolithic(max_scenarios=500)
+            elif version_type == "opt_d":
+                optimal_obj_val, optimal_interdiction_edges = env.solve_optimal_interdiction(method=opt_method) 
+    #            optimal_obj_val, optimal_interdiction_edges = env.solve_exact_decomposition(max_scenarios=500)
+            elif version_type == 'bi':
+                # Reduced n_workers to avoid thread resource exhaustion (pthread_create failed)
+                optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = 32, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True,  rl_model_path=model_path) 
+            end_time = time.perf_counter()
+        else:
+            start_time = time.perf_counter()
+            # Reduced n_workers to avoid thread resource exhaustion
+            optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = 32) 
+            end_time = time.perf_counter()
+        
+        solve_time = end_time - start_time
     
-    solve_time = end_time - start_time
+        #Save optimal solution value and interdiction set
+        optimal_obj_vals[episode] = optimal_obj_val
+        optimal_solution_times[episode] = solve_time
+        all_optimal_interdiction_edges[episode] = sorted(list(optimal_interdiction_edges))
+        all_states[episode] = obs  # Add this line to save the state
+    
+        # Periodically save results
+        if (episode + 1) % save_interval == 0 or (episode + 1) == num_of_scenarios:
+            save_partial_results(save_path, episode+1,
+                                 optimal_obj_vals, all_optimal_interdiction_edges, 
+                                 optimal_solution_times, all_states)
+            print(f"Progress saved at episode {episode+1} to {save_path}", flush=True)
 
-    #Save optimal solution value and interdiction set
-    optimal_obj_vals[episode] = optimal_obj_val
-    optimal_solution_times[episode] = solve_time
-    all_optimal_interdiction_edges[episode] = sorted(list(optimal_interdiction_edges))
-    all_states[episode] = obs  # Add this line to save the state
-
-    # Periodically save results
-    if (episode + 1) % save_interval == 0 or (episode + 1) == num_of_scenarios:
-        save_partial_results(save_path, episode+1,
+    except Exception as e:
+        print(f"Error in episode {episode}: {e}")
+        # Save whatever we have
+        save_partial_results(save_path, episode,
                              optimal_obj_vals, all_optimal_interdiction_edges, 
                              optimal_solution_times, all_states)
-        print(f"Progress saved at episode {episode+1} to {save_path}", flush=True)
+        raise e
+finally:
+    if ray.is_initialized():
+        ray.shutdown()
