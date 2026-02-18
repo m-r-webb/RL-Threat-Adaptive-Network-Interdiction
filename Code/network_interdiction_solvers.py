@@ -299,8 +299,13 @@ class _RemoteEnvWorker:
             if self.enable_alpha_pruning:
                 # Heuristic sorting for pruning
                 # Optimization: State is already set correctly, just call heuristics
+                # IMPORTANT: For zero_sum, we need to handle negative heuristics appropriately if calculate_action_heuristics returns positives
                 heuristics = self.env.calculate_action_heuristics(valid_actions, current_flows, rem_budget)
                 
+                # Check if we should reverse sort order based on strategy sign convention
+                # calculate_action_heuristics usually returns positive "impact" (flow reduction)
+                # But our objective here (final_objective) might be negative.
+                pass
                 # Sort descending
                 sorted_indices = np.argsort(-heuristics)
                 valid_actions = valid_actions[sorted_indices]
@@ -525,6 +530,9 @@ class InterdictionSolverMixin:
         epsilon = 1e-4
         max_iter = 100
         
+        # Initialize x_hat to avoid reference error if loop breaks early
+        x_hat = {}
+
         for iteration in range(max_iter):
             master.optimize()
             if master.status != grb.GRB.OPTIMAL:
@@ -588,7 +596,9 @@ class InterdictionSolverMixin:
             master.addConstr(theta >= rhs + lhs_terms)
             master.update()
 
-        interdicted = [e for e in self.both_edges if gamma[e].X > 0.5]
+        # Use x_hat to construct interdicted set, as gamma[e].X may be unavailable if loop
+        # terminated via max_iter or optimization failed
+        interdicted = [e for e in self.both_edges if x_hat.get(e, 0) > 0.5]
         return UB, interdicted
 
     def _solve_stochastic_decomposition_IM(self, n_scenarios, seed, interdicted_edges, interdicted_quantities):
@@ -637,6 +647,9 @@ class InterdictionSolverMixin:
         epsilon = 1e-4
         max_iter = 100
         
+        # Initialize x_hat
+        x_hat = {}
+
         for iteration in range(max_iter):
             master.optimize()
             if master.status != grb.GRB.OPTIMAL:
@@ -697,15 +710,15 @@ class InterdictionSolverMixin:
             master.addConstr(theta >= rhs + lhs_terms)
             master.update()
 
-        # Extract Solution
+        # Extract Solution using x_hat
         interdicted = []
         quantities = []
         for e in self.interdictable_edges:
             for k in k_vals:
-                if gamma[e, k].X > 0.5:
+                if x_hat.get((e, k), 0) > 0.5:
                     interdicted.append(e)
                     quantities.append(k)
-                    break
+                    break 
                     
         return UB, interdicted, quantities
 
@@ -793,6 +806,414 @@ class InterdictionSolverMixin:
 
         return(self.optimal_stochastic_model.objVal, interdicted_edges)
 
+
+    def _generate_exact_scenarios_and_probs(self, max_scenarios=200):
+        """
+        Helper method to generate all possible scenarios and their probabilities 
+        for edges with 0 < probability < 1.
+        Returns:
+            scenario_outcomes: List of binary vectors (one per scenario) for all edges
+            scenario_probs: List of probabilities for each scenario
+        """
+        # 1. Identify relevant edges (prob > 0 and prob < 1)
+        probs = self.state["edge_interdiction_probability"][:self.num_both_edges]
+        stochastic_indices = [i for i, p in enumerate(probs) if 0 < p < 1]
+        
+        # 2. Generate Scenarios
+        # If too many scenarios, we use a heap to keep only the top N most likely
+        n_exact = 2**len(stochastic_indices)
+        
+        if n_exact > 20000:
+            logging.warning(f"Too many scenarios ({n_exact}). Limiting to top {max_scenarios} most likely.")
+            import heapq
+            
+            # Helper to calculate prob of a partial/full outcome
+            # We want to find top scenarios without iterating all 2^22
+            # But implementing an efficient "next best" search is complex.
+            # For 2^22 (4M), we can iterate comfortably in C++, but in Python it might take ~10-20s.
+            # Let's try to iterate but use a min-heap to track top N.
+            
+            # Optimization: If p > 0.5 for most edges, the mass is concentrated on "success".
+            # If we iterate all, it takes time.
+            # Alternative: Just sample? No, user asked for "most likely".
+            
+            # Let's use a priority queue search to find top N scenarios
+            # Start with the most likely scenario (for each edge, pick outcome with max p)
+            # Then explore neighbors by flipping state of one edge
+            
+            scenario_outcomes_list = []
+            scenario_probs = []
+            
+            # 1. Construct Most Likely Scenario (Base)
+            best_outcome_bits = []
+            current_log_prob = 0.0 # Working in log space for numerical stability is better, but simple probs ok
+            
+            # Precompute log probs for stability
+            log_p_success = []
+            log_p_fail = []
+            
+            for idx in stochastic_indices:
+                p = probs[idx]
+                # Avoid log(0)
+                lp_s = math.log(p) if p > 1e-9 else -1000.0
+                lp_f = math.log(1-p) if (1-p) > 1e-9 else -1000.0
+                log_p_success.append(lp_s)
+                log_p_fail.append(lp_f)
+            
+            # Determine best state for each bit
+            initial_state = []
+            initial_log_prob = 0.0
+            
+            # We need to compute delta for flipping each bit from best to second best
+            deltas = [] # (cost_to_flip, bit_index)
+            
+            for i in range(len(stochastic_indices)):
+                ls = log_p_success[i]
+                lf = log_p_fail[i]
+                
+                if ls >= lf:
+                    initial_state.append(1)
+                    initial_log_prob += ls
+                    diff = ls - lf # Positive cost to flip to fail
+                    deltas.append((diff, i, 0)) # 0 means "flip to 0"
+                else:
+                    initial_state.append(0)
+                    initial_log_prob += lf
+                    diff = lf - ls
+                    deltas.append((diff, i, 1)) # 1 means "flip to 1"
+            
+            deltas.sort(key=lambda x: x[0]) # Sort by cost to flip (ascending)
+            
+            # Base outcome initialized with deterministic edges
+            # Edges with p=1 are 1, others 0 (stochastic ones will be filled)
+            base_outcome = [1 if p >= 0.999 else 0 for p in probs]
+            
+            # Priority Queue for searching states: (-log_prob, state_tuple)
+            # Actually we can just search in the "delta space".
+            # State is defined by set of indices flipped from optimal.
+            # Queue stores: (current_penalty, last_index_in_deltas_processed, active_flips_indices)
+            
+            # 0. Best scenario
+            pq = [(0.0, -1, ())] # penalty, max_idx_used, indices_flipped
+            
+            count = 0
+            
+            # Top N Search
+            while count < max_scenarios and pq:
+                penalty, max_idx, flipped_tuple = heapq.heappop(pq)
+                
+                # Reconstruct this scenario
+                current_outcome = base_outcome.copy() # Contains deterministic 1s
+                prob_val = math.exp(initial_log_prob - penalty)
+                
+                # Apply optimal baselines for stochastic
+                local_stochastic_outcomes = list(initial_state)
+                
+                # Apply flips
+                for flip_idx_ptr in flipped_tuple:
+                    # deltas[flip_idx_ptr] is (diff, original_index, target_val)
+                    diff, orig_idx, target_val = deltas[flip_idx_ptr]
+                    local_stochastic_outcomes[orig_idx] = target_val
+                
+                # Fill current_outcome
+                for i, idx in enumerate(stochastic_indices):
+                    current_outcome[idx] = local_stochastic_outcomes[i]
+                
+                scenario_outcomes_list.append(current_outcome)
+                scenario_probs.append(prob_val)
+                count += 1
+                
+                # Generate successors
+                # 1. Extend current flip set with next available delta
+                next_idx = max_idx + 1
+                if next_idx < len(deltas):
+                    # Child 1: Add next delta to current set
+                    new_penalty = penalty + deltas[next_idx][0]
+                    new_flips = flipped_tuple + (next_idx,)
+                    heapq.heappush(pq, (new_penalty, next_idx, new_flips))
+                    
+                    # Child 2: Replace last delta with next delta (if not root)
+                    if flipped_tuple:
+                         # Remove last added, add next
+                         prev_penalty_contrib = deltas[max_idx][0]
+                         new_node_penalty = penalty - prev_penalty_contrib + deltas[next_idx][0]
+                         # Pop last from tuple
+                         new_node_flips = flipped_tuple[:-1] + (next_idx,)
+                         heapq.heappush(pq, (new_node_penalty, next_idx, new_node_flips))
+            
+            # Re-normalize probabilities
+            total_p = sum(scenario_probs)
+            print(f"Top {len(scenario_probs)} scenarios cover {total_p:.6f} probability mass. Unaccounted: {1.0 - total_p:.6f}")
+            if total_p > 0:
+                scenario_probs = [p / total_p for p in scenario_probs]
+                
+            return scenario_outcomes_list, scenario_probs
+
+        else:
+            # Original Exact Logic
+            # Generate combinations of 0/1 for the stochastic edges
+            outcomes_combinations = list(itertools.product([0, 1], repeat=len(stochastic_indices)))
+            
+            # Base outcome initialized with deterministic edges
+            base_outcome = [1 if p >= 0.999 else 0 for p in probs]
+            
+            scenario_outcomes_list = []
+            scenario_probs = []
+            
+            for outcome in outcomes_combinations:
+                current_outcome = base_outcome.copy()
+                scenario_prob = 1.0
+                
+                for i, idx in enumerate(stochastic_indices):
+                    is_success = outcome[i]
+                    # ... rest of original loop ...
+                    current_outcome[idx] = is_success
+                    
+                    p = probs[idx]
+                    if is_success:
+                        scenario_prob *= p
+                    else:
+                        scenario_prob *= (1 - p)
+                
+                scenario_outcomes_list.append(current_outcome)
+                scenario_probs.append(scenario_prob)
+                
+            # Sort and clip if we are in the 20-20000 range but user wants top 200 explicitly?
+            # The condition above handles > 20000. 
+            # If < 20000 but > 200, we currently keep all.
+            # User asked "limit it to 200". We should apply it generally?
+            # Let's apply sorting and clipping if n > max_scenarios
+            
+            if len(scenario_probs) > max_scenarios:
+                # Zip, sort, unzip
+                zipped = sorted(zip(scenario_probs, scenario_outcomes_list), key=lambda x: -x[0])
+                scenario_probs = [p for p, o in zipped[:max_scenarios]]
+                scenario_outcomes_list = [o for p, o in zipped[:max_scenarios]]
+                
+                # Normalize
+                total_p = sum(scenario_probs)
+                print(f"Top {len(scenario_probs)} scenarios cover {total_p:.6f} probability mass. Unaccounted: {1.0 - total_p:.6f}")
+                if total_p > 0:
+                    scenario_probs = [p / total_p for p in scenario_probs]
+
+            return scenario_outcomes_list, scenario_probs
+
+    def solve_exact_monolithic(self, max_scenarios=200):
+        """
+        Solves the stochastic updated interdiction problem exactly using a monolithic MIP formulation.
+        Enumerates all outcome scenarios weighted by their probability.
+        """
+        # 1. Generate Scenarios
+        scenario_outcomes_list, scenario_probs = self._generate_exact_scenarios_and_probs(max_scenarios=max_scenarios)
+        n_scenarios = len(scenario_probs)
+        scenarios = range(n_scenarios)
+
+        # 2. Build Model
+        # Create a local environment to ensure output is captured in Jupyter
+        monolithic_env = grb.Env(empty=True)
+        monolithic_env.setParam("OutputFlag", 1)
+        monolithic_env.setParam("LogToConsole", 0) # Disable C-level logging to avoid duplication
+        monolithic_env.start()
+        
+        model = grb.Model("Exact_Monolithic_Stochastic", env=monolithic_env)
+        model.setParam("Threads", 0)     # Use all available threads
+        
+        # Decision Variables
+        gamma = model.addVars(self.both_edges, vtype=grb.GRB.BINARY, name="gamma")
+        
+        # Budget Constraint
+        model.addConstr(
+            grb.quicksum(self.edges_episode[e].interdiction_cost * gamma[e] for e in self.both_edges) 
+            <= self.state['budget'][0], name="budget"
+        )
+        
+        # Non-interdictable constraints
+        model.setAttr("UB", [gamma[e] for e in self.noninterdictable_edges], 0)
+        
+        # Scenario-specific Dual Variables (Alpha, Beta)
+        alpha = model.addVars([(i, s) for s in scenarios for i in self.nodes], 
+                                     vtype=grb.GRB.BINARY, name="alpha")
+        beta = model.addVars([(e, s) for s in scenarios for e in self.edges_reset],
+                                    vtype=grb.GRB.BINARY, name="beta")
+        
+        # Source-Sink cut constraint per scenario
+        model.addConstrs(
+            (alpha[self.super_sink_nodes[0], s] - alpha[self.super_source_nodes[0], s] >= 1 
+             for s in scenarios), name="source_sink"
+        )
+        
+        # AABG Constraints (Dual Max Flow) weighted by outcome
+        for s in scenarios:
+            outcome_vec = scenario_outcomes_list[s]
+            for idx, e in enumerate(self.both_edges):
+                outcome_val = outcome_vec[idx]
+                # Forward
+                model.addConstr(
+                    alpha[e[0], s] - alpha[e[1], s] + beta[e, s] + (gamma[e] * outcome_val) >= 0
+                )
+                # Reverse (assuming undirected edge logic or separate reverse edges handling)
+                # The existing code typically adds reverse constraints for undirected edges if they are modeled as pairs
+                model.addConstr(
+                    alpha[e[1], s] - alpha[e[0], s] + beta[e, s] + (gamma[e] * outcome_val) >= 0
+                )
+
+        # Objective: Min Expected Max Flow
+        obj_expr = 0
+        for s in scenarios:
+             s_prob = scenario_probs[s]
+             s_cut_val = grb.quicksum(self.edges_episode[e].capacity * beta[e, s] for e in self.edges_reset)
+             obj_expr += s_prob * s_cut_val
+             
+        model.setObjective(obj_expr, grb.GRB.MINIMIZE)
+        
+        # Optimize with callback for Jupyter output
+        import sys
+        def jupyter_callback(model, where):
+            if where == grb.GRB.Callback.MESSAGE:
+                # Capture message
+                msg = model.cbGet(grb.GRB.Callback.MSG_STRING)
+                if msg:
+                    # Write to both stdout and stderr to ensure visibility
+                    sys.stdout.write(msg)
+                    sys.stdout.flush()
+                
+        print("Starting Monolithic Optimization (Exact)...", file=sys.stdout)
+        sys.stdout.flush()
+        
+        # Pass callback to optimize
+        model.optimize(jupyter_callback)
+        
+        print(f"Optimization Finished. Objective: {model.objVal}", file=sys.stdout)
+        sys.stdout.flush()
+        
+        interdicted = [e for e in self.both_edges if gamma[e].X > 0.5]
+        
+        # Use centralized evaluation method to ensure consistency
+        final_obj_val = self._evaluate_solution_stochastic(interdicted)
+        
+        return final_obj_val, interdicted
+
+    def solve_exact_decomposition(self, max_scenarios=200):
+        """
+        Solves the stochastic updated interdiction problem exactly using Benders Decomposition.
+        Enumerates all outcome scenarios weighted by their probability.
+        """
+        # 1. Generate Scenarios
+        scenario_outcomes_list, scenario_probs = self._generate_exact_scenarios_and_probs(max_scenarios=max_scenarios)
+        n_scenarios = len(scenario_probs)
+        
+        # 2. Master Problem
+        # Create a local environment to ensure output is captured in Jupyter
+        benders_env = grb.Env(empty=True)
+        benders_env.setParam("OutputFlag", 1)
+        benders_env.setParam("LogToConsole", 0) # Disable C-level logging to avoid duplication
+        benders_env.start()
+
+        master = grb.Model("Exact_Benders_Master", env=benders_env)
+        master.setParam("Threads", 0)     # Use all available threads
+        
+        gamma = master.addVars(self.both_edges, vtype=grb.GRB.BINARY, name="gamma")
+        theta = master.addVar(lb=0, name="theta")
+        
+        # Budget
+        master.addConstr(
+            grb.quicksum(self.edges_episode[e].interdiction_cost * gamma[e] for e in self.both_edges) 
+            <= self.state['budget'][0], name="budget"
+        )
+        # Non-interdictable constraints
+        master.setAttr("UB", [gamma[e] for e in self.noninterdictable_edges], 0)
+        
+        master.setObjective(theta, grb.GRB.MINIMIZE)
+        
+        # 3. Benders Loop
+        epsilon = 1e-4
+        max_iter = 100
+        UB = float('inf')
+        
+        # Initialize x_hat
+        x_hat = {} 
+        
+        # Callback for Jupyter output
+        import sys
+        def jupyter_callback(model, where):
+            if where == grb.GRB.Callback.MESSAGE:
+                msg = model.cbGet(grb.GRB.Callback.MSG_STRING)
+                if msg:
+                     sys.stdout.write(msg)
+                     sys.stdout.flush()
+        
+        for iteration in range(max_iter):
+            print(f"\n--- Benders Iteration {iteration+1} ---", file=sys.stdout)
+            sys.stdout.flush()
+            master.optimize(jupyter_callback)
+            if master.status != grb.GRB.OPTIMAL:
+                break
+                
+            x_hat = {e: gamma[e].X for e in self.both_edges}
+            current_theta = theta.X
+            
+            # Solve Subproblems (Weighted by Probability)
+            total_expected_flow = 0.0
+            cut_term_coefs = defaultdict(float) # Coef for gamma[e]
+            
+            for s in range(n_scenarios):
+                s_prob = scenario_probs[s]
+                s_outcome = scenario_outcomes_list[s]
+                
+                # Update Capacities based on x_hat and outcome
+                current_caps = {}
+                for idx, e in enumerate(self.both_edges):
+                    # Interdiction is successful if attempted (x_hat > 0.5) AND outcome is 1
+                    is_interdicted = (x_hat[e] > 0.5)
+                    outcome_success = (s_outcome[idx] == 1)
+                    
+                    is_blocked = is_interdicted and outcome_success
+                    cap = 0 if is_blocked else self.edges_episode[e].capacity
+                    current_caps[e] = cap
+                    rev_e = (e[1], e[0])
+                    current_caps[rev_e] = cap
+                
+                # Solve max flow
+                sub_obj, flow_dict = self.solve_max_flow(capacity_dict=current_caps)
+                
+                total_expected_flow += s_prob * sub_obj
+                
+                # Calculate cut coefficients
+                for idx, e in enumerate(self.both_edges):
+                     if s_outcome[idx] == 1:
+                         # Flow that would be blocked
+                         f_fwd = flow_dict.get(e, 0)
+                         rev_e = (e[1], e[0])
+                         f_rev = flow_dict.get(rev_e, 0)
+                         f_total = f_fwd + f_rev
+                         
+                         # Coefficient: - Prob * Flow * Outcome (outcome is 1 here)
+                         cut_term_coefs[e] -= s_prob * f_total
+
+            UB = total_expected_flow
+            
+            if UB <= current_theta + epsilon:
+                 break
+                 
+            # Add Weighted Cut
+            # Theta >= Sum( P_s * MaxFlow_s(x_hat) ) + Sum_e ( Sum_s (P_s * dMaxFlow/dx_e) * (gamma_e - x_hat_e) )
+            # Simplified: Theta >= Intercept + Sum(Coef_e * gamma_e)
+            
+            grad_dot_xhat = sum(cut_term_coefs[e] * x_hat[e] for e in self.both_edges)
+            intercept = total_expected_flow - grad_dot_xhat
+            
+            lhs_terms = grb.quicksum(cut_term_coefs[e] * gamma[e] for e in self.both_edges)
+            master.addConstr(theta >= intercept + lhs_terms)
+            master.update()
+            
+        interdicted = [e for e in self.both_edges if x_hat.get(e, 0) > 0.5]
+        
+        # Use centralized evaluation method to ensure consistency
+        # Note: UB here is the expected value across the scenarios used in decomposition
+        # Evaluating with _evaluate_solution_stochastic will use the default sampling/exact method of the environment
+        final_obj_val = self._evaluate_solution_stochastic(interdicted)
+        
+        return final_obj_val, interdicted
 
     def _compute_baycik_static_features(self):
         """Compute static topological features for Baycik's methodology."""
@@ -1057,7 +1478,10 @@ class InterdictionSolverMixin:
                     cost = self.state['edge_costs'][idx]
                     
                     # Consistent with train_baycik_model
-                    f_val = flow_dict.get(edge, 0) + flow_dict.get((edge[1],edge[0]), 0)
+                    if isinstance(flow_dict, np.ndarray):
+                        f_val = flow_dict[idx]
+                    else:
+                        f_val = flow_dict.get(edge, 0) + flow_dict.get((edge[1],edge[0]), 0)
                     
                     tail_in = static_feats['in_degree'].get(u, 0)
                     tail_out = static_feats['out_degree'].get(u, 0)
@@ -1835,6 +2259,11 @@ class InterdictionSolverMixin:
                 print(f"Serial execution completed in {time.time() - t0:.2f}s")
                 
             optimal_actions = [self.both_edges[idx] for idx in opt_seq]
+            
+            # Match behavior of parallel implementation and Gurobi
+            if self.attacker_strategy in ("zero_sum", "isolate"):
+                opt_reward = -opt_reward
+                
             return opt_reward, optimal_actions
 
 
@@ -2185,7 +2614,11 @@ class InterdictionSolverMixin:
         except: pass
 
         if self.attacker_strategy in ("zero_sum", "isolate"):
-            optimal_reward = -optimal_reward
+            # The DP maximizes "reward" (negative flow). 
+            # We negate it here to return "positive flow" (cost) to match Gurobi.
+            if optimal_reward is not None:
+                optimal_reward = -optimal_reward
 
         optimal_actions = [self.both_edges[idx] for idx in optimal_sequence]
+        
         return optimal_reward, optimal_actions
