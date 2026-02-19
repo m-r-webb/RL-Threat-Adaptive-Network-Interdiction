@@ -779,12 +779,14 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         # Clear local outcome cache on reset because capacities/objectives change
         self.local_outcome_cache = {}
 
-        # Clear centralized outcome cache if it exists
+        # Kill centralized outcome cache actors if they exist to free memory completely
         if self.outcome_memo_actors:
             for actor in self.outcome_memo_actors:
-                actor.clear.remote()
+                ray.kill(actor)
+            self.outcome_memo_actors = None
         elif self.outcome_memo_actor:
-            self.outcome_memo_actor.clear.remote()
+            ray.kill(self.outcome_memo_actor)
+            self.outcome_memo_actor = None
         
         # Call parent reset and set random seeds
         super().reset(seed=seed)
