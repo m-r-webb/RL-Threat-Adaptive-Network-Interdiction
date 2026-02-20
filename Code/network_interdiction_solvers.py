@@ -1946,6 +1946,117 @@ class InterdictionSolverMixin:
 
         return objVal, actions_taken
 
+    def solve_min_cut_heuristic(self):
+        """
+        Executes a Min-Cut Heuristic solver on the current environment state.
+        
+        Zero Sum Variation:
+        1. Compute the min cut of network.
+        2. Compute efficiency for each edge in the cut: (capacity * interdiction_probability) / cost.
+        3. Select edges from cut by efficiency until budget is expended.
+        4. If budget remains, select remaining interdictable edges by efficiency value.
+        """
+        actions_taken = []
+        num_interdictable = len(self.interdictable_edges)
+        
+        if self.attacker_strategy == "zero_sum":
+            # 1. Compute Min Cut
+            # Use solve_max_flow to get the current flows
+            _, flows = self.solve_max_flow(routing_assumption='zero_sum')
+            
+            # Map all possible directed edges to their current capacity
+            # Symmetric capacity assumed for both_edges in env_TA
+            directed_caps = {}
+            for idx in range(self.num_both_edges):
+                edge = self.both_edges[idx]
+                c = self.state['edge_capacity'][idx]
+                directed_caps[edge] = c
+                directed_caps[(edge[1], edge[0])] = c
+            
+            # BFS on residual graph to find reachable set from super source (Node ID 1)
+            reachable = {1}
+            queue = deque([1])
+            while queue:
+                u = queue.popleft()
+                if u in self.edge_groups:
+                    for edge in self.edge_groups[u]['out']: # edge is (u, v)
+                        v = edge[1]
+                        if v not in reachable:
+                            cap = directed_caps.get(edge, 0)
+                            if flows.get(edge, 0) < cap - 1e-6:
+                                reachable.add(v)
+                                queue.append(v)
+            
+            # Identify interdictable edges in the cut (edges connecting reachable to unreachable nodes)
+            cut_indices = []
+            for idx in range(num_interdictable):
+                u, v = self.both_edges[idx]
+                if (u in reachable and v not in reachable) or (v in reachable and u not in reachable):
+                    cut_indices.append(idx)
+            
+            # 2. Calculate efficiency = (cap * prob) / cost
+            efficiencies = np.zeros(num_interdictable)
+            for idx in range(num_interdictable):
+                cap = self.state['edge_capacity'][idx]
+                prob = self.state['edge_interdiction_probability'][idx]
+                cost = self.state['edge_costs'][idx]
+                efficiencies[idx] = (cap * prob) / cost if cost > 0 else 0
+            
+            # 3. Sort cut edges by efficiency descending
+            cut_to_sort = [(idx, efficiencies[idx]) for idx in cut_indices]
+            cut_to_sort.sort(key=lambda x: x[1], reverse=True)
+            
+            # 4. Interdict cut edges as long as budget allows
+            done = False
+            for idx, _ in cut_to_sort:
+                remaining_budget = self.state['budget'][0]
+                cost = self.state['edge_costs'][idx]
+                
+                # Check if edge is valid to interdict (using mask_fn for safety)
+                mask = self.mask_fn()
+                if mask[idx] == 1 and cost <= remaining_budget:
+                    obs, reward, done, _, _ = self.step(idx)
+                    actions_taken.append(self.both_edges[idx])
+                    if done: break
+            
+            # 5. If budget remains, select other interdictable edges by overall efficiency
+            if not done:
+                remaining_budget = self.state['budget'][0]
+                all_interdictable = []
+                mask = self.mask_fn()
+                for idx in range(num_interdictable):
+                    if mask[idx] == 1:
+                        all_interdictable.append((idx, efficiencies[idx]))
+                
+                all_interdictable.sort(key=lambda x: x[1], reverse=True)
+                
+                for idx, _ in all_interdictable:
+                    remaining_budget = self.state['budget'][0]
+                    cost = self.state['edge_costs'][idx]
+                    if cost <= remaining_budget:
+                        obs, reward, done, _, _ = self.step(idx)
+                        actions_taken.append(self.both_edges[idx])
+                        if done: break
+                        
+        else:
+            # Placeholder for other strategies (canalize, isolate, divert)
+            # Default to zero_sum logic for now if not specified
+            _, actions_taken = self.solve_heuristic_interdiction()
+            
+        # Determine final objective value based on strategy
+        if self.attacker_strategy == "zero_sum":
+            objVal, _ = self._compute_objective_and_flows()
+        elif self.attacker_strategy == "isolate":
+            objVal, _ = self._calculate_isolate_objective_and_flows()
+        elif self.attacker_strategy == "canalize":
+            objVal, _ = self._calculate_canalize_objective_and_flows()
+        elif self.attacker_strategy == "divert":
+            objVal, _ = self._calculate_divert_objective_and_flows()
+        else:
+            objVal, _ = self._compute_objective_and_flows()
+
+        return objVal, actions_taken
+
     # --- Re-add solve_backward_induction_ray method to Mixin ---
     
     def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=None, ray_address=None, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, rl_model_path=None):
