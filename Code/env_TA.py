@@ -861,8 +861,8 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                 self.reference_start_flows = (from_flow, to_flow)
                 self.reference_obj = 0
                 
-                # Check if restart is needed for divert strategy
-                if self.reference_start_flows[0] == 0:
+                # Check if restart is needed for divert strategy (objective must have 3 edges and some from_flow to divert)
+                if self.reference_start_flows[0] == 0 or np.sum(self.state['divert_to_objective']) < 3:
                     continue
             
             # If we made it here, the environment is valid
@@ -895,7 +895,11 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                 delattr(self, model_name)
     
         # Clean up related attributes
-        cleanup_attrs = ['benders_cuts', 'stochastic_alpha', 'stochastic_beta', 'stochastic_source_sink_constr', 'stochastic_aabg_constr', 'stochastic_alpha_IM', 'stochastic_beta_IM', 'stochastic_source_sink_constr_IM', 'stochastic_aabg_constr_IM']
+        cleanup_attrs = [
+            'benders_cuts', 
+            'stochastic_gamma', 'stochastic_gamma_constr', 'stochastic_budget_constr', 'stochastic_alpha', 'stochastic_beta', 'stochastic_source_sink_constr', 'stochastic_aabg_constr', 'stochastic_aabg_reverse_constr', 'stochastic_old_state', 'stochastic_old_interdicted_edges',
+            'stochastic_gamma_IM', 'stochastic_gamma_constr_IM', 'stochastic_budget_constr_IM', 'stochastic_alpha_IM', 'stochastic_beta_IM', 'stochastic_source_sink_constr_IM', 'stochastic_aabg_constr_IM', 'stochastic_aabg_reverse_constr_IM', 'stochastic_old_state_IM', 'stochastic_old_interdicted_edges_IM', 'stochastic_old_interdicted_quantities_IM'
+        ]
     
         for attr in cleanup_attrs:
             if hasattr(self, attr):
@@ -1236,14 +1240,48 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
              post_divert_from = [from_path[i], from_path[i+1]]
              
              divert_from_segments = [pre_edge] + post_divert_from
+
+             # Avoid edges to supersink in divert_from
+             if any(edge[1] in self.super_sink_nodes for edge in divert_from_segments):
+                 continue
              
              # divert_to segments: find alternate path of length 2 from breakpoint
-             # that does not intersect with post_divert_from (pre_edge is shared)
-             divert_to_post = self._find_alternate_segment(breakpoint_node, post_divert_from)
+             # that does not intersect with post_divert_from or pre_edge (pre_edge is shared)
+             divert_to_post = self._find_alternate_segment(breakpoint_node, post_divert_from + [pre_edge])
              
              if divert_to_post:
                  divert_to_segments = [pre_edge] + divert_to_post
-                 candidates.append((divert_from_segments, divert_to_segments))
+                 
+                 # Verify both objectives have exactly 3 unique undirected edges
+                 unique_from = {tuple(sorted(e)) for e in divert_from_segments}
+                 unique_to = {tuple(sorted(e)) for e in divert_to_segments}
+                 
+                 if len(unique_from) == 3 and len(unique_to) == 3:
+                    # Avoid direct edge between initial and final nodes of divert_to objective
+                    # Find endpoints (nodes that appear exactly once across the 3 edges)
+                    all_nodes_to = []
+                    for u, v in divert_to_segments:
+                        all_nodes_to.extend([u, v])
+                    node_counts = Counter(all_nodes_to)
+                    endpoints = [node for node, count in node_counts.items() if count == 1]
+                #    print(f"divert_to_segments: {divert_to_segments}")
+                #    print(f"endpoints: {endpoints}")
+                    # Ensure it's a simple path (exactly 2 endpoints) and check for shortcuts
+                    if len(endpoints) == 2:
+                        n0, n3 = endpoints
+                        # Check all directions for any edge between the two endpoints
+                        exists_shortcut = any(e[1] == n3 for e in self.edge_groups[n0]['out']) or \
+                                          any(e[1] == n0 for e in self.edge_groups[n3]['out'])
+                 #       print(f"Checking shortcut between {n0} and {n3}: {exists_shortcut}")
+                        if exists_shortcut:
+                 #           print(f"Rejected candidate due to shortcut between {n0} and {n3}")
+                            continue
+                    else:
+                        # If not exactly 2 endpoints, it's a cycle or disconnected, which we don't want
+                 #       print(f"Rejected candidate due to endpoints: {endpoints}")
+                        continue
+                 #   print(f"Adding candidate: divert_from={divert_from_segments}, divert_to={divert_to_segments}")
+                    candidates.append((divert_from_segments, divert_to_segments))
         
         if not candidates:
              # Fallback if no valid configuration found
