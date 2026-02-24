@@ -43,13 +43,16 @@ class _SharedMemoActor:
 
 @ray.remote
 class _SharedAlphaActor:
-    def __init__(self, initial_alpha=-float('inf')):
+    def __init__(self, initial_alpha=-float('inf'), initial_sequence=None):
         self.alpha = initial_alpha
+        self.sequence = initial_sequence if initial_sequence is not None else []
     def get(self):
-        return self.alpha
-    def update(self, new_alpha):
+        return self.alpha, self.sequence
+    def update(self, new_alpha, new_sequence=None):
         if new_alpha > self.alpha:
             self.alpha = new_alpha
+            if new_sequence is not None:
+                self.sequence = new_sequence
 
 @ray.remote
 class SharedOutcomeMemoActor:
@@ -149,7 +152,7 @@ class _RemoteEnvWorker:
         local_alpha_cache = -float('inf')
         if self.alpha_actor:
             try:
-                local_alpha_cache = _ray.get(self.alpha_actor.get.remote())
+                local_alpha_cache, _ = _ray.get(self.alpha_actor.get.remote())
             except Exception:
                 pass
 
@@ -172,7 +175,7 @@ class _RemoteEnvWorker:
                         
                         # Sync alpha
                         if self.alpha_actor:
-                            remote_val = _ray.get(self.alpha_actor.get.remote())
+                            remote_val, _ = _ray.get(self.alpha_actor.get.remote())
                             if remote_val > local_alpha_cache:
                                 local_alpha_cache = remote_val
                     except Exception:
@@ -416,7 +419,7 @@ class InterdictionSolverMixin:
             return(self.optimal_model.objVal, interdicted_edges)
         
         else:  #Solve Stochastic Case with Cormican's Formulation      
-            M = 100                       # Number of training episodes
+            M = 500                       # Number of training episodes
             N = 700                   # Number of test episodes
             seed_list = [100, 200, 300]#, 400, 500]
             best_objective_value = 100000    # Big M Value
@@ -1950,94 +1953,216 @@ class InterdictionSolverMixin:
         """
         Executes a Min-Cut Heuristic solver on the current environment state.
         
-        Zero Sum Variation:
-        1. Compute the min cut of network.
-        2. Compute efficiency for each edge in the cut: (capacity * interdiction_probability) / cost.
-        3. Select edges from cut by efficiency until budget is expended.
-        4. If budget remains, select remaining interdictable edges by efficiency value.
+        Variations:
+        - Zero Sum: Min-cut separates Super Source from Super Sink.
+        - Isolate: Min-cut separates Super Source from target nodes in isolate_objective.
         """
         actions_taken = []
         num_interdictable = len(self.interdictable_edges)
+        interdictable_set = set(self.interdictable_edges)
         
-        if self.attacker_strategy == "zero_sum":
-            # 1. Compute Min Cut
-            # Use solve_max_flow to get the current flows
-            _, flows = self.solve_max_flow(routing_assumption='zero_sum')
+        if self.attacker_strategy in ["zero_sum", "isolate"]:
+            # 1. Compute Min Cut using Gurobi
+            cut_model = grb.Model("MinCut_Heuristic", env=self.GUROBI_ENV)
+            cut_model.setParam('OutputFlag', 0)
             
-            # Map all possible directed edges to their current capacity
-            # Symmetric capacity assumed for both_edges in env_TA
-            directed_caps = {}
-            for idx in range(self.num_both_edges):
-                edge = self.both_edges[idx]
-                c = self.state['edge_capacity'][idx]
-                directed_caps[edge] = c
-                directed_caps[(edge[1], edge[0])] = c
+            # Nodes: 0 if on source side, 1 if on sink side
+            p = cut_model.addVars(self.nodes, vtype=grb.GRB.BINARY, name="p")
+            # Edges: 1 if edge is in the cut
+            y = cut_model.addVars(self.both_edges, vtype=grb.GRB.BINARY, name="y")
+            z = cut_model.addVars(self.both_edges, vtype=grb.GRB.BINARY, name="z")
             
-            # BFS on residual graph to find reachable set from super source (Node ID 1)
-            reachable = {1}
-            queue = deque([1])
-            while queue:
-                u = queue.popleft()
-                if u in self.edge_groups:
-                    for edge in self.edge_groups[u]['out']: # edge is (u, v)
-                        v = edge[1]
-                        if v not in reachable:
-                            cap = directed_caps.get(edge, 0)
-                            if flows.get(edge, 0) < cap - 1e-6:
-                                reachable.add(v)
-                                queue.append(v)
+            # Boundary conditions
+            cut_model.addConstr(p[self.super_source_nodes[0]] == 0)
             
-            # Identify interdictable edges in the cut (edges connecting reachable to unreachable nodes)
-            cut_indices = []
-            for idx in range(num_interdictable):
-                u, v = self.both_edges[idx]
-                if (u in reachable and v not in reachable) or (v in reachable and u not in reachable):
-                    cut_indices.append(idx)
+            target_nodes = set()
+            super_sinks = set(self.super_sink_nodes)
+            if self.attacker_strategy == "zero_sum":
+                cut_model.addConstr(p[self.super_sink_nodes[0]] == 1)
+            elif self.attacker_strategy == "isolate":
+                target_indices = np.where(self.state['isolate_objective'][:self.num_both_edges] == 1)[0]
+                target_nodes = set([self.both_edges[i][1] for i in target_indices])
+                for node in target_nodes:
+                    cut_model.addConstr(p[node] == 1)
             
-            # 2. Calculate efficiency = (cap * prob) / cost
-            efficiencies = np.zeros(num_interdictable)
-            for idx in range(num_interdictable):
-                cap = self.state['edge_capacity'][idx]
+            # Constraint: y_uv >= p_v - p_u (Standard min-cut formulation)
+            # We use absolute difference for the symmetric capacity assumption
+            for idx, edge in enumerate(self.both_edges):
+                u, v = edge
+                
+                # USER REQUIREMENT: Skip constraints for isolate strategy on target-sink edges
+                skip_partition_const = False
+                if self.attacker_strategy == "isolate":
+                    if (u in target_nodes and v in super_sinks) or (v in target_nodes and u in super_sinks):
+                        skip_partition_const = True
+                
+                if not skip_partition_const:
+                    cut_model.addConstr(y[edge] >= p[v] - p[u])
+                    cut_model.addConstr(y[edge] >= p[u] - p[v])
+                
+                cut_model.addConstr(z[edge] <= y[edge])
+
+                # USER REQUIREMENT: Non-interdictable OR Zero Success Probability edges cannot be in the cut
                 prob = self.state['edge_interdiction_probability'][idx]
-                cost = self.state['edge_costs'][idx]
-                efficiencies[idx] = (cap * prob) / cost if cost > 0 else 0
+                if edge not in interdictable_set or prob <= 1e-9:
+                    y[edge].UB = 0
+
+            # 1. Budget constraint: sum of (z[edge] * cost) <= current state budget
+            cut_model.addConstr(
+                grb.quicksum(self.state['edge_costs'][idx] * z[edge] for idx, edge in enumerate(self.both_edges))
+                <= self.state['budget'][0], name="budget"
+            )
             
-            # 3. Sort cut edges by efficiency descending
-            cut_to_sort = [(idx, efficiencies[idx]) for idx in cut_indices]
-            cut_to_sort.sort(key=lambda x: x[1], reverse=True)
+            # 2. Objective: Minimize (Capacity * y) - (Capacity * prob * z)
+            cut_model.setObjective(
+                grb.quicksum(self.state['edge_capacity'][idx] * y[edge] - 
+                             (self.state['edge_capacity'][idx] * self.state['edge_interdiction_probability'][idx] * z[edge])
+                             for idx, edge in enumerate(self.both_edges)),
+                grb.GRB.MINIMIZE
+            )
             
-            # 4. Interdict cut edges as long as budget allows
-            done = False
-            for idx, _ in cut_to_sort:
-                remaining_budget = self.state['budget'][0]
-                cost = self.state['edge_costs'][idx]
-                
-                # Check if edge is valid to interdict (using mask_fn for safety)
-                mask = self.mask_fn()
-                if mask[idx] == 1 and cost <= remaining_budget:
-                    obs, reward, done, _, _ = self.step(idx)
-                    actions_taken.append(self.both_edges[idx])
-                    if done: break
+            cut_model.optimize()
             
-            # 5. If budget remains, select other interdictable edges by overall efficiency
-            if not done:
-                remaining_budget = self.state['budget'][0]
-                all_interdictable = []
-                mask = self.mask_fn()
-                for idx in range(num_interdictable):
-                    if mask[idx] == 1:
-                        all_interdictable.append((idx, efficiencies[idx]))
+            # Interdict edges where z[edge].X is 1 - Batch Update
+            if cut_model.status == grb.GRB.OPTIMAL:
+                for idx, edge in enumerate(self.both_edges):
+                    if z[edge].X > 0.5:
+                        action_idx = self.edge_to_index.get(edge)
+                        if action_idx is not None:
+                            # Update state directly (bypass step/mask_fn for efficiency as requested)
+                            self.state['edge_interdicted'][action_idx] += 1
+                            self.state['budget'][0] -= self.state['edge_costs'][action_idx]
+                            actions_taken.append(edge)
                 
-                all_interdictable.sort(key=lambda x: x[1], reverse=True)
+                # Recompute flows once after all cut interdictions are applied
+                self._cache_flow_array()
+
+            # 2. If budget remains, fall back to solve_heuristic_interdiction for remaining decisions
+            if not self._is_episode_complete(self.state['budget']) and self.attacker_strategy == "zero_sum":
+                _, extra_actions = self.solve_heuristic_interdiction()
+                actions_taken.extend(extra_actions)
+            
+        elif self.attacker_strategy == "canalize":
+            # 1. Identify Target Edges
+            target_indices = np.where(self.state['canalize_objective'][:self.num_both_edges] == 1)[0]
+            target_indices_set = set(target_indices)
+            
+            # Tally for occurrences in min-cut
+            cut_tally = defaultdict(int)
+            
+            # 2. Loop through each target edge and solve min-cut
+            for t_idx in target_indices:
+                target_edge = self.both_edges[t_idx]
                 
-                for idx, _ in all_interdictable:
-                    remaining_budget = self.state['budget'][0]
-                    cost = self.state['edge_costs'][idx]
-                    if cost <= remaining_budget:
-                        obs, reward, done, _, _ = self.step(idx)
-                        actions_taken.append(self.both_edges[idx])
-                        if done: break
-                        
+                cut_model = grb.Model(f"MinCut_Canalize_{t_idx}", env=self.GUROBI_ENV)
+                cut_model.setParam('OutputFlag', 0)
+                
+                # Nodes & Edges variables
+                p = cut_model.addVars(self.nodes, vtype=grb.GRB.BINARY, name="p")
+                y = cut_model.addVars(self.both_edges, vtype=grb.GRB.BINARY, name="y")
+                z = cut_model.addVars(self.both_edges, vtype=grb.GRB.BINARY, name="z")
+                
+                # Source and Sink potentials
+                cut_model.addConstr(p[self.super_source_nodes[0]] == 0)
+                cut_model.addConstr(p[self.super_sink_nodes[0]] == 1)
+                
+                # Force target edge into cut but not interdicted
+                cut_model.addConstr(y[target_edge] == 1)
+                cut_model.addConstr(z[target_edge] == 0)
+                
+                # Standard min-cut constraints
+                for idx, edge in enumerate(self.both_edges):
+                    u, v = edge
+                    cut_model.addConstr(y[edge] >= p[v] - p[u])
+                    cut_model.addConstr(y[edge] >= p[u] - p[v])
+                    cut_model.addConstr(z[edge] <= y[edge])
+                    
+                    # Edges with 0 sucess prob or non-interdictable cannot be in z (implied by objective but safe)
+                    prob = self.state['edge_interdiction_probability'][idx]
+                    if edge not in interdictable_set or prob <= 1e-9:
+                        z[edge].UB = 0
+                
+                # Budget constraint
+                cut_model.addConstr(
+                    grb.quicksum(self.state['edge_costs'][idx] * z[edge] for idx, edge in enumerate(self.both_edges))
+                    <= self.state['budget'][0], name="budget"
+                )
+                
+                # Objective: Minimize Residual Capacity
+                cut_model.setObjective(
+                    grb.quicksum(self.state['edge_capacity'][idx] * y[edge] - 
+                                 (self.state['edge_capacity'][idx] * self.state['edge_interdiction_probability'][idx] * z[edge])
+                                 for idx, edge in enumerate(self.both_edges)),
+                    grb.GRB.MINIMIZE
+                )
+                
+                cut_model.optimize()
+                
+                if cut_model.status == grb.GRB.OPTIMAL:
+                    for idx, edge in enumerate(self.both_edges):
+                        if idx not in target_indices_set and y[edge].X > 0.5:
+                            cut_tally[idx] += 1
+            
+            # 3. Selection Loop: Sort by Tally, Tie-break by Flow, Recompute Flow on ties
+            remaining_candidates = list(cut_tally.keys())
+            
+            while remaining_candidates and self.state['budget'][0] > 0:
+                # Filter for affordable candidates that haven't reached max interdiction
+                affordable_candidates = [idx for idx in remaining_candidates 
+                                         if self.state['edge_costs'][idx] <= self.state['budget'][0]
+                                         and self.state['edge_interdicted'][idx] < self.max_interdictions]
+                
+                if not affordable_candidates:
+                    break
+                
+                # Find maximum tally among affordable candidates
+                max_tally = max(cut_tally[idx] for idx in affordable_candidates)
+                top_candidates = [idx for idx in affordable_candidates if cut_tally[idx] == max_tally]
+                
+                target_idx = -1
+                if len(top_candidates) == 1:
+                    # Highest tally outright
+                    target_idx = top_candidates[0]
+                else:
+                    # Tie at the top tally: Recompute flow for tie-breaking
+                    if self.deterministic_outcomes:
+                        _, flows = self.solve_max_flow(routing_assumption='canalize')
+                    else:
+                        _, flows = self._calculate_stochastic_objective_and_flow(
+                            strategy_type='canalize', 
+                            return_full_flows=True
+                        )
+                    
+                    # Ensure we have a unified array format for flow lookup
+                    if isinstance(flows, dict):
+                        flows_arr = self._flows_dict_to_array(flows)
+                    else:
+                        flows_arr = flows
+                    
+                    # Find candidates with max flow among those tied for max tally
+                    def get_combined_flow(idx):
+                        return flows_arr[idx]
+                    
+                    target_idx = max(top_candidates, key=get_combined_flow)
+                
+                # Interdict the selected edge
+                edge = self.both_edges[target_idx]
+                cost = self.state['edge_costs'][target_idx]
+                
+                self.state['edge_interdicted'][target_idx] += 1
+                self.state['budget'][0] -= cost
+                actions_taken.append(edge)
+                
+                # Remove from candidates until all tallied edges are targeted
+                if self.state['edge_interdicted'][target_idx] >= self.max_interdictions:
+                    remaining_candidates.remove(target_idx)
+                
+                if self._is_episode_complete(self.state['budget']):
+                    break
+            
+            # Synchronize environment flows after batch interdiction
+            self._cache_flow_array()
+
         else:
             # Placeholder for other strategies (canalize, isolate, divert)
             # Default to zero_sum logic for now if not specified
@@ -2059,12 +2184,14 @@ class InterdictionSolverMixin:
 
     # --- Re-add solve_backward_induction_ray method to Mixin ---
     
-    def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=None, ray_address=None, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, rl_model_path=None):
+    def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=None, ray_address=None, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, rl_model_path=None, time_limit=3600):
         """
         Parallelized backward induction using Ray with Adaptive Frontier Expansion.
         """
         # Import locally to ensure availability in all paths and avoid scope issues
         import copy, numpy as np, ray as _ray, time
+
+        start_time = time.time()
 
         # init ray if not already
         if n_workers > 0 and not ray.is_initialized():
@@ -2263,7 +2390,15 @@ class InterdictionSolverMixin:
             pbar = tqdm(total=estimated_states, desc="DP States (Serial)", unit=" states", disable=not verbose)
 
             # Define recursive solver for serial execution
-            def dp_serial(rem_budget, inter_state, d, alpha=-float('inf')):
+            best_incumbent_reward = initial_alpha
+            best_incumbent_seq = [self.edge_to_index[e] for e in initial_alpha_actions]
+
+            def dp_serial(rem_budget, inter_state, d, alpha=-float('inf'), path_to_here=[]):
+                nonlocal best_incumbent_reward, best_incumbent_seq
+                
+                if time.time() - start_time > time_limit:
+                    raise TimeoutError("Time limit exceeded")
+
                 key = inter_state[:self.num_both_edges].tobytes()
                 
                 # Volume calc for this node's potential subtree
@@ -2295,7 +2430,12 @@ class InterdictionSolverMixin:
                 else:
                     val = -float('inf')
                     flows = {}
-                    
+                
+                # Update incumbent if we found a better terminal value (or stopping here)
+                if val > best_incumbent_reward:
+                    best_incumbent_reward = val
+                    best_incumbent_seq = list(path_to_here)
+
                 self.reference_flows = flows
                 self._cache_flow_array()
                 
@@ -2363,7 +2503,9 @@ class InterdictionSolverMixin:
                     inter_state[action] += 1
                     new_budget = rem_budget - self.state['edge_costs'][action]
                     
-                    fut_reward, fut_seq = dp_serial(new_budget, inter_state, d + 1, alpha)
+                    path_to_here.append(action)
+                    fut_reward, fut_seq = dp_serial(new_budget, inter_state, d + 1, alpha, path_to_here)
+                    path_to_here.pop()
                     
                     inter_state[action] -= 1
                     
@@ -2381,8 +2523,14 @@ class InterdictionSolverMixin:
             initial_interdicted = self.state['edge_interdicted'].copy()
             initial_budget = self.state['budget'][0]
             
-            opt_reward, opt_seq = dp_serial(initial_budget, initial_interdicted, 0, alpha=initial_alpha)
-            
+            try:
+                opt_reward, opt_seq = dp_serial(initial_budget, initial_interdicted, 0, alpha=initial_alpha, path_to_here=[])
+            except TimeoutError:
+                if verbose:
+                    print(f"Serial execution timed out after {time.time() - t0:.2f}s. Returning best solution found.")
+                opt_reward = best_incumbent_reward
+                opt_seq = best_incumbent_seq
+
             pbar.close()
 
             if verbose:
@@ -2426,8 +2574,11 @@ class InterdictionSolverMixin:
             # When using heuristics, the initial_alpha is a lower bound on the optimal value.
             # We should subtract a small epsilon (or larger buffer) to ensure we don't prune branches that are exactly equal 
             # to this initial value due to floating point noise.
+            initial_alpha_indices = [self.edge_to_index[e] for e in initial_alpha_actions]
+            alpha_actor = _SharedAlphaActor.remote(initial_alpha, initial_alpha_indices)
             
-            alpha_actor = _SharedAlphaActor.remote(initial_alpha)
+            best_incumbent_val = initial_alpha
+            best_incumbent_seq = initial_alpha_indices
             
             max_budget = self.state['budget'][0]
             budget_levels = int(max_budget // self.min_edge_cost) if self.min_edge_cost > 0 else 1
@@ -2528,6 +2679,13 @@ class InterdictionSolverMixin:
             tasks_to_solve = [] # Nodes ready to be sent to workers
             
             while frontier:
+                # Check for timeout
+                if time.time() - start_time > time_limit:
+                    if verbose: print("Expansion phase timed out. Moving to solve...")
+                    tasks_to_solve.extend(frontier)
+                    frontier = []
+                    break
+
                 # If we have enough tasks, stop expanding and move remaining frontier to solve list
                 if len(frontier) + len(tasks_to_solve) >= TARGET_TASKS:
                     tasks_to_solve.extend(frontier)
@@ -2618,6 +2776,10 @@ class InterdictionSolverMixin:
             running_futures = {} # future -> (worker, node)
             
             while pending_tasks or running_futures:
+                if time.time() - start_time > time_limit:
+                    if verbose: print(f"Execution phase timed out after {time.time() - start_time:.2f}s.")
+                    break
+
                 while idle_workers and pending_tasks:
                     worker = idle_workers.pop()
                     node = pending_tasks.pop(0)
@@ -2638,6 +2800,20 @@ class InterdictionSolverMixin:
                             node.value = val
                             node.best_sequence = seq
                             
+                            # Track best incumbent
+                            prefix = []
+                            curr = node
+                            while curr.parent:
+                                prefix.append(curr.action_from_parent)
+                                curr = curr.parent
+                            prefix.reverse()
+                            full_seq = prefix + seq
+                            
+                            if val > best_incumbent_val:
+                                best_incumbent_val = val
+                                best_incumbent_seq = full_seq
+                                alpha_actor.update.remote(val, full_seq)
+
                             # Cache result in driver memo
                             if enable_memoization:
                                 memo_driver[node.key] = (val, seq)
@@ -2648,8 +2824,7 @@ class InterdictionSolverMixin:
                         idle_workers.append(worker)
 
             # 3. Aggregation Phase (Bottom-Up)
-            # We need to propagate values from leaves up to root.
-            # Since we built a tree, we can do a post-order traversal or just iterate by depth reverse.
+            # Only run fully if we haven't timed out significantly, but we can try to partial aggregate
             
             # Collect all nodes in the tree
             all_nodes = []
@@ -2659,66 +2834,72 @@ class InterdictionSolverMixin:
                 all_nodes.append(curr)
                 q.extend(curr.children)
                 
-            # Sort by depth descending (deepest first)
-            all_nodes.sort(key=lambda x: x.depth, reverse=True)
-            
-            for node in all_nodes:
-                # Compute value of current node (stopping value)
-                # Temporarily set state
-                old_budget = self.state['budget'][0]
-                old_interdicted = self.state['edge_interdicted'].copy()
-                self.state['budget'][0] = node.budget
-                self.state['edge_interdicted'][:] = node.state
+            # If we didn't timeout, run formal aggregation
+            if time.time() - start_time <= time_limit:
+                # Sort by depth descending (deepest first)
+                all_nodes.sort(key=lambda x: x.depth, reverse=True)
                 
-                if self.attacker_strategy == "zero_sum":
-                    val, _ = self._compute_objective_and_flows()
-                    val = -val
-                elif self.attacker_strategy == 'canalize':
-                    val, _ = self._calculate_canalize_objective_and_flows()
-                elif self.attacker_strategy == 'isolate':
-                    val, _ = self._calculate_isolate_objective_and_flows()
-                    val = -val
-                elif self.attacker_strategy == 'divert':
-                    val, _ = self._calculate_divert_objective_and_flows()
-                else:
-                    val = -float('inf')
-                
-                self.state['budget'][0] = old_budget
-                self.state['edge_interdicted'][:] = old_interdicted
+                for node in all_nodes:
+                    # Compute value of current node (stopping value)
+                    # Temporarily set state
+                    old_budget = self.state['budget'][0]
+                    old_interdicted = self.state['edge_interdicted'].copy()
+                    self.state['budget'][0] = node.budget
+                    self.state['edge_interdicted'][:] = node.state
+                    
+                    if self.attacker_strategy == "zero_sum":
+                        val, _ = self._compute_objective_and_flows()
+                        val = -val
+                    elif self.attacker_strategy == 'canalize':
+                        val, _ = self._calculate_canalize_objective_and_flows()
+                    elif self.attacker_strategy == 'isolate':
+                        val, _ = self._calculate_isolate_objective_and_flows()
+                        val = -val
+                    elif self.attacker_strategy == 'divert':
+                        val, _ = self._calculate_divert_objective_and_flows()
+                    else:
+                        val = -float('inf')
+                    
+                    self.state['budget'][0] = old_budget
+                    self.state['edge_interdicted'][:] = old_interdicted
 
-                if node.children:
-                    # This is an internal node in our expanded tree.
-                    # Its value is the max of its children AND itself (stopping).
-                    best_val = val
-                    best_seq = []
+                    if node.children:
+                        # This is an internal node in our expanded tree.
+                        # Its value is the max of its children AND itself (stopping).
+                        best_val = val
+                        best_seq = []
+                        
+                        for child in node.children:
+                            # Child value should be set by now (either from worker or recursion)
+                            if child.value is None:
+                                # Should not happen if logic is correct
+                                continue
+                                
+                            if child.value > best_val:
+                                best_val = child.value
+                                best_seq = [child.action_from_parent] + child.best_sequence
+                        
+                        node.value = best_val
+                        node.best_sequence = best_seq
+                        
+                        # Cache
+                        if enable_memoization:
+                            memo_driver[node.key] = (best_val, best_seq)
                     
-                    for child in node.children:
-                        # Child value should be set by now (either from worker or recursion)
-                        if child.value is None:
-                            # Should not happen if logic is correct
-                            continue
-                            
-                        if child.value > best_val:
-                            best_val = child.value
-                            best_seq = [child.action_from_parent] + child.best_sequence
-                    
-                    node.value = best_val
-                    node.best_sequence = best_seq
-                    
-                    # Cache
-                    if enable_memoization:
-                        memo_driver[node.key] = (best_val, best_seq)
-                
-                elif node.value is None:
-                    # Leaf node that wasn't solved?
-                    node.value = val
-                    node.best_sequence = []
-                    if enable_memoization:
-                        memo_driver[node.key] = (val, [])
+                    elif node.value is None:
+                        # Leaf node that wasn't solved?
+                        node.value = val
+                        node.best_sequence = []
+                        if enable_memoization:
+                            memo_driver[node.key] = (val, [])
 
-            # Final result
-            optimal_reward = root_node.value
-            optimal_sequence = root_node.best_sequence
+                # Final result
+                optimal_reward = root_node.value
+                optimal_sequence = root_node.best_sequence
+            else:
+                # Timeout case: Use best incumbent found during task completion
+                optimal_reward = best_incumbent_val
+                optimal_sequence = best_incumbent_seq
 
             # Cleanup
             stop_event.set()
