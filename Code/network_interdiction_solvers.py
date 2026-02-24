@@ -786,6 +786,7 @@ class InterdictionSolverMixin:
                                                   vtype=grb.GRB.BINARY, name="alpha")
             self.stochastic_beta = self.optimal_stochastic_model.addVars([(e, s) for s in self.scenarios for e in self.edges_reset],
                                                                           vtype=grb.GRB.BINARY, name="beta")
+            self.optimal_stochastic_model.update()
 
             if hasattr(self, 'stochastic_source_sink_constr'):
                 self.optimal_stochastic_model.remove(self.stochastic_source_sink_constr)
@@ -812,7 +813,7 @@ class InterdictionSolverMixin:
         self.stochastic_aabg_constr = self.optimal_stochastic_model.addConstrs(
             (self.stochastic_alpha[e[0],s] - self.stochastic_alpha[e[1], s] + self.stochastic_beta[e, s] + (self.stochastic_gamma[e] * scenario_outcomes[s, edge_id]) >= 0 for s in self.scenarios for edge_id, e in enumerate(self.both_edges)), name='aabg')
         self.stochastic_aabg_reverse_constr = self.optimal_stochastic_model.addConstrs(
-            (self.stochastic_alpha[e[1],s] - self.stochastic_alpha[e[0], s] + self.stochastic_beta[e, s] + (self.stochastic_gamma[e] * scenario_outcomes[s, edge_id]) >= 0 for s in self.scenarios for edge_id, e in enumerate(self.both_edges)), name='aabg')
+            (self.stochastic_alpha[e[1],s] - self.stochastic_alpha[e[0], s] + self.stochastic_beta[e, s] + (self.stochastic_gamma[e] * scenario_outcomes[s, edge_id]) >= 0 for s in self.scenarios for edge_id, e in enumerate(self.both_edges)), name='aabg_reverse')
 
         # Solving
         self.optimal_stochastic_model.optimize()
@@ -1319,6 +1320,16 @@ class InterdictionSolverMixin:
                 self.state = state
                 self._cache_flow_array() # Update cache based on state
                 
+                # Initialize reference values for the current attacker strategy (needed for training consistency)
+                if self.attacker_strategy == 'canalize':
+                    _, flows = self.solve_max_flow(routing_assumption = 'canalize')
+                    self.reference_start_flow = self._calculate_target_path_flow(flows, 'canalize_objective')
+                elif self.attacker_strategy == 'divert':
+                    _, flows = self.solve_max_flow(routing_assumption = 'divert')
+                    from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
+                    to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
+                    self.reference_start_flows = (from_flow, to_flow)
+
                 # Calculate Initial Uninterdicted Flow
                 # Ensure no interdictions are considered for the feature extraction
                 # We temporarily clear interdictions in state dict
@@ -1357,8 +1368,30 @@ class InterdictionSolverMixin:
                 # So we loop len(targets) times.
                 
                 for step_idx in range(len(targets_remaining) ):
-                    # 1. Update features for current state
-                    _, flow_dict = self.solve_max_flow()
+                    # 1. Update Strategy Flows and calculate features
+                    obj_iso_can = 0.0
+                    obj_div_from = 0.0
+                    obj_div_to = 0.0
+
+                    try:
+                        if self.attacker_strategy == "zero_sum":
+                            _, flow_dict = self._compute_objective_and_flows()
+                        elif self.attacker_strategy == "canalize":
+                            obj_iso_can, flow_dict = self._calculate_canalize_objective_and_flows()
+                        elif self.attacker_strategy == "isolate":
+                            obj_iso_can, flow_dict = self._calculate_isolate_objective_and_flows()
+                        elif self.attacker_strategy == "divert":
+                            _, flow_dict = self._calculate_divert_objective_and_flows()
+                            # Use dict flows for components
+                            _, flows_dict = self.solve_max_flow(routing_assumption = 'divert')
+                            from_flow = self._calculate_target_path_flow(flows_dict, 'divert_from_objective')
+                            to_flow = self._calculate_target_path_flow(flows_dict, 'divert_to_objective')
+                            obj_div_from = (getattr(self, 'reference_start_flows', [0,0])[0] - from_flow)
+                            obj_div_to = (to_flow - getattr(self, 'reference_start_flows', [0,0])[1])
+                        else:
+                            _, flow_dict = self.solve_max_flow()
+                    except Exception:
+                        _, flow_dict = self.solve_max_flow()
                     
                     current_budget = self.state['budget'][0]
                     
@@ -1374,7 +1407,11 @@ class InterdictionSolverMixin:
                         
                         cap = self.state['edge_capacity'][idx]
                         cost = self.state['edge_costs'][idx]
-                        f_val = flow_dict.get(edge, 0) + flow_dict.get((edge[1],edge[0]), 0)
+                        
+                        if isinstance(flow_dict, np.ndarray):
+                            f_val = flow_dict[idx]
+                        else:
+                            f_val = flow_dict.get(edge, 0) + flow_dict.get((edge[1],edge[0]), 0)
 
                         
                         # Extra Features
@@ -1392,10 +1429,11 @@ class InterdictionSolverMixin:
                         
                         prob_success = self.state['edge_interdiction_probability'][idx]
                             
-                        # Features: Cost, Flow, Budget, Interdiction Prob + 7 New. (Removed Raw Capacity)
+                        # Features: Cost, Flow, Budget, Interdiction Prob + 7 Static + 3 Strategy.
                         features = [cost, f_val, current_budget, prob_success,
                             tail_in, tail_out, head_in, head_out,
-                            norm_d_src, norm_d_sink, norm_cap]
+                            norm_d_src, norm_d_sink, norm_cap,
+                            obj_iso_can, obj_div_from, obj_div_to]
 
                         # Label is 1 if edge is in the remaining target set
                         label = 1 if edge in target_set and edge not in current_interdicted_indices else 0
@@ -1457,17 +1495,26 @@ class InterdictionSolverMixin:
             selected_indices = set()
             
             while not done:
-                # 1. Update Strategy Flows (for Mask)
-                # We need to ensure mask_fn allows valid actions based on current flow state
+                # 1. Update Strategy Flows and calculate extra features
+                obj_iso_can = 0.0
+                obj_div_from = 0.0
+                obj_div_to = 0.0
+
                 try:
                     if self.attacker_strategy == "zero_sum":
                         _, self.reference_flows = self._compute_objective_and_flows()
                     elif self.attacker_strategy == "canalize":
-                        _, self.reference_flows = self._calculate_canalize_objective_and_flows()
+                        obj_iso_can, self.reference_flows = self._calculate_canalize_objective_and_flows()
                     elif self.attacker_strategy == "isolate":
-                        _, self.reference_flows = self._calculate_isolate_objective_and_flows()
+                        obj_iso_can, self.reference_flows = self._calculate_isolate_objective_and_flows()
                     elif self.attacker_strategy == "divert":
                         _, self.reference_flows = self._calculate_divert_objective_and_flows()
+                        # Use dict flows for components
+                        _, flows_dict = self.solve_max_flow(routing_assumption = 'divert')
+                        from_flow = self._calculate_target_path_flow(flows_dict, 'divert_from_objective')
+                        to_flow = self._calculate_target_path_flow(flows_dict, 'divert_to_objective')
+                        obj_div_from = (getattr(self, 'reference_start_flows', [0,0])[0] - from_flow)
+                        obj_div_to = (to_flow - getattr(self, 'reference_start_flows', [0,0])[1])
                 except Exception:
                     # Fallback check
                     pass
@@ -1515,10 +1562,11 @@ class InterdictionSolverMixin:
                     
                     prob_success = self.state['edge_interdiction_probability'][idx]
 
-                    # Consistent Order with train_baycik_model: Cost, Flow, Budget...
+                    # Consistent Order with train_baycik_model: Cost, Flow, Budget, ..., Strategy Obj
                     features = [cost, f_val, current_budget, prob_success,
                                 tail_in, tail_out, head_in, head_out,
-                                norm_d_src, norm_d_sink, norm_cap]
+                                norm_d_src, norm_d_sink, norm_cap,
+                                obj_iso_can, obj_div_from, obj_div_to]
                     
                     # Predict
                     prob = model.predict_proba([features])[0][1]
@@ -1601,6 +1649,7 @@ class InterdictionSolverMixin:
                                                   vtype=grb.GRB.BINARY, name="alpha_IM")
             self.stochastic_beta_IM = self.optimal_stochastic_model_IM.addVars([(e, s) for s in self.scenarios_IM for e in self.edges_reset],
                                                                           vtype=grb.GRB.BINARY, name="beta_IM")
+            self.optimal_stochastic_model_IM.update()
 
             if hasattr(self, 'stochastic_source_sink_constr_IM'):
                 self.optimal_stochastic_model_IM.remove(self.stochastic_source_sink_constr_IM)
@@ -1637,7 +1686,7 @@ class InterdictionSolverMixin:
             del self.stochastic_aabg_constr_IM, self.stochastic_aabg_reverse_constr_IM
             
         self.stochastic_aabg_constr_IM = self.optimal_stochastic_model_IM.addConstrs((self.stochastic_alpha_IM[e[0],s] - self.stochastic_alpha_IM[e[1], s]+self.stochastic_beta_IM[e, s]+ (grb.quicksum(self.stochastic_gamma_IM[e,k] * scenario_outcomes[s, interdictable_edge_map[e], k-1] for k in k_vals) if e in interdictable_edge_map else 0) >= 0 for s in self.scenarios_IM for e in self.edges_reset.keys()), name='aabg_IM')
-        self.stochastic_aabg_reverse_constr_IM = self.optimal_stochastic_model_IM.addConstrs((self.stochastic_alpha_IM[e[1],s] - self.stochastic_alpha_IM[e[0], s]+self.stochastic_beta_IM[e, s]+ (grb.quicksum(self.stochastic_gamma_IM[e,k] * scenario_outcomes[s, interdictable_edge_map[e], k-1] for k in k_vals) if e in interdictable_edge_map else 0) >= 0 for s in self.scenarios_IM for e in self.edges_reset.keys()), name='aabg_IM')
+        self.stochastic_aabg_reverse_constr_IM = self.optimal_stochastic_model_IM.addConstrs((self.stochastic_alpha_IM[e[1],s] - self.stochastic_alpha_IM[e[0], s]+self.stochastic_beta_IM[e, s]+ (grb.quicksum(self.stochastic_gamma_IM[e,k] * scenario_outcomes[s, interdictable_edge_map[e], k-1] for k in k_vals) if e in interdictable_edge_map else 0) >= 0 for s in self.scenarios_IM for e in self.edges_reset.keys()), name='aabg_reverse_IM')
 
         # Solving
         self.optimal_stochastic_model_IM.optimize()
@@ -2103,6 +2152,24 @@ class InterdictionSolverMixin:
                         if idx not in target_indices_set and y[edge].X > 0.5:
                             cut_tally[idx] += 1
             
+            # 2.5 Add base tally of 1 for edges connected to intermediate objective nodes
+            # (If they weren't already identified by the min-cut solutions)
+            node_counts = defaultdict(int)
+            for idx in target_indices:
+                u, v = self.both_edges[idx]
+                node_counts[u] += 1
+                node_counts[v] += 1
+            
+            intermediate_nodes = {node for node, count in node_counts.items() if count >= 2}
+            for node in intermediate_nodes:
+                # Check all edges incident to this intermediate node
+                connected_edges = self.edge_groups[node].get('in', []) + self.edge_groups[node].get('out', [])
+                for edge in connected_edges:
+                    idx = self.edge_to_index.get(edge)
+                    if idx is not None and idx not in target_indices_set:
+                        if idx not in cut_tally:
+                            cut_tally[idx] = 1
+
             # 3. Selection Loop: Sort by Tally, Tie-break by Flow, Recompute Flow on ties
             remaining_candidates = list(cut_tally.keys())
             
