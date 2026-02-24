@@ -24,32 +24,50 @@ import seaborn as sns
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 import ray
+
+#User Determined Settings
+graphName = "G5x5"
+env_params = {'deterministic_agent': False,
+              'multiple_interdiction_attempts': False,
+              'attacker_strategy': 'zero_sum',  # canalize   isolate   divert  zero_sum
+              'training_budget_range': (5,15),  #G5x5: zero_sum/isolate: (5,15), canalize/divert: (12,24) G10x10: zero_sum/isolate: (10,20), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (18,30) G15x15: zero_sum/isolate: (25,45)
+              'max_path_length': 2,  #G5x5: 2,  G10x10: 3, UKR: 4
+              'sample_size': None,
+              'penalty_value': -0.01,
+             }
+              
+version_date = "02_19" # numeric month_day
+version_type = "opt_m"  # bi for backward induction or opt_m or opt_d for optimal MIP
+num_cpus_run = 44   # 36  44
+
+model_name = "G5x5_S_MaskablePPO_zero_sum_B_v01_16_GCN"
+
+# Number of scenarios to generate
+num_of_scenarios = 500 
+save_interval = 1  # Save every 10 episodes
+
+# Print settings for easy copying for continuation runs
+print("\n# --- USER DETERMINED SETTINGS (FOR CONTINUATION) ---")
+print(f'graphName = "{graphName}"')
+print(f"env_params = {env_params}")
+print(f'version_date = "{version_date}"')
+print(f'version_type = "{version_type}"')
+print(f"num_cpus_run = {num_cpus_run}")
+print(f"model_name = {model_name}")
+print("# --------------------------------------------------\n")
+
 if not ray.is_initialized():
     ray.init(
         address=None, 
         ignore_reinit_error=True, 
         logging_level='INFO',
         include_dashboard=False,
-        num_cpus=40, #46  38
+        num_cpus=num_cpus_run,
         _temp_dir=os.environ.get('RAY_TMPDIR'), # Add this parameter with a short path
     )
 
 # Import custom environment .py file
 import env_TA as ce #modified for curriculum learning
-
-#User Determined Settings
-graphName = "UKR"
-env_params = {'deterministic_agent': False,
-              'multiple_interdiction_attempts': False,
-              'attacker_strategy': 'zero_sum',  # canalize   isolate   divert  zero_sum
-              'training_budget_range': (10,20),  #G5x5: zero_sum/isolate: (5,15), canalize/divert: (12,24) G10x10: zero_sum/isolate: (10,20), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (18,30) G15x15: zero_sum/isolate: (25,45)
-              'max_path_length': 2,  #G5x5: 2,  G10x10: 3, UKR: 4
-              'sample_size': None,
-              'penalty_value': -0.01,
-             }
-              
-version_date = "02_10" # numeric month_day
-version_type = "bi"  # bi for backward induction or opt_m or opt_d for optimal MIP
 
 if version_type == "opt_m":
     opt_method = 'monolithic'  
@@ -59,15 +77,10 @@ elif version_type == "opt_d":
 # LOAD Previous saved model
 current_dir = os.getcwd()
 models_dir = os.path.join(current_dir, '..', 'Trained_RL_Models')
-model_name = "UKR_S_MaskablePPO_zero_sum_B_v01_04"
 model_timesteps = None #17640000 #None #4830000 #None #          # Set a number, 1512000, or  None
 if model_timesteps == None:
     model_path = f"{models_dir}/{model_name}/best_model"
 else:    model_path = f"{models_dir}/{model_name}/{model_name}_{model_timesteps}_steps"
-
-# Number of scenarios to generate
-num_of_scenarios = 500 
-save_interval = 1  # Save every 10 episodes
 
 if env_params['multiple_interdiction_attempts'] == True:
     MI_letter = 'M'
@@ -185,13 +198,13 @@ else:
                     elif version_type == "opt_d":
                         optimal_obj_val, optimal_interdiction_edges = env.solve_optimal_interdiction(method=opt_method) 
                     elif version_type == 'bi':
-                        # Reduced n_workers to avoid thread resource exhaustion (pthread_create failed)
-                        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = 32, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True,  rl_model_path=model_path) 
+                        # Reduced n_workers to avoid thread resource exhaustion
+                        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = num_cpus_run-6, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True,  rl_model_path=model_path) 
                     end_time = time.perf_counter()
                 else:
                     start_time = time.perf_counter()
                     # Reduced n_workers to avoid thread resource exhaustion
-                    optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = 32) 
+                    optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = num_cpus_run-6, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True,  rl_model_path=model_path) 
                     end_time = time.perf_counter()
                 
                 solve_time = end_time - start_time
