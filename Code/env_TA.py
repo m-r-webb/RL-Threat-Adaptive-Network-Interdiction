@@ -15,6 +15,7 @@ import gurobipy as grb                # Gurobi optimization library for solving 
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
+import time
 import copy, random
 from tqdm import tqdm
 
@@ -86,7 +87,9 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
     """Custom Gym environment for network interdiction problems."""
     # Class constants
     # Set Method=1 (Dual Simplex) and MIPGap=0 for strict deterministic/optimal behavior
-    GUROBI_ENV = grb.Env(params={"OutputFlag": 0, "LogToConsole": 0, "Threads": 1, "Seed": 1}) #, "Method": 1, "MIPGap": 0})
+    # Do NOT create a global Gurobi Env at import time (not multiprocessing-safe).
+    # Create a per-instance env in _initialize_maxflow_model instead.
+    GUROBI_ENV = None
     
     def __init__(self, nodes, edges, deterministic_agent=True, initial_budget = None, 
                  multiple_interdiction_attempts=True, attacker_strategy="zero_sum",
@@ -322,9 +325,16 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             self._update_sensitive_edges(routing_assumption)
             callback = self._subtour_callback
 
-        self.maxflow_model.optimize(callback)
+        try:
+            self.maxflow_model.optimize(callback)
+        except Exception as e:
+            raise
         
-        if self.maxflow_model.Status == grb.GRB.OPTIMAL:
+        try:
+            status = self.maxflow_model.Status
+        except Exception:
+            status = None
+        if status == grb.GRB.OPTIMAL:
             # Use strict values without rounding to avoid flipping behavior near .5 boundaries
             obj_val = self.maxflow_model.ObjVal
             # Rounding flows is safer for interpretation but obj_val should be precise
@@ -332,7 +342,6 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         else:
             obj_val = 0
             flow_results = {e: 0 for e in self.flow_var.keys()}
-        
         return obj_val, flow_results 
 
     def _update_sensitive_edges(self, routing_assumption):
@@ -414,7 +423,16 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
 
     def _initialize_maxflow_model(self):
         """Initialize the Gurobi max flow model with variables and constraints."""
-        self.maxflow_model = grb.Model("Max Flow", env=self.GUROBI_ENV)
+        # Ensure a per-instance Gurobi environment (safe for multiprocessing workers)
+        if getattr(self, 'GUROBI_ENV', None) is None:
+            try:
+                self.GUROBI_ENV = grb.Env(params={"OutputFlag": 0, "LogToConsole": 0, "Threads": 1, "Seed": 1})#, "TimeLimit": 10})
+            except Exception as e:
+                self.GUROBI_ENV = None
+        try:
+            self.maxflow_model = grb.Model("Max Flow", env=self.GUROBI_ENV)
+        except Exception as e:
+            raise
         self.super_edge = (self.max_num_nodes, 1)
         
         # Prepare edge list with super sink-source connection
@@ -881,7 +899,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
     
     def _cleanup_models(self):
         """Clean up any existing Gurobi models to free resources."""
-        models_to_cleanup = ['master_model', 'sub_model', 'optimal_stochastic_model', 'optimal_stochastic_model_IM']
+        models_to_cleanup = ['master_model', 'sub_model', 'optimal_stochastic_model', 'optimal_stochastic_model_IM', 'maxflow_model']
         
         # Reset optimizations flags
         self.static_capacity_constraints_setup = False
@@ -889,10 +907,21 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         for model_name in models_to_cleanup:
             if hasattr(self, model_name):
                 try:
-                    getattr(self, model_name).dispose()
+                    obj = getattr(self, model_name)
+                    try:
+                        obj.dispose()
+                    except Exception:
+                        # If GUROBI_ENV or other objects don't have dispose, ignore
+                        pass
                 except Exception:
-                    pass  # Continue if dispose fails
-                delattr(self, model_name)
+                    pass
+                try:
+                    delattr(self, model_name)
+                except Exception:
+                    try:
+                        setattr(self, model_name, None)
+                    except Exception:
+                        pass
     
         # Clean up related attributes
         cleanup_attrs = [
@@ -907,6 +936,29 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
 
         self.num_stochastic_scenarios = None
         self.num_stochastic_scenarios_IM = None
+
+        # Additional cleanup: remove maxflow-related variables and auxiliary structures
+
+        # Only remove model/solution related attributes — keep static network structure
+        extra_attrs = [
+            'flow_var', 'edge_used', 'forward_cons', 'reverse_cons', 'mf_all_both_edges',
+            'aux_vars', 'aux_constrs', 'sensitive_edges', 'reference_flows', 'reference_start_flow',
+            'reference_start_flows', 'reference_obj', 'reference_budget', 'cached_flow_array'
+        ]
+
+        for attr in extra_attrs:
+            if hasattr(self, attr):
+                try:
+                    delattr(self, attr)
+                except Exception:
+                    # Best-effort cleanup; ignore if attribute cannot be deleted
+                    pass
+
+        # Ensure flags that control model reinitialization are reset
+        self.strategy_objectives_setup = False
+        self.old_routing_assumption = None
+        self.reference_start_flows = None
+        self.reference_start_flow = None
 
     def _set_random_seeds(self, seed):      
         """Set random seeds for reproducibility."""
@@ -1004,8 +1056,8 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         max_len = len(max_flow_edge_set) + self.MAX_PATH_LENGTH
         
         # Try to find valid alternative paths (try 50 times)
-        for _ in range(50):
-            if len(candidates) >= 10: break
+        for _ in range(10):  #50
+            if len(candidates) >= 5: break #10
             
             alt_path = self._find_random_path_from_supersource(avoid_nodes, max_len)
             if alt_path:
@@ -1030,7 +1082,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             internal_edges = [e for e in valid_edges if e[0] not in self.super_source_nodes and e[1] not in self.super_sink_nodes]
             
             # Use internal edges if we have enough, otherwise fallback to all valid edges
-            pool_source = internal_edges if len(internal_edges) >= 2 else valid_edges
+            pool_source = internal_edges if len(internal_edges) >= 1 else valid_edges
 
             if len(pool_source) >= 2:
                 if len(pool_source) == 2:
@@ -1119,27 +1171,27 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         current_node = self.super_source_nodes[0]
         visited = {current_node} | avoid_nodes
         sink = self.super_sink_nodes[0]
-        
+        max_steps = 100
+        steps = 0
         while current_node != sink:
+            steps += 1
+            if steps > max_steps:
+                return False
             valid_edges = []
             if current_node in self.edge_groups:
                 for edge in self.edge_groups[current_node]['out']:
                     neighbor = edge[1]
                     if neighbor not in visited and neighbor >= current_node - 1:
                          valid_edges.append(edge)
-            
             if not valid_edges:
-                return None
-            
+                return False
             # Choose next
             selected_edge = random.choice(valid_edges)
             path_edges.append(selected_edge)
             visited.add(selected_edge[1])
             current_node = selected_edge[1]
-            
             if len(path_edges) > max_length:
-                return None
-                
+                return False
         return path_edges
 
     def _add_isolate_components(self, base_state):
@@ -1186,7 +1238,8 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             # If no start node (e.g. cycle), just pick one
             curr = 1 if 1 in nodes else min(nodes)
         else:
-             curr = 1 if 1 in start_nodes else start_nodes[0]
+            # Select the start node with the lowest node number
+            curr = min(start_nodes)
         
         path_edges = []
         visited = {curr}
@@ -1567,13 +1620,24 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                 objective = obj
             elif strategy_type == "canalize":                
                 target_flow = self._calculate_target_path_flow(flows, 'canalize_objective')
-                objective = (target_flow - getattr(self, 'reference_start_flow', 0))
+                ref_start = getattr(self, 'reference_start_flow', 0)
+                if ref_start is None:
+                    ref_start = 0
+                objective = (target_flow - ref_start)
             elif strategy_type == "isolate":
                 objective = self._calculate_target_edge_flow(flows, 'isolate_objective')
             elif strategy_type == "divert":
                 from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
                 to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
-                objective = np.min([(self.reference_start_flows[0] - from_flow), (to_flow - self.reference_start_flows[1])])
+                ref_flows = getattr(self, 'reference_start_flows', None)
+                if ref_flows is None:
+                    ref_a, ref_b = 0, 0
+                else:
+                    try:
+                        ref_a, ref_b = ref_flows[0], ref_flows[1]
+                    except Exception:
+                        ref_a, ref_b = 0, 0
+                objective = np.min([(ref_a - from_flow), (to_flow - ref_b)])
 
             res = {
                 'objective': objective
@@ -1755,51 +1819,16 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
 
     def _calculate_target_path_flow(self, flows, objective_key):
         """Calculate total flow through edges marked in the objective."""
-        # Modified to support partial paths (canalize) by using mask directly
-        if objective_key == 'canalize_objective':
-            # Just get all marked edges
-            objective = self.state[objective_key]
-            indices = np.where(objective[:self.num_both_edges] == 1)[0]
-            path_edges = [self.both_edges[i] for i in indices]
-            
-            if not path_edges:
-                return 0.0
-                
-            # Check for contiguous flow in either direction relative to the path definition
-            fwd_flows = [flows.get(e, 0) for e in path_edges]
-            rev_flows = [flows.get((e[1], e[0]), 0) for e in path_edges]
-            
-            min_fwd = min(fwd_flows)
-            max_rev = max(rev_flows)
-            
-            # Use small epsilon for float comparison
-            EPS = 1e-5
-            
-            # Case 1: Consistent forward flow (min > 0) AND no reverse flow
-            if min_fwd > EPS and max_rev < EPS:
-                return min_fwd
-                
-            min_rev = min(rev_flows)
-            max_fwd = max(fwd_flows)
-            
-            # Case 2: Consistent reverse flow (min > 0) AND no forward flow
-            if min_rev > EPS and max_fwd < EPS:
-                return min_rev
-                
-            # If mixed directions or breaks in flow, return 0
-            return 0.0
-            
-        else:
-            # Use strict path extraction for other strategies (ensures connectivity from source)
-            path_edges = self._extract_directed_path_edges(objective_key)
+        # Use strict path extraction for other strategies (ensures connectivity from source)
+        path_edges = self._extract_directed_path_edges(objective_key)
 
-            if not path_edges:
-                return 0.0
+        if not path_edges:
+            return 0.0
     
-            target_flows = [flows.get(edge, 0) for edge in path_edges]
+        target_flows = [flows.get(edge, 0) for edge in path_edges]
     
-            # Return minimum flow among target edges (bottleneck)
-            return min(target_flows)
+        # Return minimum flow among target edges (bottleneck)
+        return min(target_flows)
 
     def _calculate_target_edge_flow(self, flows, objective_key):
         """Calculate total flow on edges marked in the objective."""
@@ -1913,9 +1942,6 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
 
         print("=" * 80)
         # END Gymnasium Environment Methods
-            
-
-
 
     def load_network_from_state(self, seed, state):
         """Reset the environment to initial state and return observation."""
@@ -2094,7 +2120,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         elif self.attacker_strategy == 'canalize':
              # Logic for canalize: valid actions should NOT be on path to source from the objective start node.
              # "These edges should not be valid targets."
-             on_path_to_source = self.get_edges_on_paths_to_source(start_nodes = self.state['canalize_objective'])
+             #on_path_to_source = self.get_edges_on_paths_to_source(start_nodes = self.state['canalize_objective'])
              
              has_flow = self.cached_flow_array[:self.num_interdictable] > 0
              not_target = self.state['canalize_objective'][:self.num_interdictable] != 1
