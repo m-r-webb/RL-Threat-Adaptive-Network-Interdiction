@@ -907,12 +907,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         for model_name in models_to_cleanup:
             if hasattr(self, model_name):
                 try:
-                    obj = getattr(self, model_name)
-                    try:
-                        obj.dispose()
-                    except Exception:
-                        # If GUROBI_ENV or other objects don't have dispose, ignore
-                        pass
+                    getattr(self, model_name).dispose()
                 except Exception:
                     pass
                 try:
