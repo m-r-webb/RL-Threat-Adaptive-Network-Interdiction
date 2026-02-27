@@ -2092,143 +2092,141 @@ class InterdictionSolverMixin:
                 actions_taken.extend(extra_actions)
             
         elif self.attacker_strategy == "canalize":
-            # 1. Identify Target Edges
+            # Identify canalize objective edges
             target_indices = np.where(self.state['canalize_objective'][:self.num_both_edges] == 1)[0]
             target_indices_set = set(target_indices)
-            
-            # Tally for occurrences in min-cut
-            cut_tally = defaultdict(int)
-            
-            # 2. Loop through each target edge and solve min-cut
-            for t_idx in target_indices:
-                target_edge = self.both_edges[t_idx]
-                
-                cut_model = grb.Model(f"MinCut_Canalize_{t_idx}", env=self.GUROBI_ENV)
+
+            if len(target_indices) == 0:
+                # Nothing special to do, fallback to heuristic
+                _, actions_taken = self.solve_heuristic_interdiction()
+            else:
+                # Use _extract_directed_path_edges to get ordered path and nodes
+                path_edges = self._extract_directed_path_edges('canalize_objective')
+                if len(path_edges) == 0:
+                    # Fallback to previous counting logic if extraction fails
+                    node_counts = defaultdict(int)
+                    for idx in target_indices:
+                        u, v = self.both_edges[idx]
+                        node_counts[u] += 1
+                        node_counts[v] += 1
+                    intermediate_nodes = {node for node, count in node_counts.items() if count >= 2}
+                    start_node = None
+                    end_node = None
+                else:
+                    # derive ordered node sequence
+                    node_seq = [e[0] for e in path_edges] + [path_edges[-1][1]]
+                    start_node = node_seq[0]
+                    end_node = node_seq[-1]
+                    intermediate_nodes = set(node_seq[1:-1])
+
+                # Edges of interest: incident to intermediate nodes but not part of canalize objective
+                edges_of_interest_idxs = set()
+                for node in intermediate_nodes:
+                    connected = self.edge_groups[node].get('in', []) + self.edge_groups[node].get('out', [])
+                    for edge in connected:
+                        idx = self.edge_to_index.get(edge)
+                        # Also try reversed orientation if direct lookup fails
+                        if idx is None:
+                            rev = (edge[1], edge[0])
+                            idx = self.edge_to_index.get(rev)
+                        if idx is not None and idx not in target_indices_set:
+                            edges_of_interest_idxs.add(idx)
+
+                # Choose first edge of canalize objective (use first index in array)
+                first_edge_idx = int(target_indices[0])
+                first_edge = self.both_edges[first_edge_idx]
+
+                # Build a single min-cut model that forces edges_of_interest and first_edge into the cut
+                cut_model = grb.Model("MinCut_Canalize_Targeted", env=self.GUROBI_ENV)
                 cut_model.setParam('OutputFlag', 0)
-                
-                # Nodes & Edges variables
+
                 p = cut_model.addVars(self.nodes, vtype=grb.GRB.BINARY, name="p")
                 y = cut_model.addVars(self.both_edges, vtype=grb.GRB.BINARY, name="y")
                 z = cut_model.addVars(self.both_edges, vtype=grb.GRB.BINARY, name="z")
-                
-                # Source and Sink potentials
-                cut_model.addConstr(p[self.super_source_nodes[0]] == 0)
-                cut_model.addConstr(p[self.super_sink_nodes[0]] == 1)
-                
-                # Force target edge into cut but not interdicted
-                cut_model.addConstr(y[target_edge] == 1)
-                cut_model.addConstr(z[target_edge] == 0)
-                
+
+                # Use start/end nodes from extracted path when available, otherwise use super source/sink
+                if 'start_node' in locals() and start_node is not None:
+                    cut_model.addConstr(p[start_node] == 0)
+                else:
+                    cut_model.addConstr(p[self.super_source_nodes[0]] == 0)
+
+                if 'end_node' in locals() and end_node is not None:
+                    cut_model.addConstr(p[end_node] == 1)
+                else:
+                    cut_model.addConstr(p[self.super_sink_nodes[0]] == 1)
+
+                # Force edges of interest and first canalize edge to be interdicted (z==1).
+                # If an edge is not interdictable or has zero prob, fall back to forcing it in the cut (y==1).
+                for idx in edges_of_interest_idxs:
+                    edge = self.both_edges[idx]
+                    prob = self.state['edge_interdiction_probability'][idx]
+                    # Force interdiction (z==1) when possible. Do NOT force y==1 for edges of interest.
+                    if edge in interdictable_set and prob > 1e-9:
+                        cut_model.addConstr(z[edge] == 1)
+                        cut_model.addConstr(y[edge] == 0)
+
+                # Ensure all canalize objective edges are in the cut (y==1) and not interdicted (z==0).
+                for idx in target_indices:
+                    edge = self.both_edges[idx]
+                    cut_model.addConstr(y[edge] == 1)
+                    cut_model.addConstr(z[edge] == 0)
+
                 # Standard min-cut constraints
                 for idx, edge in enumerate(self.both_edges):
                     u, v = edge
                     cut_model.addConstr(y[edge] >= p[v] - p[u])
                     cut_model.addConstr(y[edge] >= p[u] - p[v])
-                    cut_model.addConstr(z[edge] <= y[edge])
-                    
-                    # Edges with 0 sucess prob or non-interdictable cannot be in z (implied by objective but safe)
+
+                    # Only enforce z <= y for edges that are NOT in edges_of_interest
+                    if idx not in edges_of_interest_idxs:
+                        cut_model.addConstr(z[edge] <= y[edge])
+
+                    # If edge not interdictable or prob==0, forbid z
                     prob = self.state['edge_interdiction_probability'][idx]
                     if edge not in interdictable_set or prob <= 1e-9:
                         z[edge].UB = 0
-                
-                # Budget constraint
-                cut_model.addConstr(
-                    grb.quicksum(self.state['edge_costs'][idx] * z[edge] for idx, edge in enumerate(self.both_edges))
-                    <= self.state['budget'][0], name="budget"
-                )
-                
-                # Objective: Minimize Residual Capacity
+
+                # Budget constraint: exclude the first canalize edge from costing
+                cost_terms = []
+                for idx, edge in enumerate(self.both_edges):
+                    if idx == first_edge_idx:
+                        # skip cost for first edge
+                        continue
+                    cost_terms.append(self.state['edge_costs'][idx] * z[edge])
+
+                cut_model.addConstr(grb.quicksum(cost_terms) <= self.state['budget'][0], name="budget")
+
+                # Objective: same as zero_sum: minimize capacity*y - expected reduction from z
                 cut_model.setObjective(
-                    grb.quicksum(self.state['edge_capacity'][idx] * y[edge] - 
+                    grb.quicksum(self.state['edge_capacity'][idx] * y[edge] -
                                  (self.state['edge_capacity'][idx] * self.state['edge_interdiction_probability'][idx] * z[edge])
                                  for idx, edge in enumerate(self.both_edges)),
                     grb.GRB.MINIMIZE
                 )
-                
+
                 cut_model.optimize()
-                
+
+                # Batch apply interdictions from z (but never interdicted canalize objective edges by constraint)
                 if cut_model.status == grb.GRB.OPTIMAL:
                     for idx, edge in enumerate(self.both_edges):
-                        if idx not in target_indices_set and y[edge].X > 0.5:
-                            cut_tally[idx] += 1
-            
-            # 2.5 Add base tally of 1 for edges connected to intermediate objective nodes
-            # (If they weren't already identified by the min-cut solutions)
-            node_counts = defaultdict(int)
-            for idx in target_indices:
-                u, v = self.both_edges[idx]
-                node_counts[u] += 1
-                node_counts[v] += 1
-            
-            intermediate_nodes = {node for node, count in node_counts.items() if count >= 2}
-            for node in intermediate_nodes:
-                # Check all edges incident to this intermediate node
-                connected_edges = self.edge_groups[node].get('in', []) + self.edge_groups[node].get('out', [])
-                for edge in connected_edges:
-                    idx = self.edge_to_index.get(edge)
-                    if idx is not None and idx not in target_indices_set:
-                        if idx not in cut_tally:
-                            cut_tally[idx] = 1
+                        # Skip canalize objective edges explicitly
+                        if idx in target_indices_set:
+                            continue
+                        if z[edge].X > 0.5:
+                            action_idx = self.edge_to_index.get(edge)
+                            if action_idx is not None:
+                                # Update state
+                                self.state['edge_interdicted'][action_idx] += 1
+                                self.state['budget'][0] -= self.state['edge_costs'][action_idx]
+                                actions_taken.append(edge)
 
-            # 3. Selection Loop: Sort by Tally, Tie-break by Flow, Recompute Flow on ties
-            remaining_candidates = list(cut_tally.keys())
-            
-            while remaining_candidates and self.state['budget'][0] > 0:
-                # Filter for affordable candidates that haven't reached max interdiction
-                affordable_candidates = [idx for idx in remaining_candidates 
-                                         if self.state['edge_costs'][idx] <= self.state['budget'][0]
-                                         and self.state['edge_interdicted'][idx] < self.max_interdictions]
-                
-                if not affordable_candidates:
-                    break
-                
-                # Find maximum tally among affordable candidates
-                max_tally = max(cut_tally[idx] for idx in affordable_candidates)
-                top_candidates = [idx for idx in affordable_candidates if cut_tally[idx] == max_tally]
-                
-                target_idx = -1
-                if len(top_candidates) == 1:
-                    # Highest tally outright
-                    target_idx = top_candidates[0]
-                else:
-                    # Tie at the top tally: Recompute flow for tie-breaking
-                    if self.deterministic_outcomes:
-                        _, flows = self.solve_max_flow(routing_assumption='canalize')
-                    else:
-                        _, flows = self._calculate_stochastic_objective_and_flow(
-                            strategy_type='canalize', 
-                            return_full_flows=True
-                        )
-                    
-                    # Ensure we have a unified array format for flow lookup
-                    if isinstance(flows, dict):
-                        flows_arr = self._flows_dict_to_array(flows)
-                    else:
-                        flows_arr = flows
-                    
-                    # Find candidates with max flow among those tied for max tally
-                    def get_combined_flow(idx):
-                        return flows_arr[idx]
-                    
-                    target_idx = max(top_candidates, key=get_combined_flow)
-                
-                # Interdict the selected edge
-                edge = self.both_edges[target_idx]
-                cost = self.state['edge_costs'][target_idx]
-                
-                self.state['edge_interdicted'][target_idx] += 1
-                self.state['budget'][0] -= cost
-                actions_taken.append(edge)
-                
-                # Remove from candidates until all tallied edges are targeted
-                if self.state['edge_interdicted'][target_idx] >= self.max_interdictions:
-                    remaining_candidates.remove(target_idx)
-                
-                if self._is_episode_complete(self.state['budget']):
-                    break
-            
-            # Synchronize environment flows after batch interdiction
-            self._cache_flow_array()
+                    # Recompute flows once after batch interdiction
+                    self._cache_flow_array()
+
+                # If budget remains, fall back to greedy heuristic for remaining decisions
+                if not self._is_episode_complete(self.state['budget']):
+                    _, extra_actions = self.solve_heuristic_interdiction()
+                    actions_taken.extend(extra_actions)
 
         else:
             # Placeholder for other strategies (canalize, isolate, divert)

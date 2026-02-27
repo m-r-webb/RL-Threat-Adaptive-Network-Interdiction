@@ -1041,117 +1041,100 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         # 2. Identify nodes to avoid (all intermediate nodes on max flow path)
         avoid_nodes = set()
         for u, v in max_flow_edge_set:
-            if u != self.super_source_nodes[0] and u != self.super_sink_nodes[0]:
-                avoid_nodes.add(u)
-            if v != self.super_source_nodes[0] and v != self.super_sink_nodes[0]:
-                avoid_nodes.add(v)
+            avoid_nodes.add(u)
+            avoid_nodes.add(v)
         
         # 3. Generate alternative paths
         candidates = []
         max_len = len(max_flow_edge_set) + self.MAX_PATH_LENGTH
         
         # Try to find valid alternative paths (try 50 times)
-        for _ in range(10):  #50
+        for _ in range(20):  #50
             if len(candidates) >= 5: break #10
             
             alt_path = self._find_random_path_from_supersource(avoid_nodes, max_len)
             if alt_path:
-                candidates.append(alt_path)
+                pool_source = [edge for edge in alt_path[1:-1] if edge in self.edge_to_index or (edge[1], edge[0]) in self.edge_to_index]
+
+                start_idx = random.randint(0, len(pool_source) - 2)
+                possible_seq = pool_source[start_idx : start_idx + 2]
+                if possible_seq not in candidates:
+                    candidates.append(possible_seq)
 
         # Fallback: if no disjoint paths found, use max_flow_path
         if not candidates:
-             candidates.append(max_flow_edge_set)
+            pool_source = [edge for edge in max_flow_edge_set if edge in self.edge_to_index or (edge[1], edge[0]) in self.edge_to_index]
+            start_idx = random.randint(0, len(pool_source) - 2)
+            candidates.append(pool_source[start_idx : start_idx + 2])
 
-        # 4. Generate Connected Segments
-        # "randomly choose three connected segments and use these as the candidates"
-        final_candidates = []
-        segment_pool = []
-        
-        for path in candidates:
-            # Filter to edges that actually exist in the model's edge set
-            # This filters out potential artifacts or non-indexed edges but accounts for reverse edges
-            valid_edges = [edge for edge in path if edge in self.edge_to_index or (edge[1], edge[0]) in self.edge_to_index]
+        if len(candidates)<=1:
+            best_path=candidates
+        else:
+            candidates_with_caps = []
+            for seg in candidates:
+                caps = []
+                for edge in seg:
+                    if edge in self.edge_to_index:
+                        caps.append(self.state['edge_capacity'][self.edge_to_index[edge]])
+                    elif (edge[1], edge[0]) in self.edge_to_index:
+                        caps.append(self.state['edge_capacity'][self.edge_to_index[(edge[1], edge[0])]])
             
-            # Further filter to "internal" edges if possible (exclude SuperSource/SuperSink connections)
-            # to make the canalization objective more "central" to the network
-            internal_edges = [e for e in valid_edges if e[0] not in self.super_source_nodes and e[1] not in self.super_sink_nodes]
-            
-            # Use internal edges if we have enough, otherwise fallback to all valid edges
-            pool_source = internal_edges if len(internal_edges) >= 1 else valid_edges
+                # Bottleneck is minimum capacity in the segment
+                bottleneck = min(caps) if caps else -1
+                candidates_with_caps.append((bottleneck, seg))
 
-            if len(pool_source) >= 2:
-                if len(pool_source) == 2:
-                    segment_pool.append(pool_source)
-                else:
-                    # Pick a random segment of length 2
-                    start_idx = random.randint(0, len(pool_source) - 2)
-                    segment_pool.append(pool_source[start_idx : start_idx + 2])
-        
-        # Fallback: If segment pool is empty (no paths with >= 2 edges), try to use any valid edge pair from candidates
-        if not segment_pool and candidates:
-             for path in candidates:
-                 valid_edges = [edge for edge in path if edge in self.edge_to_index or (edge[1], edge[0]) in self.edge_to_index]
-                 if len(valid_edges) >= 2:
-                     segment_pool.append(valid_edges[:2])
-                     
-        # Select top 3 segments based on bottleneck capacity
-        candidates_with_caps = []
-        for seg in segment_pool:
-            caps = []
-            for edge in seg:
-                if edge in self.edge_to_index:
-                    caps.append(self.state['edge_capacity'][self.edge_to_index[edge]])
-                elif (edge[1], edge[0]) in self.edge_to_index:
-                    caps.append(self.state['edge_capacity'][self.edge_to_index[(edge[1], edge[0])]])
+            candidates_with_caps.sort(key=lambda x: x[0], reverse=True)
             
-            # Bottleneck is minimum capacity in the segment
-            bottleneck = min(caps) if caps else -1
-            candidates_with_caps.append((bottleneck, seg))
+            # Take top 3
+            final_candidates = [seg for _, seg in candidates_with_caps[:3]]
         
-        # Sort descending by bottleneck capacity
-        candidates_with_caps.sort(key=lambda x: x[0], reverse=True)
-            
-        # Take top 3
-        final_candidates = [seg for _, seg in candidates_with_caps[:3]]
             
         # 5. Select Best Candidate (Least Flow)
-        best_path = None
-        min_candidate_flow = float('inf')
+            best_path = None
+            min_candidate_flow = float('inf')
         
-        for candidate in final_candidates:
-             # Construct objective vector for this candidate
-             temp_objective = np.zeros(self.max_num_edges, dtype=int)
-             for edge in candidate:
-                 # Mark ONLY forward (directed) edge
-                 if edge in self.edge_to_index:
-                     temp_objective[self.edge_to_index[edge]] = 1
-                 elif (edge[1], edge[0]) in self.edge_to_index:
-                     temp_objective[self.edge_to_index[(edge[1], edge[0])]] = 1
+            for candidate in final_candidates:
+            # Construct objective vector for this candidate
+                temp_objective = np.zeros(self.max_num_edges, dtype=int)
+                for edge in candidate:
+                    # Coerce list/ndarray edges to tuple to allow dict membership checks
+                    if not isinstance(edge, tuple):
+                        try:
+                            edge = tuple(edge)
+                        except Exception:
+                            pass
+                    # Mark ONLY forward (directed) edge
+                    if edge in self.edge_to_index:
+                        temp_objective[self.edge_to_index[edge]] = 1
+                    elif (edge[1], edge[0]) in self.edge_to_index:
+                        temp_objective[self.edge_to_index[(edge[1], edge[0])]] = 1
              
-             # Apply temporary objective
-             self.state['canalize_objective'] = temp_objective
+                # Apply temporary objective
+                self.state['canalize_objective'] = temp_objective
+                 
+                # Solve and measure flow
+                _, candidate_flows = self.solve_max_flow(routing_assumption='canalize')
              
-             # Solve and measure flow
-             _, candidate_flows = self.solve_max_flow(routing_assumption='canalize')
-             
-             # Calculate total flow passing through the candidate edges
-             # For bottleneck calculation, we want the flow through the sequence.
-             # Using min flow is better than sum for bottleneck.
-             current_flow_vals = [candidate_flows.get(edge, 0) for edge in candidate]
-             current_flow = min(current_flow_vals) if current_flow_vals else 0
-             
-             if current_flow < min_candidate_flow:
-                 min_candidate_flow = current_flow
-                 best_path = candidate
-
-        # Handle case where no candidates found/processed
-        if best_path is None:
-             best_path = candidates[0] if candidates else []
+                     # Calculate total flow passing through the candidate edges
+                     # For bottleneck calculation, we want the flow through the sequence.
+                     # Using min flow is better than sum for bottleneck.
+                current_flow_vals = [candidate_flows.get(edge, 0) for edge in candidate]
+                current_flow = min(current_flow_vals) if current_flow_vals else 0
+        
+                if current_flow < min_candidate_flow:
+                    min_candidate_flow = current_flow
+                    best_path = candidate
 
         # 6. Set Final Objective
         final_objective = np.zeros(self.max_num_edges, dtype=int)
         
         for edge in best_path:
+            # Coerce list/ndarray edges to tuple to allow dict membership checks
+            if not isinstance(edge, tuple):
+                try:
+                    edge = tuple(edge)
+                except Exception:
+                    pass
             # Mark ONLY forward (directed) edge
             if edge in self.edge_to_index:
                 final_objective[self.edge_to_index[edge]] = 1
@@ -1211,52 +1194,63 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         indices = np.where(obj_mask[:self.num_both_edges] == 1)[0]
         if len(indices) == 0:
             return []
-            
+        # Build set of target edges (as tuples)
         target_edges_set = {self.both_edges[i] for i in indices}
-        
-        # Build adjacency for subgraph
-        adj = defaultdict(list)
-        in_degree = defaultdict(int)
+
+        # Count occurrences of each node across all edges
+        node_counts = Counter()
         nodes = set()
-        
+        for u, v in target_edges_set:
+            node_counts[u] += 1
+            node_counts[v] += 1
+            nodes.add(u); nodes.add(v)
+
+        # Find endpoints: nodes that appear exactly once
+        endpoints = [n for n, c in node_counts.items() if c == 1]
+        if len(endpoints) >= 2:
+            # Choose smaller-valued node as start per specification
+            start_node = min(endpoints)
+            end_node = [n for n in endpoints if n != start_node][0]
+        else:
+            # Fallback: pick smallest node as start and largest as end
+            if not nodes:
+                return []
+            start_node = min(nodes)
+            end_node = max(nodes)
+
+        # Build undirected adjacency for traversal (so orientation stored in target_edges_set can be reversed)
+        adj = defaultdict(list)
         for u, v in target_edges_set:
             adj[u].append(v)
-            in_degree[v] += 1
-            if u not in in_degree: in_degree[u] += 0
-            nodes.add(u)
-            nodes.add(v)
-            
-        # Find start node(s): in-degree 0 in the subgraph
-        start_nodes = [n for n in nodes if in_degree[n] == 0]
-        
-        if not start_nodes:
-            # If no start node (e.g. cycle), just pick one
-            curr = 1 if 1 in nodes else min(nodes)
-        else:
-            # Select the start node with the lowest node number
-            curr = min(start_nodes)
-        
+            adj[v].append(u)
+
+        # Traverse from start_node to end_node, avoiding immediate backtracking
         path_edges = []
-        visited = {curr}
-        
-        # Traverse
-        while True:
+        curr = start_node
+        prev = None
+        max_steps = len(nodes) + 5
+        steps = 0
+        while curr != end_node and steps < max_steps:
+            steps += 1
+            neighbors = adj.get(curr, [])
+            # Choose next neighbor that is not the previous node if possible
             next_node = None
-            # Find next step in the path
-            if curr in adj:
-                for neighbor in adj[curr]:
-                     if (curr, neighbor) in target_edges_set:
-                          if neighbor not in visited:
-                               next_node = neighbor
-                               path_edges.append((curr, neighbor))
-                               break
-            
-            if next_node is not None:
-                curr = next_node
-                visited.add(curr)
-            else:
+            for nb in neighbors:
+                if nb == prev:
+                    continue
+                next_node = nb
                 break
-                
+            # If we couldn't avoid backtrack, allow it (graph may be small)
+            if next_node is None and neighbors:
+                next_node = neighbors[0]
+
+            if next_node is None:
+                break
+
+            path_edges.append((curr, next_node))
+            
+            prev, curr = curr, next_node
+
         return path_edges
 
     def _add_divert_components(self, base_state):
@@ -1317,12 +1311,9 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                     # Ensure it's a simple path (exactly 2 endpoints) and check for shortcuts
                     if len(endpoints) == 2:
                         n0, n3 = endpoints
-                        # Check all directions for any edge between the two endpoints
-                        exists_shortcut = any(e[1] == n3 for e in self.edge_groups[n0]['out']) or \
-                                          any(e[1] == n0 for e in self.edge_groups[n3]['out'])
-                 #       print(f"Checking shortcut between {n0} and {n3}: {exists_shortcut}")
-                        if exists_shortcut:
-                 #           print(f"Rejected candidate due to shortcut between {n0} and {n3}")
+                        # Reject candidate if any graph edge directly connects the two endpoints
+                        graph_edges = set(self.all_both_edges) if hasattr(self, 'all_both_edges') else set(self.both_edges)
+                        if (n0, n3) in graph_edges or (n3, n0) in graph_edges:
                             continue
                     else:
                         # If not exactly 2 endpoints, it's a cycle or disconnected, which we don't want
@@ -1400,14 +1391,32 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         from_path = []
         current_node = self.super_sink_nodes[0]
         source = 1
-    
-        while current_node != source:
-            incoming_edges = self.edge_groups[current_node]['in']
-            prev_edge = max(incoming_edges, key=lambda e: flows.get(e, 0)+ random.random() * 1e-6)
+
+        # Safety guards: track visited nodes and limit steps to avoid infinite loops
+        visited = {current_node}
+        max_steps = max(2 * len(self.nodes), 1000)
+        steps = 0
+
+        while current_node != source and steps < max_steps:
+            steps += 1
+            incoming_edges = self.edge_groups.get(current_node, {}).get('in', [])
+            if not incoming_edges:
+                break
+
+            prev_edge = max(incoming_edges, key=lambda e: flows.get(e, 0) + random.random() * 1e-6)
             from_path.append(prev_edge)
             current_node = prev_edge[0]
-    
-        return list(reversed(from_path))
+
+            if current_node in visited:
+                # cycle detected; stop walking
+                break
+            visited.add(current_node)
+
+        path = list(reversed(from_path))
+        # preserve previous slicing behaviour but handle short paths safely
+        if len(path) <= 2:
+            return path
+        return path[1:-1]
     
     def step(self, action):                                                     
         """Execute one step in the environment based on the given action."""
