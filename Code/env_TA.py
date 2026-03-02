@@ -789,10 +789,12 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         """Reset the environment to initial state and return observation."""
         # Clean up any existing models
         self._cleanup_models()
-        self.strategy_objectives_setup = False # Force objective reset on next solve
-        self.old_routing_assumption = False
-        self.reference_start_flows = None # Plural (divert)
-        self.reference_start_flow = None # Singular (canalize)
+        self.strategy_objectives_setup = False
+        self.old_routing_assumption = None
+        self.reference_start_flows = None
+        self.reference_start_flow = None
+        self.reference_obj = 0.0
+        self.reference_budget = 0.0
 
         # Clear local outcome cache on reset because capacities/objectives change
         self.local_outcome_cache = {}
@@ -901,15 +903,23 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         """Clean up any existing Gurobi models to free resources."""
         models_to_cleanup = ['master_model', 'sub_model', 'optimal_stochastic_model', 'optimal_stochastic_model_IM', 'maxflow_model']
         
-        # Reset optimizations flags
+        # Reset optimizations and model flags
         self.static_capacity_constraints_setup = False
+        self.strategy_objectives_setup = False
+        self.old_routing_assumption = None
+        self.num_stochastic_scenarios = None
+        self.num_stochastic_scenarios_IM = None
     
         for model_name in models_to_cleanup:
             if hasattr(self, model_name):
-                try:
-                    getattr(self, model_name).dispose()
-                except Exception:
-                    pass
+                model = getattr(self, model_name)
+                # Dispose model if it exists
+                if model is not None:
+                    try:
+                        model.dispose()
+                    except Exception:
+                        pass
+                # Remove attribute
                 try:
                     delattr(self, model_name)
                 except Exception:
@@ -918,42 +928,24 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                     except Exception:
                         pass
     
-        # Clean up related attributes
+        # Consolidate related attributes to clean up
         cleanup_attrs = [
+            # Stochastic Benders attributes
             'benders_cuts', 
             'stochastic_gamma', 'stochastic_gamma_constr', 'stochastic_budget_constr', 'stochastic_alpha', 'stochastic_beta', 'stochastic_source_sink_constr', 'stochastic_aabg_constr', 'stochastic_aabg_reverse_constr', 'stochastic_old_state', 'stochastic_old_interdicted_edges',
-            'stochastic_gamma_IM', 'stochastic_gamma_constr_IM', 'stochastic_budget_constr_IM', 'stochastic_alpha_IM', 'stochastic_beta_IM', 'stochastic_source_sink_constr_IM', 'stochastic_aabg_constr_IM', 'stochastic_aabg_reverse_constr_IM', 'stochastic_old_state_IM', 'stochastic_old_interdicted_edges_IM', 'stochastic_old_interdicted_quantities_IM'
+            # Stochastic IM attributes
+            'stochastic_gamma_IM', 'stochastic_gamma_constr_IM', 'stochastic_budget_constr_IM', 'stochastic_alpha_IM', 'stochastic_beta_IM', 'stochastic_source_sink_constr_IM', 'stochastic_aabg_constr_IM', 'stochastic_aabg_reverse_constr_IM', 'stochastic_old_state_IM', 'stochastic_old_interdicted_edges_IM', 'stochastic_old_interdicted_quantities_IM',
+            # Maxflow/Solution attributes
+            'flow_var', 'edge_used', 'forward_cons', 'reverse_cons', 'mf_all_both_edges',
+            'aux_vars', 'aux_constrs', 'sensitive_edges', 'reference_flows', 'cached_flow_array'
         ]
     
         for attr in cleanup_attrs:
             if hasattr(self, attr):
-                delattr(self, attr)
-
-        self.num_stochastic_scenarios = None
-        self.num_stochastic_scenarios_IM = None
-
-        # Additional cleanup: remove maxflow-related variables and auxiliary structures
-
-        # Only remove model/solution related attributes — keep static network structure
-        extra_attrs = [
-            'flow_var', 'edge_used', 'forward_cons', 'reverse_cons', 'mf_all_both_edges',
-            'aux_vars', 'aux_constrs', 'sensitive_edges', 'reference_flows', 'reference_start_flow',
-            'reference_start_flows', 'reference_obj', 'reference_budget', 'cached_flow_array'
-        ]
-
-        for attr in extra_attrs:
-            if hasattr(self, attr):
                 try:
                     delattr(self, attr)
                 except Exception:
-                    # Best-effort cleanup; ignore if attribute cannot be deleted
                     pass
-
-        # Ensure flags that control model reinitialization are reset
-        self.strategy_objectives_setup = False
-        self.old_routing_assumption = None
-        self.reference_start_flows = None
-        self.reference_start_flow = None
 
     def _set_random_seeds(self, seed):      
         """Set random seeds for reproducibility."""
@@ -1954,6 +1946,9 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         self.strategy_objectives_setup = False # Force objective reset on next solve
         self.old_routing_assumption = False
         self.reference_start_flows = None
+        self.reference_start_flow = None
+        self.reference_obj = 0.0
+        self.reference_budget = 0.0
 
         # Clear local outcome cache when loading new state
         self.local_outcome_cache = {}
