@@ -1054,13 +1054,26 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                     candidates.append(possible_seq)
 
         # Fallback: if no disjoint paths found, use max_flow_path
+        if not candidates and max_flow_edge_set:
+            # Re-validate max flow edges against environment indices
+            valid_mf_edges = [edge for edge in max_flow_edge_set if edge in self.edge_to_index or (edge[1], edge[0]) in self.edge_to_index]
+            
+            if valid_mf_edges:
+                possible_seq = None
+                if len(valid_mf_edges) >= 2:
+                    start_idx = random.randint(0, len(valid_mf_edges) - 2)
+                    possible_seq = valid_mf_edges[start_idx : start_idx + 2]
+                else:
+                    possible_seq = valid_mf_edges
+                
+                if possible_seq is not None:
+                    candidates.append(possible_seq)
+        
+        # 4. Filter Candidates based on Capacity Bottleneck (Heuristic: prefer paths with high capacity)
         if not candidates:
-            pool_source = [edge for edge in max_flow_edge_set if edge in self.edge_to_index or (edge[1], edge[0]) in self.edge_to_index]
-            start_idx = random.randint(0, len(pool_source) - 2)
-            candidates.append(pool_source[start_idx : start_idx + 2])
-
-        if len(candidates)<=1:
-            best_path=candidates
+             best_path = []
+        elif len(candidates) == 1:
+            best_path = candidates[0]
         else:
             candidates_with_caps = []
             for seg in candidates:
@@ -1120,18 +1133,19 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         # 6. Set Final Objective
         final_objective = np.zeros(self.max_num_edges, dtype=int)
         
-        for edge in best_path:
-            # Coerce list/ndarray edges to tuple to allow dict membership checks
-            if not isinstance(edge, tuple):
-                try:
-                    edge = tuple(edge)
-                except Exception:
-                    pass
-            # Mark ONLY forward (directed) edge
-            if edge in self.edge_to_index:
-                final_objective[self.edge_to_index[edge]] = 1
-            elif (edge[1], edge[0]) in self.edge_to_index:
-                final_objective[self.edge_to_index[(edge[1], edge[0])]] = 1
+        if best_path:
+            for edge in best_path:
+                # Coerce list/ndarray edges to tuple to allow dict membership checks
+                if not isinstance(edge, tuple):
+                    try:
+                        edge = tuple(edge)
+                    except Exception:
+                        pass
+                # Mark ONLY forward (directed) edge
+                if edge in self.edge_to_index:
+                    final_objective[self.edge_to_index[edge]] = 1
+                elif (edge[1], edge[0]) in self.edge_to_index:
+                    final_objective[self.edge_to_index[(edge[1], edge[0])]] = 1
 
         return {**base_state, 'canalize_objective': final_objective}
 
