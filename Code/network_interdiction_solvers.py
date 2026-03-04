@@ -419,7 +419,7 @@ class InterdictionSolverMixin:
             return(self.optimal_model.objVal, interdicted_edges)
         
         else:  #Solve Stochastic Case with Cormican's Formulation      
-            M = 500                       # Number of training episodes
+            M = 200                       # Number of training episodes
             N = 700                   # Number of test episodes
             seed_list = [100, 200, 300]#, 400, 500]
             best_objective_value = 100000    # Big M Value
@@ -2193,10 +2193,115 @@ class InterdictionSolverMixin:
                 # Recompute flows once after batch interdiction
                 self._cache_flow_array()
 
-        else:
-            # Placeholder for other strategies (canalize, isolate, divert)
-            # Default to zero_sum logic for now if not specified
-            _, actions_taken = self.solve_heuristic_interdiction()
+        elif self.attacker_strategy == "divert":  #PICKUP HERE!!!
+            # Identify canalize objective edges
+            target_to_indices = np.where(self.state['divert_to_objective'][:self.num_both_edges] == 1)[0]
+            target_from_indices = np.where(self.state['divert_from_objective'][:self.num_both_edges] == 1)[0]
+            target_to_indices_set = set(target_to_indices)
+            target_from_indices_set = set(target_from_indices)
+
+            # Use _extract_directed_path_edges to get ordered path and nodes
+            path_edges_to = self._extract_directed_path_edges('divert_to_objective')
+            path_edges_from = self._extract_directed_path_edges('divert_from_objective')
+            
+            # derive ordered node sequence
+            node_seq_to = [e[0] for e in path_edges_to] + [path_edges_to[-1][1]]
+            start_node = node_seq_to[0]
+            end_node = node_seq_to[-1]
+            intermediate_nodes_to = set(node_seq_to[1:-1])
+
+            # Edges of interest: incident to intermediate nodes but not part of divert_to objective
+            edges_of_interest_idxs = set()
+            for node in intermediate_nodes_to:
+                connected = self.edge_groups[node].get('in', []) + self.edge_groups[node].get('out', [])
+                for edge in connected:
+                    idx = self.edge_to_index.get(edge)
+                    # Also try reversed orientation if direct lookup fails
+                    if idx is None:
+                        rev = (edge[1], edge[0])
+                        idx = self.edge_to_index.get(rev)
+                    if idx is not None and idx not in target_to_indices_set:
+                        edges_of_interest_idxs.add(idx)
+
+            # Build a single min-cut model that forces an edge from divert_to objective and divert_from objective into the cut
+            cut_model = grb.Model("MinCut_Divert_Targeted", env=self.GUROBI_ENV)
+            cut_model.setParam('OutputFlag', 0)
+
+            p = cut_model.addVars(self.nodes, vtype=grb.GRB.BINARY, name="p")
+            y = cut_model.addVars(self.both_edges, vtype=grb.GRB.BINARY, name="y")
+            z = cut_model.addVars(self.both_edges, vtype=grb.GRB.BINARY, name="z")
+
+            # Use start/end nodes from extracted path
+            cut_model.addConstr(p[start_node] == 0) #start_node
+            cut_model.addConstr(p[1] == 0) #start_node
+            cut_model.addConstr(p[end_node] == 1) #end_node
+            cut_model.addConstr(p[250] == 1) #end_node
+           
+            # Force edges of interest to be interdicted (z==1).
+            for idx in edges_of_interest_idxs:
+                edge = self.both_edges[idx]
+                prob = self.state['edge_interdiction_probability'][idx]
+                # Force interdiction (z==1) when possible. Do NOT force y==1 for edges of interest.
+                if edge in interdictable_set and prob > 1e-9:
+                    cut_model.addConstr(z[edge] == 1)
+
+            # Ensure at least one divert_to objective edge is in the cut (y==1) and none are interdicted (z==0).
+            for idx in target_to_indices:
+                edge = self.both_edges[idx]
+                cut_model.addConstr(z[edge] == 0)
+            cut_model.addConstr(grb.quicksum(y[self.both_edges[idx]] for idx in target_to_indices) >= 1)
+            
+            # Standard min-cut constraints
+            for idx, edge in enumerate(self.both_edges):
+                u, v = edge
+                cut_model.addConstr(y[edge] >= p[v] - p[u])
+                cut_model.addConstr(y[edge] >= p[u] - p[v])
+
+                # Only enforce z <= y for edges that are NOT in edges_of_interest
+                if idx not in edges_of_interest_idxs:
+                    cut_model.addConstr(z[edge] <= y[edge])
+
+                # If edge not interdictable or prob==0, forbid z
+                prob = self.state['edge_interdiction_probability'][idx]
+                if edge not in interdictable_set or prob <= 1e-9:
+                    z[edge].UB = 0
+
+            # Budget constraint: exclude the divert_to objective edges from costing
+            cost_terms = []
+            for idx, edge in enumerate(self.both_edges):
+                if idx in target_to_indices_set:
+                    # skip cost 
+                    continue
+                cost_terms.append(self.state['edge_costs'][idx] * z[edge])
+
+            cut_model.addConstr(grb.quicksum(cost_terms) <= self.state['budget'][0], name="budget")
+
+            # Objective: same as zero_sum: minimize capacity*y - expected reduction from z
+            cut_model.setObjective(
+                grb.quicksum(self.state['edge_capacity'][idx] * y[edge] -
+                             (self.state['edge_capacity'][idx] * self.state['edge_interdiction_probability'][idx] * z[edge])
+                             for idx, edge in enumerate(self.both_edges)),
+                grb.GRB.MINIMIZE
+            )
+
+            cut_model.optimize()
+
+            # Batch apply interdictions from z (but never interdicted canalize objective edges by constraint)
+            if cut_model.status == grb.GRB.OPTIMAL:
+                for idx, edge in enumerate(self.both_edges):
+                    # Skip divert_to objective edges explicitly
+                    if idx in target_to_indices_set:
+                        continue
+                    if z[edge].X > 0.5:
+                        action_idx = self.edge_to_index.get(edge)
+                        if action_idx is not None:
+                            # Update state
+                            self.state['edge_interdicted'][action_idx] += 1
+                            self.state['budget'][0] -= self.state['edge_costs'][action_idx]
+                            actions_taken.append(edge)
+
+                # Recompute flows once after batch interdiction
+                self._cache_flow_array()
             
         # Determine final objective value based on strategy
         if self.attacker_strategy == "zero_sum":
