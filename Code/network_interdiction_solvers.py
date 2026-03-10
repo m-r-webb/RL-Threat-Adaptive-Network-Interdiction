@@ -2887,33 +2887,44 @@ class InterdictionSolverMixin:
                     # Sent to worker -> Worker will report progress
                     continue
 
-                # Temporarily set state to generate mask
-                old_budget = self.state['budget'][0]
-                old_interdicted = self.state['edge_interdicted'].copy()
                 # Apply incremental changes from root to this node (avoid large copies)
                 path_actions = []
                 curr = node
                 while curr.parent:
                     path_actions.append(curr.action_from_parent)
+                    curr = curr.parent
+                path_actions.reverse()
+
+                # Apply increments to self.state to reach node.state
+                for a in path_actions:
+                    self.state['edge_interdicted'][a] += 1
+                    self.state['budget'][0] -= int(self.state['edge_costs'][a])
 
                 # Update flows and cache for mask_fn
                 if self.attacker_strategy == "zero_sum":
-                    _, self.reference_flows = self._compute_objective_and_flows()
+                    stop_val, self.reference_flows = self._compute_objective_and_flows()
+                    stop_val = -stop_val
                 elif self.attacker_strategy == 'canalize':
-                    _, self.reference_flows = self._calculate_canalize_objective_and_flows()
+                    stop_val, self.reference_flows = self._calculate_canalize_objective_and_flows()
                 elif self.attacker_strategy == 'isolate':
-                    _, self.reference_flows = self._calculate_isolate_objective_and_flows()
+                    stop_val, self.reference_flows = self._calculate_isolate_objective_and_flows()
+                    stop_val = -stop_val
                 elif self.attacker_strategy == 'divert':
-                    _, self.reference_flows = self._calculate_divert_objective_and_flows()
-                
+                    stop_val, self.reference_flows = self._calculate_divert_objective_and_flows()
+                else:
+                    stop_val = -float('inf')
+
+                node.stopping_value = stop_val
+
                 self._cache_flow_array()
-                
+
                 action_mask = self.mask_fn()
                 valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
-                
-                # Restore state
-                self.state['budget'][0] = old_budget
-                self.state['edge_interdicted'][:] = old_interdicted
+
+                # Revert incremental changes to restore original driver state
+                for a in reversed(path_actions):
+                    self.state['edge_interdicted'][a] -= 1
+                    self.state['budget'][0] += int(self.state['edge_costs'][a])
 
                 if len(valid_actions) == 0:
                     node.is_terminal = True
@@ -3022,14 +3033,7 @@ class InterdictionSolverMixin:
                 all_nodes.sort(key=lambda x: x.depth, reverse=True)
                 
                 for node in all_nodes:
-                        val = -val
-                    elif self.attacker_strategy == 'canalize':
-                        val, _ = self._calculate_canalize_objective_and_flows()
-                    elif self.attacker_strategy == 'isolate':
-                        val, _ = self._calculate_isolate_objective_and_flows()
-                        val = -val
-                    elif self.attacker_strategy == 'divert':
-                        val, _ = self._calculate_divert_objective_and_flows()
+                    # Compute or retrieve the value of current node (stopping value)
                     if node.stopping_value is not None:
                         val = node.stopping_value
                     else:
