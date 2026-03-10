@@ -102,20 +102,28 @@ class _RemoteEnvWorker:
         # Set config flag
         self.env.enable_outcome_caching = enable_outcome_caching
 
-        # Make a deep, writable copy of the state snapshot to avoid read-only numpy arrays
-        state_copy = copy.deepcopy(state_snapshot)
-        if isinstance(state_copy, dict):
-            for k, v in list(state_copy.items()):
+        # Optimize serialization: Avoid deep copying the entire state.
+        # We only copy the dynamic parts that change during the episode/search.
+        # This allows large static arrays (topology, capacity) to remain read-only/zero-copy.
+        self.state = {}
+        # Keys for dynamic state components that must be writable
+        dynamic_keys = {'budget', 'edge_interdicted'}
+
+        for k, v in state_snapshot.items():
+            if k in dynamic_keys:
+                # Create writable copy for dynamic elements
                 if isinstance(v, np.ndarray):
-                    try:
-                        v = v.copy()
-                        v.setflags(write=True)
-                        state_copy[k] = v
-                    except Exception:
-                        state_copy[k] = np.array(v, copy=True)
+                    self.state[k] = v.copy()
+                elif hasattr(v, 'copy'):
+                    self.state[k] = v.copy()
+                else:
+                    self.state[k] = copy.deepcopy(v)
+            else:
+                # Zero-copy read-only reference for static elements
+                self.state[k] = v
 
         # Restore state on the worker
-        self.env.load_network_from_state(seed, state_copy)
+        self.env.load_network_from_state(seed, self.state)
 
         # Attach shared actors after loading state
         self.env.outcome_memo_actor = outcome_memo_actor
@@ -150,9 +158,14 @@ class _RemoteEnvWorker:
         
         # Local cache of the global alpha value
         local_alpha_cache = -float('inf')
+        pending_alpha_ref = None
+        
+        # Initialize alpha synchronously at the start of the subtree to ensure we have the latest baseline
         if self.alpha_actor:
             try:
                 local_alpha_cache, _ = _ray.get(self.alpha_actor.get.remote())
+                # Start the first async fetch for updates
+                pending_alpha_ref = self.alpha_actor.get.remote()
             except Exception:
                 pass
 
@@ -161,7 +174,7 @@ class _RemoteEnvWorker:
         report_interval = 0.5  # Max 2 reports per second per worker
 
         def maybe_flush_progress():
-            nonlocal local_counter, last_report_time, local_alpha_cache
+            nonlocal local_counter, last_report_time, local_alpha_cache, pending_alpha_ref
             # 1. Check if we have enough accumulated progress (batch size)
             if self.progress_actor is not None and local_counter >= self.progress_granularity:
                 # 2. Check if enough time has passed (throttle)
@@ -173,11 +186,19 @@ class _RemoteEnvWorker:
                         local_counter = 0
                         last_report_time = now
                         
-                        # Sync alpha
-                        if self.alpha_actor:
-                            remote_val, _ = _ray.get(self.alpha_actor.get.remote())
-                            if remote_val > local_alpha_cache:
-                                local_alpha_cache = remote_val
+                        # Sync alpha asynchronously (NON-BLOCKING)
+                        if self.alpha_actor and pending_alpha_ref:
+                            # Check if the future is ready
+                            ready, _ = _ray.wait([pending_alpha_ref], timeout=0)
+                            if ready:
+                                try:
+                                    remote_val, _ = _ray.get(pending_alpha_ref)
+                                    if remote_val > local_alpha_cache:
+                                        local_alpha_cache = remote_val
+                                except Exception:
+                                    pass
+                                # Launch next request
+                                pending_alpha_ref = self.alpha_actor.get.remote()
                     except Exception:
                         pass
 
@@ -339,7 +360,7 @@ class _RemoteEnvWorker:
                 self.env.state['edge_interdicted'][action] -= 1
                 self.env.state['budget'][0] += cost
                 
-                if fut_reward > best_reward:
+                if fut_reward > best_reward + 1e-6:
                     best_reward = fut_reward
                     best_seq = [action] + fut_seq
                     alpha = max(alpha, best_reward)
@@ -351,6 +372,12 @@ class _RemoteEnvWorker:
                             try:
                                 self.alpha_actor.update.remote(alpha)
                             except: pass
+                elif abs(fut_reward - best_reward) <= 1e-6:
+                    # Tie-breaking: favor sequence with the minimal total cost
+                    current_cost = sum(self.env.state['edge_costs'][a] for a in best_seq)
+                    new_cost = self.env.state['edge_costs'][action] + sum(self.env.state['edge_costs'][a] for a in fut_seq)
+                    if new_cost < current_cost:
+                        best_seq = [action] + fut_seq
 
             memo_local[key] = (best_reward, best_seq)
             
@@ -2567,9 +2594,14 @@ class InterdictionSolverMixin:
                     flows = {}
                 
                 # Update incumbent if we found a better terminal value (or stopping here)
-                if val > best_incumbent_reward:
+                if val > best_incumbent_reward + 1e-6:
                     best_incumbent_reward = val
                     best_incumbent_seq = list(path_to_here)
+                elif abs(val - best_incumbent_reward) <= 1e-6:
+                    current_cost = sum(self.state['edge_costs'][a] for a in best_incumbent_seq)
+                    new_cost = sum(self.state['edge_costs'][a] for a in path_to_here)
+                    if new_cost < current_cost:
+                        best_incumbent_seq = list(path_to_here)
 
                 self.reference_flows = flows
                 self._cache_flow_array()
@@ -2644,10 +2676,15 @@ class InterdictionSolverMixin:
                     
                     inter_state[action] -= 1
                     
-                    if fut_reward > best_reward:
+                    if fut_reward > best_reward + 1e-6:
                         best_reward = fut_reward
                         best_seq = [action] + fut_seq
                         alpha = max(alpha, best_reward)
+                    elif abs(fut_reward - best_reward) <= 1e-6:
+                        current_cost = sum(self.state['edge_costs'][a] for a in best_seq)
+                        new_cost = self.state['edge_costs'][action] + sum(self.state['edge_costs'][a] for a in fut_seq)
+                        if new_cost < current_cost:
+                            best_seq = [action] + fut_seq
                         
                 if enable_memoization:
                     memo_serial[key] = (best_reward, best_seq)
@@ -2789,6 +2826,7 @@ class InterdictionSolverMixin:
                     self.children = [] # List of TreeNodes
                     self.is_terminal = False
                     self.value = None
+                    self.stopping_value = None
                     self.best_sequence = []
                     self.key = state[:num_edges_limit].tobytes()
 
@@ -2852,8 +2890,11 @@ class InterdictionSolverMixin:
                 # Temporarily set state to generate mask
                 old_budget = self.state['budget'][0]
                 old_interdicted = self.state['edge_interdicted'].copy()
-                self.state['budget'][0] = node.budget
-                self.state['edge_interdicted'][:] = node.state
+                # Apply incremental changes from root to this node (avoid large copies)
+                path_actions = []
+                curr = node
+                while curr.parent:
+                    path_actions.append(curr.action_from_parent)
 
                 # Update flows and cache for mask_fn
                 if self.attacker_strategy == "zero_sum":
@@ -2944,10 +2985,16 @@ class InterdictionSolverMixin:
                             prefix.reverse()
                             full_seq = prefix + seq
                             
-                            if val > best_incumbent_val:
+                            if val > best_incumbent_val + 1e-6:
                                 best_incumbent_val = val
                                 best_incumbent_seq = full_seq
                                 alpha_actor.update.remote(val, full_seq)
+                            elif abs(val - best_incumbent_val) <= 1e-6:
+                                current_cost = sum(self.state['edge_costs'][a] for a in best_incumbent_seq)
+                                new_cost = sum(self.state['edge_costs'][a] for a in full_seq)
+                                if new_cost < current_cost:
+                                    best_incumbent_seq = full_seq
+                                    alpha_actor.update.remote(val, full_seq)
 
                             # Cache result in driver memo
                             if enable_memoization:
@@ -2975,15 +3022,6 @@ class InterdictionSolverMixin:
                 all_nodes.sort(key=lambda x: x.depth, reverse=True)
                 
                 for node in all_nodes:
-                    # Compute value of current node (stopping value)
-                    # Temporarily set state
-                    old_budget = self.state['budget'][0]
-                    old_interdicted = self.state['edge_interdicted'].copy()
-                    self.state['budget'][0] = node.budget
-                    self.state['edge_interdicted'][:] = node.state
-                    
-                    if self.attacker_strategy == "zero_sum":
-                        val, _ = self._compute_objective_and_flows()
                         val = -val
                     elif self.attacker_strategy == 'canalize':
                         val, _ = self._calculate_canalize_objective_and_flows()
@@ -2992,11 +3030,33 @@ class InterdictionSolverMixin:
                         val = -val
                     elif self.attacker_strategy == 'divert':
                         val, _ = self._calculate_divert_objective_and_flows()
+                    if node.stopping_value is not None:
+                        val = node.stopping_value
                     else:
-                        val = -float('inf')
-                    
-                    self.state['budget'][0] = old_budget
-                    self.state['edge_interdicted'][:] = old_interdicted
+                        # Fallback for leaves or dynamically generated parts missing the cached value
+                        if node.children or node.value is None:
+                            old_budget = self.state['budget'][0]
+                            old_interdicted = self.state['edge_interdicted'].copy()
+                            self.state['budget'][0] = node.budget
+                            self.state['edge_interdicted'][:] = node.state
+                            
+                            if self.attacker_strategy == "zero_sum":
+                                val, _ = self._compute_objective_and_flows()
+                                val = -val
+                            elif self.attacker_strategy == 'canalize':
+                                val, _ = self._calculate_canalize_objective_and_flows()
+                            elif self.attacker_strategy == 'isolate':
+                                val, _ = self._calculate_isolate_objective_and_flows()
+                                val = -val
+                            elif self.attacker_strategy == 'divert':
+                                val, _ = self._calculate_divert_objective_and_flows()
+                            else:
+                                val = -float('inf')
+                            
+                            self.state['budget'][0] = old_budget
+                            self.state['edge_interdicted'][:] = old_interdicted
+                        else:
+                            val = -float('inf') # Will not be used below since node.value is already set for leaves
 
                     if node.children:
                         # This is an internal node in our expanded tree.
@@ -3010,9 +3070,14 @@ class InterdictionSolverMixin:
                                 # Should not happen if logic is correct
                                 continue
                                 
-                            if child.value > best_val:
+                            if child.value > best_val + 1e-6:
                                 best_val = child.value
                                 best_seq = [child.action_from_parent] + child.best_sequence
+                            elif abs(child.value - best_val) <= 1e-6:
+                                current_cost = sum(self.state['edge_costs'][a] for a in best_seq)
+                                new_cost = self.state['edge_costs'][child.action_from_parent] + sum(self.state['edge_costs'][a] for a in child.best_sequence)
+                                if new_cost < current_cost:
+                                    best_seq = [child.action_from_parent] + child.best_sequence
                         
                         node.value = best_val
                         node.best_sequence = best_seq
