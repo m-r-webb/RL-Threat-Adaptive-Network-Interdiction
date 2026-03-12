@@ -2066,41 +2066,45 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
 
         visited_nodes = set(target_nodes)
         incoming_edge_indices = set()
+        
+        # Precompute the boolean map of edges with flow for O(1) lookup
+        has_flow_array = self.cached_flow_array[:self.num_both_edges] > 1e-6
 
-        while target_nodes:
-            arrival_in_targets = np.isin(self.edge_arrivals, list(target_nodes))
-            has_flow = (self.cached_flow_array[:self.num_both_edges]) > 1e-6
-            valid_edge_indices = np.where(arrival_in_targets & has_flow)[0]
+        # Standard queue-based BFS using the pre-computed edge_groups adjacency dictionary
+        queue = list(target_nodes)
+        
+        while queue:
+            curr_node = queue.pop(0)
             
-            if is_canalize:
-                # Traceback logic for canalize: filter out tracing THROUGH objective edges
-                indices_to_trace = []
-                for idx in valid_edge_indices:
-                    incoming_edge_indices.add(idx)
-                    # If edge is NOT in objective, we can trace back from its start node.
-                    # If it IS in objective, we record it (protected) but STOP tracing this branch.
-                    if idx not in objective_edge_indices:
-                        indices_to_trace.append(idx)
-                
-                if indices_to_trace:
-                     new_target_nodes = set([self.both_edges[i][0] for i in indices_to_trace])
-                else:
-                     new_target_nodes = set()
-            else:
-                incoming_edge_indices.update(valid_edge_indices)
-                new_target_nodes = set([self.both_edges[idx][0] for idx in valid_edge_indices])
-    
-            # Remove already visited nodes
-            target_nodes = new_target_nodes - visited_nodes
-    
-            # Add newly discovered nodes to visited set
-            visited_nodes.update(target_nodes)
+            # Check incoming edges to the current node
+            if curr_node in self.edge_groups:
+                for edge in self.edge_groups[curr_node]['in']:
+                    edge_idx = self.edge_to_index.get(edge)
+                    if edge_idx is None:
+                        continue
+                        
+                    # Only traverse if the edge actually has flow
+                    if has_flow_array[edge_idx]:
+                        if is_canalize:
+                            incoming_edge_indices.add(edge_idx)
+                            # Stop tracing this branch if we hit a protected objective edge
+                            if edge_idx not in objective_edge_indices:
+                                prev_node = edge[0]
+                                if prev_node not in visited_nodes:
+                                    visited_nodes.add(prev_node)
+                                    queue.append(prev_node)
+                        else:
+                            incoming_edge_indices.add(edge_idx)
+                            prev_node = edge[0]
+                            if prev_node not in visited_nodes:
+                                visited_nodes.add(prev_node)
+                                queue.append(prev_node)
     
 #        incoming_edges_with_flow = [self.both_edges[idx] for idx in incoming_edge_indices]
         action_mask = np.zeros(self.num_both_edges, dtype=bool)
         if incoming_edge_indices:
             action_mask[list(incoming_edge_indices)] = True
-        return(action_mask)
+        return action_mask
 
     def mask_fn(self):
         """
