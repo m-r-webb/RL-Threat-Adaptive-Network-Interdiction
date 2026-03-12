@@ -26,6 +26,8 @@ from sklearn.ensemble import RandomForestClassifier
 
 import ray
 
+import networkx as nx
+
 # Reduce native logging noise (best-effort; affects Python loggers)
 import logging
 logging.getLogger("ray").setLevel(logging.WARNING)
@@ -361,6 +363,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
     def _subtour_callback(self, model, where):
         """Callback to eliminate subtours efficiently."""
         if where == grb.GRB.Callback.MIPSOL:
+                
             vals = model.cbGetSolution(self.edge_used)
             # Filter edges with value > 0.5
             selected_edges = [e for e, v in vals.items() if v > 0.5]
@@ -373,52 +376,69 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                 expr = grb.quicksum(self.edge_used[e] for e in cycle)
                 model.cbLazy(expr <= len(cycle) - 1)
 
-    def _find_cycles(self, edges):
+    def _find_cycles(self, edges, use_networkx=True):
         """Find cycles in solution graph using targeted BFS on sensitive edges."""
         if not hasattr(self, 'sensitive_edges') or not self.sensitive_edges:
              return []
-        
-        adj = defaultdict(list)
+                     
         active_edges_set = set(edges)
-        for u, v in edges:
-            adj[u].append(v)
-        
+        active_sensitive = [e for e in self.sensitive_edges if e in active_edges_set]
         cycles = []
         
-        # Identify which sensitive edges are currently active
-        active_sensitive = [e for e in self.sensitive_edges if e in active_edges_set]
-        
-        for u, v in active_sensitive:
-            if len(cycles) >= 20: break
+        if use_networkx:
+            G = nx.DiGraph()
+            G.add_edges_from(edges)
             
-            # BFS to find shortest path from v back to u
-            # This confirms a cycle passing through (u, v)
-            queue = [(v, [v])]
-            visited = {v}
-            found_path = None
-            
-            while queue:
-                curr, path = queue.pop(0)
-                if curr == u:
-                    found_path = path
-                    break
-                
-                # Limit depth to avoid large search in complex graphs
-                if len(path) > 20: 
+            for u, v in active_sensitive:
+                if len(cycles) >= 20: break
+                try:
+                    # Find shortest path from v back to u to complete the cycle
+                    # Using nx.shortest_path is highly optimized compared to custom BFS
+                    path = nx.shortest_path(G, source=v, target=u)
+                    if len(path) <= 20: # Limiting length to match old behavior
+                        cycle_edges = [(u, v)]
+                        for i in range(len(path) - 1):
+                            cycle_edges.append((path[i], path[i+1]))
+                        cycles.append(cycle_edges)
+                except nx.NetworkXNoPath:
                     continue
-
-                for neighbor in adj[curr]:
-                    if neighbor not in visited:
-                        visited.add(neighbor)
-                        queue.append((neighbor, path + [neighbor]))
+        else:
+            # ORIGINAL CUSTOM BFS
+            adj = defaultdict(list)
+            for u, v in edges:
+                adj[u].append(v)
             
-            if found_path:
-                # Cycle found: (u, v) + (v -> ... -> u)
-                cycle_edges = [(u, v)]
-                for i in range(len(found_path) - 1):
-                    cycle_edges.append((found_path[i], found_path[i+1]))
-                cycles.append(cycle_edges)
+            for u, v in active_sensitive:
+                if len(cycles) >= 20: break
                 
+                # BFS to find shortest path from v back to u
+                # This confirms a cycle passing through (u, v)
+                queue = [(v, [v])]
+                visited = {v}
+                found_path = None
+                
+                while queue:
+                    curr, path = queue.pop(0)
+                    if curr == u:
+                        found_path = path
+                        break
+                    
+                    # Limit depth to avoid large search in complex graphs
+                    if len(path) > 20: 
+                        continue
+    
+                    for neighbor in adj[curr]:
+                        if neighbor not in visited:
+                            visited.add(neighbor)
+                            queue.append((neighbor, path + [neighbor]))
+                
+                if found_path:
+                    # Cycle found: (u, v) + (v -> ... -> u)
+                    cycle_edges = [(u, v)]
+                    for i in range(len(found_path) - 1):
+                        cycle_edges.append((found_path[i], found_path[i+1]))
+                    cycles.append(cycle_edges)
+            
         return cycles 
 
     def _initialize_maxflow_model(self):
@@ -426,7 +446,8 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         # Ensure a per-instance Gurobi environment (safe for multiprocessing workers)
         if getattr(self, 'GUROBI_ENV', None) is None:
             try:
-                self.GUROBI_ENV = grb.Env(params={"OutputFlag": 0, "LogToConsole": 0, "Threads": 1, "Seed": 1})#, "TimeLimit": 10})
+                # Added TimeLimit and MIPGap to prevent the solver from hanging on proving optimality
+                self.GUROBI_ENV = grb.Env(params={"OutputFlag": 0, "LogToConsole": 0, "Threads": 2, "Seed": 1, "TimeLimit": 15, "MIPGap": 0.02, "MIPFocus": 1})
             except Exception as e:
                 self.GUROBI_ENV = None
         try:
