@@ -406,7 +406,7 @@ class InterdictionSolverMixin:
     Mixin containing optimization and machine learning solver methods for Network Interdiction.
     """
 
-    def solve_optimal_interdiction(self, method='monolithic', threads=None):
+    def solve_optimal_interdiction(self, method='monolithic', threads=None, time_limit=None):
         if self.deterministic_outcomes == True:
             # Deterministic: Solve using Model 1D
             if not hasattr(self, 'optimal_model'):
@@ -415,6 +415,9 @@ class InterdictionSolverMixin:
 
             if threads is not None:
                 self.optimal_model.setParam("Threads", threads)
+            
+            if time_limit is not None:
+                self.optimal_model.setParam("TimeLimit", time_limit)
                 
             if not hasattr(self, 'gamma'):
                 # Creating decision variables
@@ -459,7 +462,7 @@ class InterdictionSolverMixin:
             # Test multiple solutions
             for seed, n_scens in tasks:
                 if self.multiple_interdiction_attempts:
-                    objective_value, interdicted_edges, interdicted_quantities = self.solve_stochastic_max_flow_IM(n_scenarios=n_scens, seed=seed, method=method, threads=threads)
+                    objective_value, interdicted_edges, interdicted_quantities = self.solve_stochastic_max_flow_IM(n_scenarios=n_scens, seed=seed, method=method, threads=threads, time_limit=time_limit)
                     
                     # Create dense vector for key (values > 1 allowed)
                     interdiction_vector = np.zeros(len(self.both_edges), dtype=int)
@@ -469,7 +472,7 @@ class InterdictionSolverMixin:
                     interdicted_key = tuple(interdiction_vector)
                     
                 else:
-                    objective_value, interdicted_edges = self.solve_stochastic_max_flow(n_scenarios=n_scens, seed=seed, method=method, threads=threads)
+                    objective_value, interdicted_edges = self.solve_stochastic_max_flow(n_scenarios=n_scens, seed=seed, method=method, threads=threads, time_limit=time_limit)
                     
                     # Create dense vector for key (binary)
                     interdiction_vector = np.zeros(len(self.both_edges), dtype=int)
@@ -483,7 +486,7 @@ class InterdictionSolverMixin:
                     unique_interdicted_sets.append(interdicted_key)       
 
                     if self.multiple_interdiction_attempts:
-                        objective_value, interdicted_edges, interdicted_quantities = self.solve_stochastic_max_flow_IM(n_scenarios=N, interdicted_edges=interdicted_edges, interdicted_quantities=interdicted_quantities, method=method, threads=threads)
+                        objective_value, interdicted_edges, interdicted_quantities = self.solve_stochastic_max_flow_IM(n_scenarios=N, interdicted_edges=interdicted_edges, interdicted_quantities=interdicted_quantities, method=method, threads=threads, time_limit=time_limit)
                         # Expand for return value
                         current_solution = []
                         for e, k in zip(interdicted_edges, interdicted_quantities):
@@ -530,7 +533,7 @@ class InterdictionSolverMixin:
             
         return objective
 
-    def _solve_stochastic_decomposition(self, n_scenarios, seed, interdicted_edges, threads=None):
+    def _solve_stochastic_decomposition(self, n_scenarios, seed, interdicted_edges, threads=None, time_limit=None):
         np.random.seed(seed)
         
         # 1. Generate Scenarios (Consistent with Monolithic)
@@ -538,10 +541,13 @@ class InterdictionSolverMixin:
         scenario_outcomes = np.random.binomial(1, probs, size=(n_scenarios, len(self.both_edges)))
         
         # 2. Master Problem
+        start_time = time.time()
         master = grb.Model("Master_Benders", env=self.GUROBI_ENV)
         
         if threads is not None:
             master.setParam("Threads", threads)
+        if time_limit is not None:
+            master.setParam("TimeLimit", time_limit)
 
         gamma = master.addVars(self.both_edges, vtype=grb.GRB.BINARY, name="gamma")
         theta = master.addVar(lb=0, name="theta")
@@ -572,6 +578,9 @@ class InterdictionSolverMixin:
         x_hat = {}
 
         for iteration in range(max_iter):
+            if time_limit is not None and time.time() - start_time > time_limit:
+                break
+                
             master.optimize()
             if master.status != grb.GRB.OPTIMAL:
                 break
@@ -639,7 +648,7 @@ class InterdictionSolverMixin:
         interdicted = [e for e in self.both_edges if x_hat.get(e, 0) > 0.5]
         return UB, interdicted
 
-    def _solve_stochastic_decomposition_IM(self, n_scenarios, seed, interdicted_edges, interdicted_quantities, threads=None):
+    def _solve_stochastic_decomposition_IM(self, n_scenarios, seed, interdicted_edges, interdicted_quantities, threads=None, time_limit=None):
         np.random.seed(seed)
         
         # 1. Generate Scenarios (Same as Monolithic IM)
@@ -653,10 +662,13 @@ class InterdictionSolverMixin:
         interdictable_edge_map = {e: i for i, e in enumerate(self.interdictable_edges)}
         
         # 2. Master Problem
+        start_time = time.time()
         master = grb.Model("Master_Benders_IM", env=self.GUROBI_ENV)
 
         if threads is not None:
             master.setParam("Threads", threads)
+        if time_limit is not None:
+            master.setParam("TimeLimit", time_limit)
         
         # Variables: gamma[e, k]
         gamma_indices = [(e, k) for e in self.interdictable_edges for k in range(1, self.max_interdictions + 1)]
@@ -692,6 +704,9 @@ class InterdictionSolverMixin:
         x_hat = {}
 
         for iteration in range(max_iter):
+            if time_limit is not None and time.time() - start_time > time_limit:
+                break
+                
             master.optimize()
             if master.status != grb.GRB.OPTIMAL:
                 break
@@ -763,9 +778,9 @@ class InterdictionSolverMixin:
                     
         return UB, interdicted, quantities
 
-    def solve_stochastic_max_flow(self, n_scenarios = 50, seed = 173, interdicted_edges = [], method='monolithic', threads=None):
+    def solve_stochastic_max_flow(self, n_scenarios = 50, seed = 173, interdicted_edges = [], method='monolithic', threads=None, time_limit=None):
         if method == 'decomposition':
-            return self._solve_stochastic_decomposition(n_scenarios, seed, interdicted_edges, threads=threads)
+            return self._solve_stochastic_decomposition(n_scenarios, seed, interdicted_edges, threads=threads, time_limit=time_limit)
 
         # Optimally Solve for Stochastic Solution using Model 1U and SAA
         if not hasattr(self, 'optimal_stochastic_model'):
@@ -774,6 +789,8 @@ class InterdictionSolverMixin:
 
         if threads is not None:
             self.optimal_stochastic_model.setParam("Threads", threads)
+        if time_limit is not None:
+            self.optimal_stochastic_model.setParam("TimeLimit", time_limit)
 
         if not hasattr(self, 'stochastic_gamma'):
             # Creating decision variables
@@ -1620,9 +1637,9 @@ class InterdictionSolverMixin:
             
         return objective_value, selected_edges
 
-    def solve_stochastic_max_flow_IM(self, n_scenarios = 50, seed = 173, interdicted_edges = [], interdicted_quantities =[], method='monolithic', threads=None):
+    def solve_stochastic_max_flow_IM(self, n_scenarios = 50, seed = 173, interdicted_edges = [], interdicted_quantities =[], method='monolithic', threads=None, time_limit=None):
         if method == 'decomposition':
-            return self._solve_stochastic_decomposition_IM(n_scenarios, seed, interdicted_edges, interdicted_quantities, threads=threads)
+            return self._solve_stochastic_decomposition_IM(n_scenarios, seed, interdicted_edges, interdicted_quantities, threads=threads, time_limit=time_limit)
 
         # Optimally Solve for Stochastic Solution using Model 1D and SAA
         if not hasattr(self, 'optimal_stochastic_model_IM'):
@@ -1631,6 +1648,8 @@ class InterdictionSolverMixin:
 
         if threads is not None:
             self.optimal_stochastic_model_IM.setParam("Threads", threads)
+        if time_limit is not None:
+            self.optimal_stochastic_model_IM.setParam("TimeLimit", time_limit)
         
         if not hasattr(self, 'stochastic_gamma_IM'):
             # Creating decision variables

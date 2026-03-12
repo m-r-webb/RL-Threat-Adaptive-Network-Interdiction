@@ -191,20 +191,23 @@ else:
                 
                 obs = env.reset(seed=episode)
                 env.render(indices = 3)
+                
+                time_limit_sec = 3600 # 1 hour time limit
+                
                 if env_params['attacker_strategy'] == "zero_sum":
                     start_time = time.perf_counter()
                     if version_type == 'opt_m':
-                        optimal_obj_val, optimal_interdiction_edges = env.solve_optimal_interdiction(method=opt_method) 
+                        optimal_obj_val, optimal_interdiction_edges = env.solve_optimal_interdiction(method=opt_method, time_limit=time_limit_sec) 
                     elif version_type == "opt_d":
-                        optimal_obj_val, optimal_interdiction_edges = env.solve_optimal_interdiction(method=opt_method) 
+                        optimal_obj_val, optimal_interdiction_edges = env.solve_optimal_interdiction(method=opt_method, time_limit=time_limit_sec) 
                     elif version_type == 'bi':
                         # Reduced n_workers to avoid thread resource exhaustion
-                        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = num_cpus_run-6, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True,  rl_model_path=model_path) 
+                        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = num_cpus_run-6, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True,  rl_model_path=model_path, time_limit=time_limit_sec) 
                     end_time = time.perf_counter()
                 else:
                     start_time = time.perf_counter()
                     # Reduced n_workers to avoid thread resource exhaustion
-                    optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = num_cpus_run-6, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True,  rl_model_path=model_path) 
+                    optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = num_cpus_run-6, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True,  rl_model_path=model_path, time_limit=time_limit_sec) 
                     end_time = time.perf_counter()
                 
                 solve_time = end_time - start_time
