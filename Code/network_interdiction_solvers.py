@@ -78,7 +78,7 @@ class _RemoteEnvWorker:
                  num_both_edges, deterministic_outcomes, multiple_interdiction_attempts,
                  progress_actor=None, memo_actors=None, budget_levels=1, progress_granularity=50,
                  max_depth_inner=100, outcome_memo_actor=None, outcome_memo_actors=None, alpha_actor=None,
-                 enable_outcome_caching=True, enable_alpha_pruning=True, sample_size=1000):
+                 enable_outcome_caching=True, enable_alpha_pruning=True, sample_size=1000, jitter=False):
         """
         Worker now accepts a progress_actor handle, a shared memo_actor handle,
         and budget_levels so it can estimate progress for invalid actions.
@@ -101,6 +101,7 @@ class _RemoteEnvWorker:
         
         # Set config flag
         self.env.enable_outcome_caching = enable_outcome_caching
+        self.env.jitter = jitter
 
         # Optimize serialization: Avoid deep copying the entire state.
         # We only copy the dynamic parts that change during the episode/search.
@@ -2405,7 +2406,7 @@ class InterdictionSolverMixin:
 
     # --- Re-add solve_backward_induction_ray method to Mixin ---
     
-    def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=None, ray_address=None, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, rl_model_path=None, time_limit=3600):
+    def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=None, ray_address=None, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, rl_model_path=None, time_limit=3600, jitter=False):
         """
         Parallelized backward induction using Ray with Adaptive Frontier Expansion.
         """
@@ -2423,6 +2424,7 @@ class InterdictionSolverMixin:
 
         # Propagate caching flag to driver for heuristic usage
         self.enable_outcome_caching = enable_outcome_caching
+        self.jitter = jitter
         if self.enable_outcome_caching:
              self.local_outcome_cache = {}
 
@@ -2839,7 +2841,8 @@ class InterdictionSolverMixin:
                     alpha_actor=alpha_actor,
                     enable_outcome_caching=enable_outcome_caching,
                     enable_alpha_pruning=enable_alpha_pruning,
-                    sample_size=self.SAMPLE_SIZE
+                    sample_size=self.SAMPLE_SIZE,
+                    jitter=jitter
                 )
                 for _ in range(n_workers)
             ]
@@ -2901,7 +2904,7 @@ class InterdictionSolverMixin:
             
             # Target number of tasks to generate (e.g., 4x workers ensures good balancing)
             # TWEAK THIS: Higher = more small tasks (better balancing, more overhead)
-            TARGET_TASKS = n_workers * 50 
+            TARGET_TASKS = n_workers * 10 
             
             # Local memoization for the driver expansion phase
             memo_driver = {}

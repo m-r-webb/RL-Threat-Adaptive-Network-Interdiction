@@ -322,6 +322,22 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         # Solve and return results
         self.maxflow_model.params.Seed = 1
         
+        # Jitter Configuration (Robustness)
+        # Check depth (number of interdictions already placed)
+        current_depth = self.state['edge_interdicted'].sum()
+        use_jitter = getattr(self, 'jitter', False) and (current_depth <= 3)
+
+        if use_jitter:
+            # Find up to 10 optimal solutions to extract common edges
+            self.maxflow_model.setParam('PoolSearchMode', 2)
+            self.maxflow_model.setParam('PoolGap', 0.0)
+            self.maxflow_model.setParam('PoolSolutions', 10)
+        else:
+            # Standard single solution
+            self.maxflow_model.setParam('PoolSearchMode', 0)
+            self.maxflow_model.setParam('PoolSolutions', 1)
+
+        self.sensitive_edges = []
         callback = None
         if routing_assumption in ['divert', 'canalize', 'isolate']:
             self._update_sensitive_edges(routing_assumption)
@@ -339,8 +355,31 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         if status == grb.GRB.OPTIMAL:
             # Use strict values without rounding to avoid flipping behavior near .5 boundaries
             obj_val = self.maxflow_model.ObjVal
-            # Rounding flows is safer for interpretation but obj_val should be precise
-            flow_results = {e: var.X for e, var in self.flow_var.items()}
+            
+            if use_jitter and self.maxflow_model.SolCount > 1:
+                # Robust Interdiction: Take minimum flow across all optimal solutions found
+                # This ensures we only identify edges that are CRITICAL (used in all equivalent paths)
+                
+                # Identify sensitive (objective) edges that should preserve their specific flow value
+                sensitive_set = set(self.sensitive_edges)
+
+                # Initialize with first solution
+                self.maxflow_model.setParam(grb.GRB.Param.SolutionNumber, 0)
+                final_flows = {e: var.Xn for e, var in self.flow_var.items()}
+                
+                # Iterate through other solutions in pool
+                for k in range(1, self.maxflow_model.SolCount):
+                    self.maxflow_model.setParam(grb.GRB.Param.SolutionNumber, k)
+                    
+                    # Take element-wise minimum, but preserve first solution for sensitive edges
+                    for e, var in self.flow_var.items():
+                        if not (e in sensitive_set or (e[1], e[0]) in sensitive_set):
+                            final_flows[e] = min(final_flows[e], var.Xn)
+                
+                flow_results = final_flows
+            else:
+                # Rounding flows is safer for interpretation but obj_val should be precise
+                flow_results = {e: var.X for e, var in self.flow_var.items()}
         else:
             obj_val = 0
             flow_results = {e: 0 for e in self.flow_var.keys()}
