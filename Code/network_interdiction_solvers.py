@@ -2044,18 +2044,28 @@ class InterdictionSolverMixin:
 
         return objVal, actions_taken
 
-    def solve_min_cut_heuristic(self):
+    def solve_min_cut_heuristic(self, return_details=False):
         """
         Executes a Min-Cut Heuristic solver on the current environment state.
         
         Variations:
         - Zero Sum: Min-cut separates Super Source from Super Sink.
         - Isolate: Min-cut separates Super Source from target nodes in isolate_objective.
+
+        Args:
+            return_details (bool): If True, returns (objVal, actions_taken, cut_set, node_partitions),
+                                   where cut_set is the set of edges in the min-cut (y=1)
+                                   and node_partitions is a dict of node -> 0/1 (p values).
+                                   If False, returns (objVal, actions_taken).
         """
         actions_taken = []
         num_interdictable = len(self.interdictable_edges)
         interdictable_set = set(self.interdictable_edges)
         
+        # Variables to store extra details if requested
+        cut_set = set()
+        node_partitions = {}
+
         if self.attacker_strategy in ["zero_sum", "isolate"]:
             # 1. Compute Min Cut using Gurobi
             cut_model = grb.Model("MinCut_Heuristic", env=self.GUROBI_ENV)
@@ -2120,6 +2130,15 @@ class InterdictionSolverMixin:
             
             # Interdict edges where z[edge].X is 1 - Batch Update
             if cut_model.status == grb.GRB.OPTIMAL:
+                if return_details:
+                     # Capture all cut edges (y=1)
+                     for edge in self.both_edges:
+                         if y[edge].X > 0.5:
+                             cut_set.add(edge)
+                     # Capture partitions (p values)
+                     for node in self.nodes:
+                         node_partitions[node] = int(round(p[node].X))
+
                 for idx, edge in enumerate(self.both_edges):
                     if z[edge].X > 0.5:
                         action_idx = self.edge_to_index.get(edge)
@@ -2224,6 +2243,15 @@ class InterdictionSolverMixin:
 
             # Batch apply interdictions from z (but never interdicted canalize objective edges by constraint)
             if cut_model.status == grb.GRB.OPTIMAL:
+                if return_details:
+                     # Capture all cut edges (y=1)
+                     for edge in self.both_edges:
+                         if y[edge].X > 0.5:
+                             cut_set.add(edge)
+                     # Capture partitions (p values)
+                     for node in self.nodes:
+                         node_partitions[node] = int(round(p[node].X))
+
                 for idx, edge in enumerate(self.both_edges):
                     # Skip canalize objective edges explicitly
                     if idx in target_indices_set:
@@ -2334,6 +2362,15 @@ class InterdictionSolverMixin:
 
             # Batch apply interdictions from z (but never interdicted canalize objective edges by constraint)
             if cut_model.status == grb.GRB.OPTIMAL:
+                if return_details:
+                     # Capture all cut edges (y=1)
+                     for edge in self.both_edges:
+                         if y[edge].X > 0.5:
+                             cut_set.add(edge)
+                     # Capture partitions (p values)
+                     for node in self.nodes:
+                         node_partitions[node] = int(round(p[node].X))
+
                 for idx, edge in enumerate(self.both_edges):
                     # Skip divert_to objective edges explicitly
                     if idx in target_to_indices_set:
@@ -2361,7 +2398,10 @@ class InterdictionSolverMixin:
         else:
             objVal, _ = self._compute_objective_and_flows()
 
-        return objVal, actions_taken
+        if return_details:
+            return objVal, actions_taken, cut_set, node_partitions
+        else:
+            return objVal, actions_taken
 
     # --- Re-add solve_backward_induction_ray method to Mixin ---
     
