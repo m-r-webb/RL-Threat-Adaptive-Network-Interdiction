@@ -325,17 +325,20 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         # Jitter Configuration (Robustness)
         # Check depth (number of interdictions already placed)
         current_depth = self.state['edge_interdicted'].sum()
-        use_jitter = getattr(self, 'jitter', False) and (current_depth <= 3)
+        
+        current_budget = self.state['budget'][0]
+        # In case solve_max_flow is called during reset before num_interdictable is set
+        limit = getattr(self, 'num_interdictable', self.num_both_edges)
+        min_cost = np.min(self.state['edge_costs'][:limit]) if limit > 0 else 0
+        has_budget = current_budget >= min_cost
 
-        if use_jitter:
-            # Find up to 10 optimal solutions to extract common edges
-            self.maxflow_model.setParam('PoolSearchMode', 2)
-            self.maxflow_model.setParam('PoolGap', 0.0)
-            self.maxflow_model.setParam('PoolSolutions', 10)
-        else:
-            # Standard single solution
-            self.maxflow_model.setParam('PoolSearchMode', 0)
-            self.maxflow_model.setParam('PoolSolutions', 1)
+        # Jitter configuration
+        # Use robustness only if we have budget for another interdiction and depth is low
+        use_jitter = getattr(self, 'jitter', False) and has_budget
+
+        # Standard single solution
+        self.maxflow_model.setParam('PoolSearchMode', 0)
+        self.maxflow_model.setParam('PoolSolutions', 1)
 
         self.sensitive_edges = []
         callback = None
@@ -356,27 +359,98 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             # Use strict values without rounding to avoid flipping behavior near .5 boundaries
             obj_val = self.maxflow_model.ObjVal
             
-            if use_jitter and self.maxflow_model.SolCount > 1:
-                # Robust Interdiction: Take minimum flow across all optimal solutions found
-                # This ensures we only identify edges that are CRITICAL (used in all equivalent paths)
+            if use_jitter:
+                # Robust Interdiction: Iterative minimization of common flow edges
+                # 1. Solution A (current optimal)
+                flow_results_A = {e: var.X for e, var in self.flow_var.items()}
+                original_obj_val = obj_val
                 
-                # Identify sensitive (objective) edges that should preserve their specific flow value
+                all_flows = [flow_results_A]
                 sensitive_set = set(self.sensitive_edges)
-
-                # Initialize with first solution
-                self.maxflow_model.setParam(grb.GRB.Param.SolutionNumber, 0)
-                final_flows = {e: var.Xn for e, var in self.flow_var.items()}
                 
-                # Iterate through other solutions in pool
-                for k in range(1, self.maxflow_model.SolCount):
-                    self.maxflow_model.setParam(grb.GRB.Param.SolutionNumber, k)
+                # Get the current objective expression to add as constraint
+                try:
+                    original_objective_expr = self.maxflow_model.getObjective()
+                    original_sense = self.maxflow_model.ModelSense # -1 for Max, 1 for Min
+                except:
+                    # Fallback if getObjective fails
+                    original_objective_expr = None
                     
-                    # Take element-wise minimum, but preserve first solution for sensitive edges
-                    for e, var in self.flow_var.items():
-                        if not (e in sensitive_set or (e[1], e[0]) in sensitive_set):
-                            final_flows[e] = min(final_flows[e], var.Xn)
+                added_constrs = []
                 
+                if original_objective_expr is not None:
+                    # Enforce optimality of original problem
+                    # Add constraint: ObjExpr >= ObjVal (if Max) or <= ObjVal (if Min)
+                    # Use a small tolerance
+                    rhs = original_obj_val
+                    if original_sense == grb.GRB.MAXIMIZE:
+                         c = self.maxflow_model.addConstr(original_objective_expr >= rhs - 1e-4, name="opt_constraint")
+                    else:
+                         c = self.maxflow_model.addConstr(original_objective_expr <= rhs + 1e-4, name="opt_constraint")
+                    added_constrs.append(c) 
+                    
+                    # 3. Loop up to 20 times (Adaptive Depth)
+                    jitter_max_depth = 20
+                    previous_target_set = None
+
+                    for _ in range(jitter_max_depth):
+                        # Identify target edges: Non-sensitive edges with > 0 flow in ALL previous solutions
+                        target_edges = [
+                            e for e in self.both_edges 
+                            if not (e in sensitive_set or (e[1], e[0]) in sensitive_set) and 
+                            all(f.get(e, 0.0) > 1e-5 for f in all_flows)
+                        ]
+                        
+                        current_target_set = set(target_edges)
+                        
+                        if not target_edges:
+                            break
+                            
+                        # Convergence Check: Stop if target set hasn't changed from previous iteration
+                        if previous_target_set is not None and current_target_set == previous_target_set:
+                            # If minimizing this set didn't change the set, we are stuck or done
+                            break
+                            
+                        previous_target_set = current_target_set
+                            
+                        # Set New Objective: Minimize sum of flow on target edges
+                        new_obj = grb.quicksum(self.flow_var[e] for e in target_edges)
+                        self.maxflow_model.setObjective(new_obj, grb.GRB.MINIMIZE)
+                        
+                        try:
+                            self.maxflow_model.optimize(callback)
+                        except Exception:
+                            break
+                        
+                        if self.maxflow_model.Status == grb.GRB.OPTIMAL:
+                             new_flow_dict = {e: var.X for e, var in self.flow_var.items()}
+                             all_flows.append(new_flow_dict)
+                        else:
+                             break
+                    
+                    # Cleanup: Remove constraints
+                    for c in added_constrs:
+                        self.maxflow_model.remove(c)
+                    
+                    # Force re-setup of original objective next time since we overwrote it
+                    self.strategy_objectives_setup = False
+                
+                # Aggregate Results
+                # For sensitive edges: Report from Solution A
+                final_flows = {}
+                for e in flow_results_A.keys():
+                    is_sensitive = e in sensitive_set or (isinstance(e, tuple) and len(e) == 2 and (e[1], e[0]) in sensitive_set)
+                    
+                    if is_sensitive:
+                        final_flows[e] = flow_results_A.get(e, 0.0)
+                    else:
+                        # For others: Report min from all solutions (A, B, C...)
+                        final_flows[e] = min(f.get(e, 0.0) for f in all_flows)
+                        
                 flow_results = final_flows
+                # Return original objective value
+                obj_val = original_obj_val
+
             else:
                 # Rounding flows is safer for interpretation but obj_val should be precise
                 flow_results = {e: var.X for e, var in self.flow_var.items()}

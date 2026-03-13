@@ -38,7 +38,7 @@ env_params = {'deterministic_agent': False,
               
 version_date = "02_19" # numeric month_day
 version_type = "opt_m"  # bi for backward induction or opt_m or opt_d for optimal MIP
-num_cpus_run = 44   # 36  44
+num_cpus_run = 36   # 36  44
 
 model_name = "G5x5_S_MaskablePPO_zero_sum_B_v01_16_GCN"
 
@@ -202,12 +202,12 @@ else:
                         optimal_obj_val, optimal_interdiction_edges = env.solve_optimal_interdiction(method=opt_method, time_limit=time_limit_sec) 
                     elif version_type == 'bi':
                         # Reduced n_workers to avoid thread resource exhaustion
-                        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = num_cpus_run-6, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True,  rl_model_path=model_path, time_limit=time_limit_sec) 
+                        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = num_cpus_run-6, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, jitter=True, rl_model_path=model_path, time_limit=time_limit_sec) 
                     end_time = time.perf_counter()
                 else:
                     start_time = time.perf_counter()
                     # Reduced n_workers to avoid thread resource exhaustion
-                    optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = num_cpus_run-6, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True,  rl_model_path=model_path, time_limit=time_limit_sec) 
+                    optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = num_cpus_run-6, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, jitter=True, rl_model_path=model_path, time_limit=time_limit_sec) 
                     end_time = time.perf_counter()
                 
                 solve_time = end_time - start_time
