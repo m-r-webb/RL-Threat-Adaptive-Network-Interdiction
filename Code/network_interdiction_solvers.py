@@ -400,6 +400,83 @@ class _RemoteEnvWorker:
                 pass
         return result
 
+    def expand_frontier_batch(self, nodes_data):
+        """
+        Expands a batch of frontier nodes in parallel.
+        nodes_data: list of (node_id, budget, state, depth)
+        Returns: list of (parent_id, node_val, valid_children_data, is_terminal)
+                 where valid_children_data is list of (child_budget, child_state, action)
+        """
+        results = []
+        
+        # Optimization: Local references
+        env = self.env
+        check_budget = env.state['budget']
+        check_interdicted = env.state['edge_interdicted']
+        
+        for n_id, budget, state, depth in nodes_data:
+            # 1. Restore State
+            check_budget[0] = budget
+            check_interdicted[:] = state
+            
+            # 2. Compute Objective & Flows (Heavy Compute)
+            if self.attacker_strategy == "zero_sum":
+                val, flows = env._compute_objective_and_flows()
+                val = -val 
+            elif self.attacker_strategy == 'canalize':
+                val, flows = env._calculate_canalize_objective_and_flows()
+            elif self.attacker_strategy == 'isolate':
+                val, flows = env._calculate_isolate_objective_and_flows()
+                val = -val
+            elif self.attacker_strategy == 'divert':
+                val, flows = env._calculate_divert_objective_and_flows()
+            else:
+                val = -float('inf')
+                flows = {}
+            
+            # Update reference flows for mask_fn mechanism
+            env.reference_flows = flows
+            env._cache_flow_array()
+
+            # 3. Get Valid Actions
+            action_mask = env.mask_fn()
+            valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
+            
+            # 4. Report Progress for Pruned Branches
+            num_invalid = int(self.num_both_edges) - len(valid_actions)
+            if num_invalid > 0 and self.progress_actor:
+                # Calculate volume of pruned subtrees
+                # remaining_depth = budget_levels - (current_depth + 1)
+                child_remaining_depth = max(0, self.budget_levels - (depth + 1))
+                child_volume = int(self.num_both_edges) ** child_remaining_depth
+                pruned_volume = num_invalid * child_volume
+                self.progress_actor.increment.remote(pruned_volume)
+            
+            # 5. Generate Children Data
+            children_data = []
+            if len(valid_actions) > 0:
+                # Calculate heuristics to sort children (optional but good for efficiency)
+                # heuristics = env.calculate_action_heuristics(valid_actions, flows, budget)
+                # sorted_indices = np.argsort(-heuristics)
+                # valid_actions = valid_actions[sorted_indices]
+
+                for action in valid_actions:
+                    # Apply action temporarily involves copying mechanism since we are in a loop
+                    # But since we return data, we just calculate new values
+                    cost = env.state['edge_costs'][action]
+                    new_budget = budget - cost
+                    
+                    # Create new state array (must copy)
+                    new_state = state.copy()
+                    new_state[action] += 1
+                    
+                    children_data.append((new_budget, new_state, action))
+            
+            is_terminal = (len(children_data) == 0)
+            results.append((n_id, val, children_data, is_terminal))
+            
+        return results
+
 # --- Mixin Class ---
 
 class InterdictionSolverMixin:
@@ -2406,7 +2483,7 @@ class InterdictionSolverMixin:
 
     # --- Re-add solve_backward_induction_ray method to Mixin ---
     
-    def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=None, ray_address=None, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, rl_model_path=None, time_limit=3600, jitter=False):
+    def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=None, ray_address=None, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, rl_model_path=None, time_limit=3600, jitter=False, parallel_expansion=False):
         """
         Parallelized backward induction using Ray with Adaptive Frontier Expansion.
         """
@@ -2522,74 +2599,53 @@ class InterdictionSolverMixin:
 
         if enable_alpha_pruning and not rl_model_path:
             if verbose:
-                print("Running heuristic for initial alpha...")
+                print("Running heuristic (Min-Cut) for initial alpha...")
             
             # Save state
             old_budget = self.state['budget'][0]
             old_interdicted = self.state['edge_interdicted'].copy()
             
             try:
-                current_budget = old_budget
-                while True:
-                    # 1. Compute current state
-                    if self.attacker_strategy == "zero_sum":
-                        obj_val, flows = self._compute_objective_and_flows()
-                        obj_val = -obj_val # Goal: Minimize flow -> Maximize -flow.
-                    elif self.attacker_strategy == "isolate":
-                        obj_val, flows = self._calculate_isolate_objective_and_flows()
-                        obj_val = -obj_val # Goal: Minimize target flow -> Maximize -flow.
-                    elif self.attacker_strategy == "canalize":
-                        obj_val, flows = self._calculate_canalize_objective_and_flows()
-                    elif self.attacker_strategy == "divert":
-                        obj_val, flows = self._calculate_divert_objective_and_flows()
-                    else:
-                        obj_val, flows = -float('inf'), {}
+                # Use Min-Cut Heuristic to get a tight lower bound (initial alpha)
+                heuristic_val, heuristic_actions = self.solve_min_cut_heuristic()
+                
+                # Convert heuristic value to "reward" space (maximize negative flow)
+                if self.attacker_strategy in ["zero_sum", "isolate"]:
+                    initial_alpha = -heuristic_val
+                else:
+                    initial_alpha = heuristic_val
+                
+                # Store actions for optimal sequence initialization
+                initial_alpha_actions = heuristic_actions
 
-                    # Update reference flows and cache for mask_fn to ensure valid actions are correct
-                    self.reference_flows = flows
-                    self._cache_flow_array()
-
-                    # 2. Check if budget exhausted
-                    if current_budget < self.min_edge_cost:
-                        initial_alpha = obj_val 
-                        break
-                    
-                    # 3. Get valid actions
-                    action_mask = self.mask_fn()
-                    valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
-                    
-                    if len(valid_actions) == 0:
-                        initial_alpha = obj_val
-                        break
-
-                    # 4. Select best action (Heuristic: Max Flow on Edge)
-                    best_action = -1
-                    if valid_actions.size > 0:
-                        heuristics = self.calculate_action_heuristics(valid_actions, flows, current_budget)
-                        best_idx = np.argmax(heuristics)
-                        best_action = valid_actions[best_idx]
-                    
-                    if best_action != -1:
-                        # Apply action
-                        self.state['edge_interdicted'][best_action] += 1
-                        cost = self.state['edge_costs'][best_action]
-                        self.state['budget'][0] -= cost
-                        current_budget -= cost
-                        initial_alpha_actions.append(self.both_edges[best_action])
-                    else:
-                        break
-                        
             except Exception as e:
                 if verbose:
-                    print(f"Heuristic failed: {e}")
+                    print(f"Min-Cut Heuristic failed: {e}")
                 initial_alpha = -float('inf')
             finally:
                 if initial_alpha > -float('inf'):
-                    initial_alpha -= 2.0 # Safety margin for pruning
+                    # Small safety margin for floating point comparisons during pruning
+                    initial_alpha -= 1e-4
+
                 # Restore state
                 self.state['budget'][0] = old_budget
                 self.state['edge_interdicted'][:] = old_interdicted
-                
+
+                 # Recalculate flows for state restoration (fix for reference_flows error)
+                try:
+                    if self.attacker_strategy == "zero_sum":
+                        _, self.reference_flows = self._compute_objective_and_flows()
+                    elif self.attacker_strategy == 'canalize':
+                        _, self.reference_flows = self._calculate_canalize_objective_and_flows()
+                    elif self.attacker_strategy == 'isolate':
+                        _, self.reference_flows = self._calculate_isolate_objective_and_flows()
+                    elif self.attacker_strategy == 'divert':
+                        _, self.reference_flows = self._calculate_divert_objective_and_flows()
+                    
+                    self._cache_flow_array()
+                except Exception:
+                    pass
+
             if verbose:
                 print(f"Heuristic found initial alpha: {initial_alpha}")
 
@@ -2910,108 +2966,205 @@ class InterdictionSolverMixin:
             memo_driver = {}
 
             # 1. Expansion Phase
-            # We pop nodes and expand them until we have enough tasks or run out of nodes
             tasks_to_solve = [] # Nodes ready to be sent to workers
-            
-            while frontier:
-                # Check for timeout
-                if time.time() - start_time > time_limit:
-                    if verbose: print("Expansion phase timed out. Moving to solve...")
-                    tasks_to_solve.extend(frontier)
-                    frontier = []
-                    break
 
-                # If we have enough tasks, stop expanding and move remaining frontier to solve list
-                if len(frontier) + len(tasks_to_solve) >= TARGET_TASKS:
-                    tasks_to_solve.extend(frontier)
-                    frontier = []
-                    break
+            if parallel_expansion:
+                if verbose:
+                    print("Running Parallel Frontier Expansion...")
                 
-                node = frontier.pop(0)
+                node_registry = {id(root_node): root_node} # Map ID -> Object
                 
-                # --- PROGRESS REPORTING FIX ---
-                # Calculate potential subtree volume for this node
-                remaining_depth = max(0, budget_levels_local - node.depth)
-                node_volume = int(self.num_both_edges ** remaining_depth)
-
-                # Check memo (driver side)
-                if enable_memoization and node.key in memo_driver:
-                    node.value, node.best_sequence = memo_driver[node.key]
-                    node.is_terminal = True
-                    # Driver pruned this whole subtree -> Report progress
-                    progress_actor.increment.remote(node_volume)
-                    continue
-
-                # Check base cases
-                if node.budget < self.min_edge_cost or node.depth >= 20:
-                    node.is_terminal = True
-                    tasks_to_solve.append(node)
-                    # Sent to worker -> Worker will report progress
-                    continue
-
-                # Apply incremental changes from root to this node (avoid large copies)
-                path_actions = []
-                curr = node
-                while curr.parent:
-                    path_actions.append(curr.action_from_parent)
-                    curr = curr.parent
-                path_actions.reverse()
-
-                # Apply increments to self.state to reach node.state
-                for a in path_actions:
-                    self.state['edge_interdicted'][a] += 1
-                    self.state['budget'][0] -= int(self.state['edge_costs'][a])
-
-                # Update flows and cache for mask_fn
-                if self.attacker_strategy == "zero_sum":
-                    stop_val, self.reference_flows = self._compute_objective_and_flows()
-                    stop_val = -stop_val
-                elif self.attacker_strategy == 'canalize':
-                    stop_val, self.reference_flows = self._calculate_canalize_objective_and_flows()
-                elif self.attacker_strategy == 'isolate':
-                    stop_val, self.reference_flows = self._calculate_isolate_objective_and_flows()
-                    stop_val = -stop_val
-                elif self.attacker_strategy == 'divert':
-                    stop_val, self.reference_flows = self._calculate_divert_objective_and_flows()
-                else:
-                    stop_val = -float('inf')
-
-                node.stopping_value = stop_val
-
-                self._cache_flow_array()
-
-                action_mask = self.mask_fn()
-                valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
-
-                # Revert incremental changes to restore original driver state
-                for a in reversed(path_actions):
-                    self.state['edge_interdicted'][a] -= 1
-                    self.state['budget'][0] += int(self.state['edge_costs'][a])
-
-                if len(valid_actions) == 0:
-                    node.is_terminal = True
-                    tasks_to_solve.append(node)
-                    # Sent to worker -> Worker will report progress
-                    continue
+                # Running futures: future_ref -> valid_node_ids_in_batch
+                expansion_futures = {} 
+                idle_workers_expansion = list(workers)
                 
-                # --- PROGRESS REPORTING FIX ---
-                # If we expand this node, we are responsible for reporting the volume of the branches we DON'T take.
-                num_invalid = int(self.num_both_edges) - len(valid_actions)
-                if num_invalid > 0:
-                    child_remaining_depth = max(0, budget_levels_local - (node.depth + 1))
-                    child_volume = int(self.num_both_edges) ** child_remaining_depth
-                    pruned_volume = num_invalid * child_volume
-                    progress_actor.increment.remote(pruned_volume)
+                BATCH_SIZE = 10 # Batch size per worker for vectorization benefits
+                MAX_EXPANSION_DEPTH = 20
+                
+                while frontier or expansion_futures:
+                    # Check timeout
+                    if time.time() - start_time > time_limit:
+                        if verbose: print("Expansion phase timed out.")
+                        tasks_to_solve.extend(frontier)
+                        frontier = []
+                        break
 
-                # Expand children
-                for action in valid_actions:
-                    new_state = node.state.copy()
-                    new_state[action] += 1
-                    new_budget = node.budget - self.state['edge_costs'][action]
+                    # Dispatch Batches
+                    # Stop dispatching if we have enough tasks, but finish existing futures
+                    if len(frontier) + len(tasks_to_solve) < TARGET_TASKS:
+                        while idle_workers_expansion and frontier:
+                            worker = idle_workers_expansion.pop()
+                            
+                            # Create Batch
+                            batch = []
+                            batch_ids = []
+                            while frontier and len(batch) < BATCH_SIZE:
+                                node = frontier.pop(0)
+                                
+                                # Check terminal conditions (Depth/Budget) BEFORE sending
+                                if node.budget < self.min_edge_cost or node.depth >= MAX_EXPANSION_DEPTH:
+                                    node.is_terminal = True
+                                    tasks_to_solve.append(node)
+                                    continue
+                                
+                                batch.append((id(node), node.budget, node.state, node.depth))
+                                batch_ids.append(id(node))
+                            
+                            if batch:
+                                future = worker.expand_frontier_batch.remote(batch)
+                                expansion_futures[future] = (worker, batch_ids)
+                            else:
+                                # Put worker back if frontier emptied during batch creation
+                                idle_workers_expansion.append(worker)
+                                break
                     
-                    child = TreeNode(new_budget, new_state, node.depth + 1, parent=node, action_from_parent=action)
-                    node.children.append(child)
-                    frontier.append(child)
+                    # If no work is happening and frontier is empty, we are done
+                    if not expansion_futures:
+                        break
+                    
+                    # Wait for results
+                    ready, _ = ray.wait(list(expansion_futures.keys()), num_returns=1)
+                    
+                    for future in ready:
+                        worker, batch_ids = expansion_futures.pop(future)
+                        idle_workers_expansion.append(worker)
+                        
+                        try:
+                            results = ray.get(future)
+                            # results: list of (n_id, val, children_data, is_terminal)
+                            
+                            for n_id, val, children_data, is_terminal in results:
+                                node = node_registry[n_id]
+                                node.stopping_value = val # Cache the costly max-flow value
+                                
+                                if is_terminal:
+                                    node.is_terminal = True
+                                    tasks_to_solve.append(node)
+                                else:
+                                    # Create child objects
+                                    for c_budget, c_state, action in children_data:
+                                        child = TreeNode(
+                                            c_budget, c_state, node.depth + 1, 
+                                            parent=node, action_from_parent=action
+                                        )
+                                        node.children.append(child)
+                                        node_registry[id(child)] = child
+                                        frontier.append(child)
+                                        
+                        except Exception as e:
+                            print(f"Expansion task failed: {e}")
+                            # Fallback: Treat failed batch nodes as leaves to be solved later
+                            for nid in batch_ids:
+                                if nid in node_registry:
+                                    tasks_to_solve.append(node_registry[nid])
+                
+                # If we stopped early due to TARGET_TASKS, move remaining frontier to solve
+                tasks_to_solve.extend(frontier)
+                frontier = []
+
+            else:
+                # 1. Expansion Phase (Serial)
+                # We pop nodes and expand them until we have enough tasks or run out of nodes
+                
+                while frontier:
+                    # Check for timeout
+                    if time.time() - start_time > time_limit:
+                        if verbose: print("Expansion phase timed out. Moving to solve...")
+                        tasks_to_solve.extend(frontier)
+                        frontier = []
+                        break
+
+                    # If we have enough tasks, stop expanding and move remaining frontier to solve list
+                    if len(frontier) + len(tasks_to_solve) >= TARGET_TASKS:
+                        tasks_to_solve.extend(frontier)
+                        frontier = []
+                        break
+                    
+                    node = frontier.pop(0)
+                    
+                    # --- PROGRESS REPORTING FIX ---
+                    # Calculate potential subtree volume for this node
+                    remaining_depth = max(0, budget_levels_local - node.depth)
+                    node_volume = int(self.num_both_edges ** remaining_depth)
+
+                    # Check memo (driver side)
+                    if enable_memoization and node.key in memo_driver:
+                        node.value, node.best_sequence = memo_driver[node.key]
+                        node.is_terminal = True
+                        # Driver pruned this whole subtree -> Report progress
+                        progress_actor.increment.remote(node_volume)
+                        continue
+
+                    # Check base cases
+                    if node.budget < self.min_edge_cost or node.depth >= 20:
+                        node.is_terminal = True
+                        tasks_to_solve.append(node)
+                        # Sent to worker -> Worker will report progress
+                        continue
+
+                    # Apply incremental changes from root to this node (avoid large copies)
+                    path_actions = []
+                    curr = node
+                    while curr.parent:
+                        path_actions.append(curr.action_from_parent)
+                        curr = curr.parent
+                    path_actions.reverse()
+
+                    # Apply increments to self.state to reach node.state
+                    for a in path_actions:
+                        self.state['edge_interdicted'][a] += 1
+                        self.state['budget'][0] -= int(self.state['edge_costs'][a])
+
+                    # Update flows and cache for mask_fn
+                    if self.attacker_strategy == "zero_sum":
+                        stop_val, self.reference_flows = self._compute_objective_and_flows()
+                        stop_val = -stop_val
+                    elif self.attacker_strategy == 'canalize':
+                        stop_val, self.reference_flows = self._calculate_canalize_objective_and_flows()
+                    elif self.attacker_strategy == 'isolate':
+                        stop_val, self.reference_flows = self._calculate_isolate_objective_and_flows()
+                        stop_val = -stop_val
+                    elif self.attacker_strategy == 'divert':
+                        stop_val, self.reference_flows = self._calculate_divert_objective_and_flows()
+                    else:
+                        stop_val = -float('inf')
+
+                    node.stopping_value = stop_val
+
+                    self._cache_flow_array()
+
+                    action_mask = self.mask_fn()
+                    valid_actions = np.where(action_mask[:self.num_both_edges] == 1)[0]
+
+                    # Revert incremental changes to restore original driver state
+                    for a in reversed(path_actions):
+                        self.state['edge_interdicted'][a] -= 1
+                        self.state['budget'][0] += int(self.state['edge_costs'][a])
+
+                    if len(valid_actions) == 0:
+                        node.is_terminal = True
+                        tasks_to_solve.append(node)
+                        # Sent to worker -> Worker will report progress
+                        continue
+                    
+                    # --- PROGRESS REPORTING FIX ---
+                    # If we expand this node, we are responsible for reporting the volume of the branches we DON'T take.
+                    num_invalid = int(self.num_both_edges) - len(valid_actions)
+                    if num_invalid > 0:
+                        child_remaining_depth = max(0, budget_levels_local - (node.depth + 1))
+                        child_volume = int(self.num_both_edges) ** child_remaining_depth
+                        pruned_volume = num_invalid * child_volume
+                        progress_actor.increment.remote(pruned_volume)
+
+                    # Expand children
+                    for action in valid_actions:
+                        new_state = node.state.copy()
+                        new_state[action] += 1
+                        new_budget = node.budget - self.state['edge_costs'][action]
+                        
+                        child = TreeNode(new_budget, new_state, node.depth + 1, parent=node, action_from_parent=action)
+                        node.children.append(child)
+                        frontier.append(child)
 
             # 2. Execution Phase (Dynamic Load Balancing)
             # tasks_to_solve contains the leaves of our expanded tree.
