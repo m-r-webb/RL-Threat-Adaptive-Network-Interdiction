@@ -78,7 +78,7 @@ class _RemoteEnvWorker:
                  num_both_edges, deterministic_outcomes, multiple_interdiction_attempts,
                  progress_actor=None, memo_actors=None, budget_levels=1, progress_granularity=50,
                  max_depth_inner=100, outcome_memo_actor=None, outcome_memo_actors=None, alpha_actor=None,
-                 enable_outcome_caching=True, enable_alpha_pruning=True, sample_size=1000, jitter=False):
+                 enable_outcome_caching=True, enable_alpha_pruning=True, sample_size=1000, reduce_flow=False):
         """
         Worker now accepts a progress_actor handle, a shared memo_actor handle,
         and budget_levels so it can estimate progress for invalid actions.
@@ -101,7 +101,7 @@ class _RemoteEnvWorker:
         
         # Set config flag
         self.env.enable_outcome_caching = enable_outcome_caching
-        self.env.jitter = jitter
+        self.env.reduce_flow = reduce_flow
 
         # Optimize serialization: Avoid deep copying the entire state.
         # We only copy the dynamic parts that change during the episode/search.
@@ -144,6 +144,9 @@ class _RemoteEnvWorker:
         
         self.progress_granularity = int(progress_granularity)
         self.budget_levels = int(budget_levels)
+        
+        # Initialize persistent local memoization cache (persist across tasks)
+        self.memo_local = {} 
 
         # PRE-COMPUTE HEURISTIC BASE VALUES (Optimization)
         # This avoids multiplying capacity * probability at every node
@@ -154,7 +157,8 @@ class _RemoteEnvWorker:
 
     def evaluate_subtree(self, remaining_budget, interdicted_state, depth):
         import numpy as np, ray as _ray, time, zlib # Added zlib for stable hashing
-        memo_local = {}
+        # Use persistent local cache (hot between tasks)
+        memo_local = self.memo_local 
         local_counter = 0
         
         # Local cache of the global alpha value
@@ -2225,9 +2229,6 @@ class InterdictionSolverMixin:
                             self.state['edge_interdicted'][action_idx] += 1
                             self.state['budget'][0] -= self.state['edge_costs'][action_idx]
                             actions_taken.append(edge)
-                
-                # Recompute flows once after all cut interdictions are applied
-                self._cache_flow_array()
             
         elif self.attacker_strategy == "canalize":
             # Identify canalize objective edges
@@ -2341,9 +2342,6 @@ class InterdictionSolverMixin:
                             self.state['edge_interdicted'][action_idx] += 1
                             self.state['budget'][0] -= self.state['edge_costs'][action_idx]
                             actions_taken.append(edge)
-
-                # Recompute flows once after batch interdiction
-                self._cache_flow_array()
 
         elif self.attacker_strategy == "divert":  #PICKUP HERE!!!
             # Identify canalize objective edges
@@ -2460,9 +2458,6 @@ class InterdictionSolverMixin:
                             self.state['edge_interdicted'][action_idx] += 1
                             self.state['budget'][0] -= self.state['edge_costs'][action_idx]
                             actions_taken.append(edge)
-
-                # Recompute flows once after batch interdiction
-                self._cache_flow_array()
             
         # Determine final objective value based on strategy
         if self.attacker_strategy == "zero_sum":
@@ -2483,7 +2478,7 @@ class InterdictionSolverMixin:
 
     # --- Re-add solve_backward_induction_ray method to Mixin ---
     
-    def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=None, ray_address=None, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, rl_model_path=None, time_limit=3600, jitter=False, parallel_expansion=False):
+    def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=None, ray_address=None, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, rl_model_path=None, time_limit=3600, reduce_flow=False, parallel_expansion=False):
         """
         Parallelized backward induction using Ray with Adaptive Frontier Expansion.
         """
@@ -2501,7 +2496,7 @@ class InterdictionSolverMixin:
 
         # Propagate caching flag to driver for heuristic usage
         self.enable_outcome_caching = enable_outcome_caching
-        self.jitter = jitter
+        self.reduce_flow = reduce_flow
         if self.enable_outcome_caching:
              self.local_outcome_cache = {}
 
@@ -2898,7 +2893,7 @@ class InterdictionSolverMixin:
                     enable_outcome_caching=enable_outcome_caching,
                     enable_alpha_pruning=enable_alpha_pruning,
                     sample_size=self.SAMPLE_SIZE,
-                    jitter=jitter
+                    reduce_flow=reduce_flow
                 )
                 for _ in range(n_workers)
             ]
@@ -3039,6 +3034,8 @@ class InterdictionSolverMixin:
                                 
                                 if is_terminal:
                                     node.is_terminal = True
+                                    if enable_memoization:
+                                        memo_driver[node.key] = (val, [])
                                     tasks_to_solve.append(node)
                                 else:
                                     # Create child objects
@@ -3143,6 +3140,8 @@ class InterdictionSolverMixin:
 
                     if len(valid_actions) == 0:
                         node.is_terminal = True
+                        if enable_memoization:
+                            memo_driver[node.key] = (stop_val, [])
                         tasks_to_solve.append(node)
                         # Sent to worker -> Worker will report progress
                         continue

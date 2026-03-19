@@ -202,12 +202,12 @@ else:
                         optimal_obj_val, optimal_interdiction_edges = env.solve_optimal_interdiction(method=opt_method, time_limit=time_limit_sec) 
                     elif version_type == 'bi':
                         # Reduced n_workers to avoid thread resource exhaustion
-                        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = num_cpus_run-6, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, jitter=True, rl_model_path=model_path, time_limit=time_limit_sec) 
+                        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = num_cpus_run-6, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, reduce_flow=True, rl_model_path=model_path, time_limit=time_limit_sec) 
                     end_time = time.perf_counter()
                 else:
                     start_time = time.perf_counter()
                     # Reduced n_workers to avoid thread resource exhaustion
-                    optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = num_cpus_run-6, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, jitter=True, rl_model_path=model_path, time_limit=time_limit_sec) 
+                    optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = num_cpus_run-6, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, reduce_flow=True, rl_model_path=model_path, time_limit=time_limit_sec) 
                     end_time = time.perf_counter()
                 
                 solve_time = end_time - start_time

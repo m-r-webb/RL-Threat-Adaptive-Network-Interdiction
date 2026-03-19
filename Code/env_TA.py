@@ -347,7 +347,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         # Solve and return results
         self.maxflow_model.params.Seed = 1
         
-        # Jitter Configuration (Robustness)
+        # Reduce Flow Configuration (Robustness)
         # Check depth (number of interdictions already placed)
         current_depth = self.state['edge_interdicted'].sum()
         
@@ -357,19 +357,20 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         min_cost = np.min(self.state['edge_costs'][:limit]) if limit > 0 else 0
         has_budget = current_budget >= min_cost
 
-        # Jitter configuration
+        # Reduce Flow configuration
         # Use robustness only if we have budget for another interdiction and depth is low
-        use_jitter = getattr(self, 'jitter', False) and has_budget
+        use_reduce_flow = getattr(self, 'reduce_flow', False) and has_budget
 
-        # Apply Jitter (Lowest Priority Objective: Minimize Edges Used)
+        # Apply Reduce Flow (Lowest Priority Objective: Minimize Edges Used)
         # Minimize sum(edge_used) -> Maximize -sum(edge_used)
-        jitter_idx = 3 # Assumes 0, 1, 2 are used by other strategies
-        if use_jitter:
-            jitter_expr = grb.quicksum(self.edge_used[e] for e in self.both_edges)
-            self.maxflow_model.setObjectiveN(jitter_expr, index=jitter_idx, priority=1, weight=-1.0, name="jitter_min_edges")
+        reduce_flow_idx = 3 # Assumes 0, 1, 2 are used by other strategies
+        if use_reduce_flow:
+            reduce_flow_expr = grb.quicksum(self.flow_var[e] for e in self.both_edges)
+            #reduce_flow_expr = grb.quicksum(self.edge_used[e] for e in self.both_edges)
+            self.maxflow_model.setObjectiveN(reduce_flow_expr, index=reduce_flow_idx, priority=1, weight=-1.0, name="reduce_flow_min_edges")
         else:
-            # Disable jitter objective if budget not sufficient
-            self.maxflow_model.setObjectiveN(0.0, index=jitter_idx, priority=0, weight=0.0, name="jitter_disabled")
+            # Disable reduce_flow objective if budget not sufficient
+            self.maxflow_model.setObjectiveN(0.0, index=reduce_flow_idx, priority=0, weight=0.0, name="reduce_flow_disabled")
 
         # Standard single solution
         self.maxflow_model.setParam('PoolSearchMode', 0)
