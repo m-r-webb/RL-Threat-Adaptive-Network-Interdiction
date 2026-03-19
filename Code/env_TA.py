@@ -361,6 +361,16 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         # Use robustness only if we have budget for another interdiction and depth is low
         use_jitter = getattr(self, 'jitter', False) and has_budget
 
+        # Apply Jitter (Lowest Priority Objective: Minimize Edges Used)
+        # Minimize sum(edge_used) -> Maximize -sum(edge_used)
+        jitter_idx = 3 # Assumes 0, 1, 2 are used by other strategies
+        if use_jitter:
+            jitter_expr = grb.quicksum(self.edge_used[e] for e in self.both_edges)
+            self.maxflow_model.setObjectiveN(jitter_expr, index=jitter_idx, priority=1, weight=-1.0, name="jitter_min_edges")
+        else:
+            # Disable jitter objective if budget not sufficient
+            self.maxflow_model.setObjectiveN(0.0, index=jitter_idx, priority=0, weight=0.0, name="jitter_disabled")
+
         # Standard single solution
         self.maxflow_model.setParam('PoolSearchMode', 0)
         self.maxflow_model.setParam('PoolSolutions', 1)
@@ -382,103 +392,13 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             status = None
         if status == grb.GRB.OPTIMAL:
             # Use strict values without rounding to avoid flipping behavior near .5 boundaries
-            obj_val = self.maxflow_model.ObjVal
-            
-            if use_jitter:
-                # Robust Interdiction: Iterative minimization of common flow edges
-                # 1. Solution A (current optimal)
-                flow_results_A = {e: var.X for e, var in self.flow_var.items()}
-                original_obj_val = obj_val
-                
-                all_flows = [flow_results_A]
-                sensitive_set = set(self.sensitive_edges)
-                
-                # Get the current objective expression to add as constraint
-                try:
-                    original_objective_expr = self.maxflow_model.getObjective()
-                    original_sense = self.maxflow_model.ModelSense # -1 for Max, 1 for Min
-                except:
-                    # Fallback if getObjective fails
-                    original_objective_expr = None
-                    
-                added_constrs = []
-                
-                if original_objective_expr is not None:
-                    # Enforce optimality of original problem
-                    # Add constraint: ObjExpr >= ObjVal (if Max) or <= ObjVal (if Min)
-                    # Use a small tolerance
-                    rhs = original_obj_val
-                    if original_sense == grb.GRB.MAXIMIZE:
-                         c = self.maxflow_model.addConstr(original_objective_expr >= rhs - 1e-4, name="opt_constraint")
-                    else:
-                         c = self.maxflow_model.addConstr(original_objective_expr <= rhs + 1e-4, name="opt_constraint")
-                    added_constrs.append(c) 
-                    
-                    # 3. Loop up to 20 times (Adaptive Depth)
-                    jitter_max_depth = 20
-                    previous_target_set = None
-
-                    for _ in range(jitter_max_depth):
-                        # Identify target edges: Non-sensitive edges with > 0 flow in ALL previous solutions
-                        target_edges = [
-                            e for e in self.both_edges 
-                            if not (e in sensitive_set or (e[1], e[0]) in sensitive_set) and 
-                            all(f.get(e, 0.0) > 1e-5 for f in all_flows)
-                        ]
-                        
-                        current_target_set = set(target_edges)
-                        
-                        if not target_edges:
-                            break
-                            
-                        # Convergence Check: Stop if target set hasn't changed from previous iteration
-                        if previous_target_set is not None and current_target_set == previous_target_set:
-                            # If minimizing this set didn't change the set, we are stuck or done
-                            break
-                            
-                        previous_target_set = current_target_set
-                            
-                        # Set New Objective: Minimize sum of flow on target edges
-                        new_obj = grb.quicksum(self.flow_var[e] for e in target_edges)
-                        self.maxflow_model.setObjective(new_obj, grb.GRB.MINIMIZE)
-                        
-                        try:
-                            self.maxflow_model.optimize(callback)
-                        except Exception:
-                            break
-                        
-                        if self.maxflow_model.Status == grb.GRB.OPTIMAL:
-                             new_flow_dict = {e: var.X for e, var in self.flow_var.items()}
-                             all_flows.append(new_flow_dict)
-                        else:
-                             break
-                    
-                    # Cleanup: Remove constraints
-                    for c in added_constrs:
-                        self.maxflow_model.remove(c)
-                    
-                    # Force re-setup of original objective next time since we overwrote it
-                    self.strategy_objectives_setup = False
-                
-                # Aggregate Results
-                # For sensitive edges: Report from Solution A
-                final_flows = {}
-                for e in flow_results_A.keys():
-                    is_sensitive = e in sensitive_set or (isinstance(e, tuple) and len(e) == 2 and (e[1], e[0]) in sensitive_set)
-                    
-                    if is_sensitive:
-                        final_flows[e] = flow_results_A.get(e, 0.0)
-                    else:
-                        # For others: Report min from all solutions (A, B, C...)
-                        final_flows[e] = min(f.get(e, 0.0) for f in all_flows)
-                        
-                flow_results = final_flows
-                # Return original objective value
-                obj_val = original_obj_val
-
+            # In multi-objective, trust the flow variable on super edge for the max flow value
+            if self.maxflow_model.NumObj > 1:
+                obj_val = self.flow_var[self.super_edge].X
             else:
-                # Rounding flows is safer for interpretation but obj_val should be precise
-                flow_results = {e: var.X for e, var in self.flow_var.items()}
+                 obj_val = self.maxflow_model.ObjVal
+            
+            flow_results = {e: var.X for e, var in self.flow_var.items()}
         else:
             obj_val = 0
             flow_results = {e: 0 for e in self.flow_var.keys()}
@@ -585,7 +505,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         if getattr(self, 'GUROBI_ENV', None) is None:
             try:
                 # Added TimeLimit and MIPGap to prevent the solver from hanging on proving optimality
-                self.GUROBI_ENV = grb.Env(params={"OutputFlag": 0, "LogToConsole": 0, "Threads": 2, "Seed": 1, "TimeLimit": 15, "MIPGap": 0.02, "MIPFocus": 1})
+                self.GUROBI_ENV = grb.Env(params={"OutputFlag": 0, "LogToConsole": 0, "Threads": 2, "Seed": 1, "TimeLimit": 30, "MIPGap": 0.02, "MIPFocus": 1})
             except Exception as e:
                 self.GUROBI_ENV = None
         try:
@@ -760,9 +680,6 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         
         # 1. Primary Objective: Maximize Total Flow (Always Priority 10)
         self.maxflow_model.setObjectiveN(self.flow_var[self.super_edge], index=0, priority=10, weight=1.0, name="max_flow")
-
-        # Minimize number of edges used to prevent cycles (Always Priority 1)
-        # self.maxflow_model.setObjectiveN(expr, index=10, priority=1, weight=-1.0, name="min_edges_used")
 
         if routing_assumption in ['divert', 'canalize', 'isolate']:
             # Use subtour elimination callback - requires BINARY vars
@@ -2220,31 +2137,14 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         if start_nodes is None:
             start_nodes = self.state['isolate_objective']
         
-        objective_edge_indices = set()
-        is_canalize = (self.attacker_strategy == 'canalize')
-
         # Check if the start_nodes contains nodes or edges
         # If passed an array of size num_edges with 0/1, it's an edge mask
         if isinstance(start_nodes, np.ndarray) and start_nodes.shape[0] >= self.num_both_edges:
-            if is_canalize:
-                # Canalize case: use both endpoints of the objective path
-                obj_indices = np.where(start_nodes[:self.num_both_edges]==1)[0]
-                objective_edge_indices = set(obj_indices)
-                obj_edges = [self.both_edges[i] for i in obj_indices]
-                
-                counts = {}
-                for u, v in obj_edges:
-                    counts[u] = counts.get(u, 0) + 1
-                    counts[v] = counts.get(v, 0) + 1
-                    
-                # Endpoints (degree 1 in path subgraph)
-                target_nodes = {n for n, c in counts.items() if c == 1}
-            else:
-                 # Standard extraction for other strategies (nodes from edge mask)
-                 target_nodes = set()
-                 for idx in np.where(start_nodes[:self.num_both_edges]==1)[0]:
-                     edge = self.both_edges[idx]
-                     target_nodes.add(edge[1])
+             # Standard extraction for other strategies (nodes from edge mask)
+             target_nodes = set()
+             for idx in np.where(start_nodes[:self.num_both_edges]==1)[0]:
+                 edge = self.both_edges[idx]
+                 target_nodes.add(edge[1])
         else:
             # Assume start_nodes is already a set/list of node IDs
             target_nodes = set(start_nodes)
@@ -2270,22 +2170,12 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                         
                     # Only traverse if the edge actually has flow
                     if has_flow_array[edge_idx]:
-                        if is_canalize:
-                            incoming_edge_indices.add(edge_idx)
-                            # Stop tracing this branch if we hit a protected objective edge
-                            if edge_idx not in objective_edge_indices:
-                                prev_node = edge[0]
-                                if prev_node not in visited_nodes:
-                                    visited_nodes.add(prev_node)
-                                    queue.append(prev_node)
-                        else:
-                            incoming_edge_indices.add(edge_idx)
-                            prev_node = edge[0]
-                            if prev_node not in visited_nodes:
-                                visited_nodes.add(prev_node)
-                                queue.append(prev_node)
+                        incoming_edge_indices.add(edge_idx)
+                        prev_node = edge[0]
+                        if prev_node not in visited_nodes:
+                            visited_nodes.add(prev_node)
+                            queue.append(prev_node)
     
-#        incoming_edges_with_flow = [self.both_edges[idx] for idx in incoming_edge_indices]
         action_mask = np.zeros(self.num_both_edges, dtype=bool)
         if incoming_edge_indices:
             action_mask[list(incoming_edge_indices)] = True
@@ -2312,41 +2202,33 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         if self.attacker_strategy == 'isolate':
             # Get edges on paths from isolate objectives to sources
             on_path_to_source = self.get_edges_on_paths_to_source(start_nodes = self.state['isolate_objective'])
-            #has_flow = self.cached_flow_array[:self.num_interdictable] > 0
             valid_actions = (sufficient_budget &  
                              has_probability & 
-                             #has_capacity &
                              on_path_to_source &
-                             #has_flow &
                              within_limit)
         elif self.attacker_strategy == 'canalize':
-             # Logic for canalize: valid actions should NOT be on path to source from the objective start node.
-             # "These edges should not be valid targets."
-             #on_path_to_source = self.get_edges_on_paths_to_source(start_nodes = self.state['canalize_objective'])
-             
              has_flow = self.cached_flow_array[:self.num_interdictable] > 0
              not_target = self.state['canalize_objective'][:self.num_interdictable] != 1
              
              valid_actions = (sufficient_budget &
                               has_probability &
-                              #~on_path_to_source & # INVERTED logic: Must NOT be on path to source
                               within_limit & has_flow & not_target)
         
         elif self.attacker_strategy == 'divert':
             has_flow = self.cached_flow_array[:self.num_interdictable] > 0
             not_target = self.state['divert_to_objective'][:self.num_interdictable] != 1
             
-            # Check if any edges on the divert_from path have been interdicted
-            from_path_interdicted = np.any((self.state['edge_interdicted'][:self.num_interdictable] > 0) & 
-                                         (self.state['divert_from_objective'][:self.num_interdictable] == 1))
+            # APPROXIMATION: Check if any edges on the divert_from path have been interdicted
+            #from_path_interdicted = np.any((self.state['edge_interdicted'][:self.num_interdictable] > 0) & 
+            #                             (self.state['divert_from_objective'][:self.num_interdictable] == 1))
 
-            if not from_path_interdicted:
-                is_target = self.state['divert_from_objective'][:self.num_interdictable] == 1
-            else:
-                is_target = True
+            #if not from_path_interdicted:
+            #    is_target = self.state['divert_from_objective'][:self.num_interdictable] == 1
+            #else:
+            #    is_target = True
 
             valid_actions = (sufficient_budget & #has_capacity & 
-                             has_probability & is_target &
+                             has_probability & #is_target &
                              within_limit & has_flow & 
                              not_target)
         else:
