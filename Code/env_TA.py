@@ -228,7 +228,32 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
 
         # Pre-compute reverse edges for caching speed
         self.reverse_edges_list = [(e[1], e[0]) for e in self.both_edges]
+
+        # Compute accurate distances to sink
+        self._compute_node_distances()
             
+    def _compute_node_distances(self):
+        """Compute shortest path distance (BFS) from every node to the Super Sink."""
+        # Initialize distances to infinity
+        self.node_distances = {node: float('inf') for node in self.nodes}
+        
+        # Start BFS from Super Sink
+        target = self.super_sink_nodes[0]
+        self.node_distances[target] = 0
+        queue = [target]
+        
+        while queue:
+            current = queue.pop(0)
+            
+            # Check all incoming edges to find upstream neighbors
+            # (We traverse the graph backwards from Sink -> Source)
+            if current in self.edge_groups:
+                for edge in self.edge_groups[current]['in']:
+                    neighbor = edge[0] # The node pointing to current
+                    if self.node_distances[neighbor] == float('inf'):
+                        self.node_distances[neighbor] = self.node_distances[current] + 1
+                        queue.append(neighbor)
+
     def _setup_spaces(self):
         """Setup observation and action spaces based on environment configuration."""
         # Calculate space dimensions
@@ -1299,7 +1324,9 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             if current_node in self.edge_groups:
                 for edge in self.edge_groups[current_node]['out']:
                     neighbor = edge[1]
-                    if neighbor not in visited and neighbor >= current_node - 1:
+                    dist_neighbor = self.node_distances.get(neighbor, float('inf'))
+                    
+                    if neighbor not in visited and dist_neighbor < float('inf'):
                          valid_edges.append(edge)
             if not valid_edges:
                 return False
@@ -1347,16 +1374,30 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
 
         # Find endpoints: nodes that appear exactly once
         endpoints = [n for n, c in node_counts.items() if c == 1]
+        
+        # Helper to get distance safely
+        def get_dist(n):
+            return self.node_distances.get(n, -1) if hasattr(self, 'node_distances') else -1
+
         if len(endpoints) >= 2:
-            # Choose smaller-valued node as start per specification
-            start_node = min(endpoints)
-            end_node = [n for n in endpoints if n != start_node][0]
+            # Choose node furthest from sink (highest distance) as start
+            # This ensures we follow flow direction towards sink
+            start_node = max(endpoints, key=get_dist)
+            
+            # Choose node closest to sink (lowest distance) as end
+            # Filter remaining endpoints to find best end
+            remaining = [n for n in endpoints if n != start_node]
+            if remaining:
+                 end_node = min(remaining, key=get_dist)
+            else:
+                 # Should not happen if len >= 2 and start_node is in endpoints
+                 end_node = endpoints[0]
         else:
-            # Fallback: pick smallest node as start and largest as end
+            # Fallback: pick furthest node as start and closest as end
             if not nodes:
                 return []
-            start_node = min(nodes)
-            end_node = max(nodes)
+            start_node = max(nodes, key=get_dist)
+            end_node = min(nodes, key=get_dist)
 
         # Build undirected adjacency for traversal (so orientation stored in target_edges_set can be reversed)
         adj = defaultdict(list)
@@ -1492,6 +1533,8 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         if start_node not in self.edge_groups:
             return None
         
+        start_dist = self.node_distances.get(start_node, float('inf'))
+
         valid_first_edges = []
         for edge1 in self.edge_groups[start_node]['out']:
              # Check if edge is in avoid_set
@@ -1518,6 +1561,14 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                  # Avoid immediate cycle back to start
                  if edge2[1] == start_node:
                       continue
+                 
+                 # Enforce that the final node is closer or at same distance to sink as start node
+                 final_node = edge2[1]
+                 final_dist = self.node_distances.get(final_node, float('inf'))
+                 
+                 if final_dist > start_dist:
+                      continue
+
                  valid_second_edges.append(edge2)
              
              if valid_second_edges:
