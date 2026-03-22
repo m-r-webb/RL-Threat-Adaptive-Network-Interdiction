@@ -506,7 +506,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         if getattr(self, 'GUROBI_ENV', None) is None:
             try:
                 # Added TimeLimit and MIPGap to prevent the solver from hanging on proving optimality
-                self.GUROBI_ENV = grb.Env(params={"OutputFlag": 0, "LogToConsole": 0, "Threads": 2, "Seed": 1, "TimeLimit": 30, "MIPGap": 0.02, "MIPFocus": 1})
+                self.GUROBI_ENV = grb.Env(params={"OutputFlag": 0, "LogToConsole": 0, "Threads": 2, "Seed": 1, "TimeLimit": 60, "MIPGap": 0.0001, "MIPFocus": 1})
             except Exception as e:
                 self.GUROBI_ENV = None
         try:
@@ -1361,75 +1361,91 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
 
         # Find max flow path
         _, flows = self.solve_max_flow()
-        from_path = self._extract_max_flow_path(flows)
 
-        # Identify valid breakpoints and corresponding divert_from/divert_to segments
+        # Get edges with positive flow
+        edge_flows = [(edge, flows.get(edge, 0)) for edge in self.both_edges if flows.get(edge, 0) > 0]
+        # Sort by flow descending
+        edge_flows.sort(key=lambda x: x[1], reverse=True)
+        
+        valid_start_edges = []
+        for edge_tuple, flow_val in edge_flows:
+            # Both endpoints of the edge chosen must have a distance greater than 3 from the sink
+            dist0 = self.node_distances.get(edge_tuple[0], float('inf'))
+            dist1 = self.node_distances.get(edge_tuple[1], float('inf'))
+            if dist0 > 3 and dist1 > 3:
+                valid_start_edges.append(edge_tuple)
+        
+        # Take the top 5 valid edges with the most flow
+        top_edges = valid_start_edges[:5]
+        
         candidates = []
-        
-        # We need at least 1 edge before and 2 edges after for divert_from
-        for i in range(1, len(from_path) - 1):
-             breakpoint_node = from_path[i][0]
-             
-             # divert_from segments: 1 before, 2 after
-             if i + 2 > len(from_path):
-                 continue
-                 
-             # Edge before breakpoint
-             pre_edge = from_path[i-1]
-             
-             # Edges after breakpoint
-             post_divert_from = [from_path[i], from_path[i+1]]
-             
-             divert_from_segments = [pre_edge] + post_divert_from
+        for start_edge in top_edges:
+            dist0 = self.node_distances.get(start_edge[0], float('inf'))
+            dist1 = self.node_distances.get(start_edge[1], float('inf'))
+            
+            # The breakpoint should be the endpoint with the shorter distance
+            # If tied, use the endpoint with the higher value (node ID)
+            if dist0 < dist1:
+                breakpoint_node = start_edge[0]
+                breakpoint_dist = dist0
+            elif dist1 < dist0:
+                breakpoint_node = start_edge[1]
+                breakpoint_dist = dist1
+            else:
+                breakpoint_node = max(start_edge[0], start_edge[1])
+                breakpoint_dist = dist0
+            
+            # Trace two more edges downstream following max flow
+            divert_from_segments = [start_edge]
+            curr = breakpoint_node
+            valid_trace = True
+            
+            visited_from_edges = {start_edge, (start_edge[1], start_edge[0])}
+            visited_from_nodes = {start_edge[0], start_edge[1]}
+            
+            for _ in range(2):
+                out_edges = self.edge_groups.get(curr, {}).get('out', [])
+                valid_out = [e for e in out_edges if e in self.both_edges and e not in visited_from_edges and e[1] not in visited_from_nodes]
+                
+                if not valid_out:
+                    valid_trace = False
+                    break
+                next_edge = max(valid_out, key=lambda e: flows.get(e, 0) + random.random()*1e-6)
+                divert_from_segments.append(next_edge)
+                visited_from_edges.add(next_edge)
+                visited_from_edges.add((next_edge[1], next_edge[0]))
+                visited_from_nodes.add(next_edge[1])
+                curr = next_edge[1]
+            
+            if not valid_trace or len(divert_from_segments) < 3:
+                continue
 
-             # Avoid edges to supersink in divert_from
-             if any(edge[1] in self.super_sink_nodes for edge in divert_from_segments):
-                 continue
-             
-             # divert_to segments: find alternate path of length 2 from breakpoint
-             # that does not intersect with post_divert_from or pre_edge (pre_edge is shared)
-             divert_to_post = self._find_alternate_segment(breakpoint_node, post_divert_from + [pre_edge])
-             
-             if divert_to_post:
-                 divert_to_segments = [pre_edge] + divert_to_post
-                 
-                 # Verify both objectives have exactly 3 unique undirected edges
-                 unique_from = {tuple(sorted(e)) for e in divert_from_segments}
-                 unique_to = {tuple(sorted(e)) for e in divert_to_segments}
-                 
-                 if len(unique_from) == 3 and len(unique_to) == 3:
-                    # Avoid direct edge between initial and final nodes of divert_to objective
-                    # Find endpoints (nodes that appear exactly once across the 3 edges)
-                    all_nodes_to = []
-                    for u, v in divert_to_segments:
-                        all_nodes_to.extend([u, v])
-                    node_counts = Counter(all_nodes_to)
-                    endpoints = [node for node, count in node_counts.items() if count == 1]
-                #    print(f"divert_to_segments: {divert_to_segments}")
-                #    print(f"endpoints: {endpoints}")
-                    # Ensure it's a simple path (exactly 2 endpoints) and check for shortcuts
-                    if len(endpoints) == 2:
-                        n0, n3 = endpoints
-                        # Reject candidate if any graph edge directly connects the two endpoints
-                        graph_edges = set(self.all_both_edges) if hasattr(self, 'all_both_edges') else set(self.both_edges)
-                        if (n0, n3) in graph_edges or (n3, n0) in graph_edges:
-                            continue
-                    else:
-                        # If not exactly 2 endpoints, it's a cycle or disconnected, which we don't want
-                 #       print(f"Rejected candidate due to endpoints: {endpoints}")
-                        continue
-                 #   print(f"Adding candidate: divert_from={divert_from_segments}, divert_to={divert_to_segments}")
-                    candidates.append((divert_from_segments, divert_to_segments))
-        
+            # Nodes to avoid for divert_to (other than nodes on first edge)
+            avoid_nodes = set()
+            for edge in divert_from_segments[1:]:
+                avoid_nodes.add(edge[0])
+                avoid_nodes.add(edge[1])
+            avoid_nodes.discard(start_edge[0])
+            avoid_nodes.discard(start_edge[1])
+            
+            # Find random walk of 2 edges from breakpoint_node
+            divert_to_post = self._find_alternate_segment(breakpoint_node, divert_from_segments, avoid_nodes, breakpoint_dist)
+            
+            if divert_to_post:
+                divert_to_segments = [start_edge] + divert_to_post
+                candidates.append((divert_from_segments, divert_to_segments))
+
         if not candidates:
-             # Fallback if no valid configuration found
-             divert_from_edges = from_path 
-             divert_to_edges = [] 
+            # Fallback if no valid configuration found
+            divert_from_edges = []
+            if top_edges:
+                divert_from_edges = [top_edges[0]]
+            divert_to_edges = []
         else:
-             # Randomly choose a breakpoint configuration
-             selected_candidate = random.choice(candidates)
-             divert_from_edges = selected_candidate[0]
-             divert_to_edges = selected_candidate[1]
+            # Randomly choose a breakpoint configuration
+            selected_candidate = random.choice(candidates)
+            divert_from_edges = selected_candidate[0]
+            divert_to_edges = selected_candidate[1]
 
         # Convert paths to objective arrays
         divert_from = np.zeros(self.max_num_edges, dtype=int)
@@ -1443,56 +1459,52 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
              # Padded entries remain 0
         return {**base_state, 'divert_from_objective': divert_from, 'divert_to_objective': divert_to}
 
-    def _find_alternate_segment(self, start_node, avoid_edges):
-        """Find a random 2-segment path starting from start_node avoiding avoid_edges."""
-        avoid_set = set(avoid_edges)
-        
-        # Edges from start_node
+    def _find_alternate_segment(self, start_node, divert_from_edges, avoid_nodes, breakpoint_dist):
+        """Find a random 2-segment path starting from start_node avoiding avoid_nodes."""
+        avoid_edges = set(divert_from_edges)
+        for e in divert_from_edges:
+            avoid_edges.add((e[1], e[0]))
+            
+        valid_first_edges = []
         if start_node not in self.edge_groups:
             return None
-        
-        start_dist = self.node_distances.get(start_node, float('inf'))
-
-        valid_first_edges = []
+            
         for edge1 in self.edge_groups[start_node]['out']:
-             # Check if edge is in avoid_set
-             if edge1 in avoid_set or (edge1[1], edge1[0]) in avoid_set:
-                 continue
-             
-             # Check if edge is valid
-             if edge1[1] not in self.edge_groups: # Need outgoing edges for 2nd segment
-                  continue
-             
-             valid_first_edges.append(edge1)
-        
+            if edge1 not in self.both_edges:
+                continue
+            if edge1 in avoid_edges:
+                continue
+            if edge1[1] in avoid_nodes:
+                continue
+            valid_first_edges.append(edge1)
+            
         random.shuffle(valid_first_edges)
         
         for edge1 in valid_first_edges:
-             node2 = edge1[1]
-             valid_second_edges = []
-             
-             if node2 not in self.edge_groups: continue
-
-             for edge2 in self.edge_groups[node2]['out']:
-                 if edge2 in avoid_set or (edge2[1], edge2[0]) in avoid_set:
-                      continue
-                 # Avoid immediate cycle back to start
-                 if edge2[1] == start_node:
-                      continue
-                 
-                 # Enforce that the final node is closer or at same distance to sink as start node
-                 final_node = edge2[1]
-                 final_dist = self.node_distances.get(final_node, float('inf'))
-                 
-                 if final_dist > start_dist:
-                      continue
-
-                 valid_second_edges.append(edge2)
-             
-             if valid_second_edges:
-                  edge2 = random.choice(valid_second_edges)
-                  return [edge1, edge2]
-                  
+            node2 = edge1[1]
+            if node2 not in self.edge_groups:
+                continue
+                
+            valid_second_edges = []
+            for edge2 in self.edge_groups[node2]['out']:
+                if edge2 not in self.both_edges:
+                    continue
+                if edge2 in avoid_edges:
+                    continue
+                final_node = edge2[1]
+                if final_node == start_node or final_node in avoid_nodes:
+                    continue
+                
+                # Should end at a node strictly less than breakpoint_dist from sink
+                if self.node_distances.get(final_node, float('inf')) >= breakpoint_dist:
+                    continue
+                    
+                valid_second_edges.append(edge2)
+                
+            if valid_second_edges:
+                edge2 = random.choice(valid_second_edges)
+                return [edge1, edge2]
+                
         return None
 
     def _extract_max_flow_path(self, flows):
