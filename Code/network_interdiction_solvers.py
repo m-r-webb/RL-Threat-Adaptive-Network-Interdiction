@@ -78,7 +78,7 @@ class _RemoteEnvWorker:
                  num_both_edges, deterministic_outcomes, multiple_interdiction_attempts,
                  progress_actor=None, memo_actors=None, budget_levels=1, progress_granularity=50,
                  max_depth_inner=100, outcome_memo_actor=None, outcome_memo_actors=None, alpha_actor=None,
-                 enable_outcome_caching=True, enable_alpha_pruning=True, sample_size=1000, reduce_flow=False):
+                 enable_outcome_caching=True, enable_alpha_pruning=True, sample_size=1000, reduce_flow=False, jitter=False, projection_uses_flow=False):
         """
         Worker now accepts a progress_actor handle, a shared memo_actor handle,
         and budget_levels so it can estimate progress for invalid actions.
@@ -98,10 +98,12 @@ class _RemoteEnvWorker:
                              outcome_memo_actor=None,
                              outcome_memo_actors=None,
                              sample_size=sample_size)
-        
+         
         # Set config flag
         self.env.enable_outcome_caching = enable_outcome_caching
         self.env.reduce_flow = reduce_flow
+        self.jitter = jitter
+        self.projection_uses_flow = projection_uses_flow
 
         # Optimize serialization: Avoid deep copying the entire state.
         # We only copy the dynamic parts that change during the episode/search.
@@ -328,13 +330,36 @@ class _RemoteEnvWorker:
             if self.enable_alpha_pruning:
                 # Heuristic sorting for pruning
                 # Optimization: State is already set correctly, just call heuristics
-                # IMPORTANT: For zero_sum, we need to handle negative heuristics appropriately if calculate_action_heuristics returns positives
-                heuristics = self.env.calculate_action_heuristics(valid_actions, current_flows, rem_budget)
                 
+                # IMPORTANT: For zero_sum, we need to handle negative heuristics appropriately if calculate_action_heuristics returns positives
+                heuristics = self.env.calculate_action_heuristics(valid_actions, current_flows, rem_budget, jitter=getattr(self, 'jitter', False), projection_uses_flow=self.projection_uses_flow)
+                
+                # Optimization: Mass-prune actions that can't beat alpha using vectorized boolean masking
+                # This avoids expensive sorting (N log N) for actions that will be immediately pruned anyway
+                if alpha > -1e9: 
+                     # Calculate pruning mask for all actions at once
+                     # Condition: Is valid_upper_bound < best_known_alpha?
+                     keep_mask = (final_objective + heuristics) >= (alpha - 1e-6)
+                     n_pruned = len(valid_actions) - np.count_nonzero(keep_mask)
+                     
+                     if n_pruned > 0:
+                         # 1. Update progress for the entire batch of pruned subtrees
+                         est_per_skipped = int(int(self.num_both_edges) ** max(0, self.budget_levels - (d + 1)))
+                         local_counter += n_pruned * est_per_skipped
+                         maybe_flush_progress()
+                         
+                         # 2. Apply filter to reduce array sizes
+                         valid_actions = valid_actions[keep_mask]
+                         heuristics = heuristics[keep_mask]
+                         
+                         # Early exit if everything was pruned
+                         if len(valid_actions) == 0:
+                             return best_reward, best_seq
+
                 # Check if we should reverse sort order based on strategy sign convention
                 # calculate_action_heuristics usually returns positive "impact" (flow reduction)
                 # But our objective here (final_objective) might be negative.
-                pass
+                
                 # Sort descending
                 sorted_indices = np.argsort(-heuristics)
                 valid_actions = valid_actions[sorted_indices]
@@ -1833,119 +1858,321 @@ class InterdictionSolverMixin:
 
         return (self.optimal_stochastic_model_IM.objVal, interdicted_edges, interdicted_quantities)
 
-    def calculate_action_heuristics(self, valid_actions, flows, remaining_budget, include_projection=True):
+    def calculate_jittered_flows(self, strategy, initial_flows=None):
+        """
+        Iterative flow minimization on active edges (Jitter) to improve heuristic robustness.
+        """
+        
+        # 1. Get initial flows if not provided
+        if initial_flows is None:
+            _, initial_flows = self.solve_max_flow(routing_assumption=strategy)
+            
+        current_flows = initial_flows
+        
+        # Handle numpy array input by converting to dict
+        if isinstance(current_flows, np.ndarray):
+            current_flows_dict = {}
+            # Assume array corresponds to self.both_edges
+            for i, edge in enumerate(self.both_edges):
+                if i < len(current_flows):
+                    current_flows_dict[edge] = float(current_flows[i])
+            current_flows_items = current_flows_dict.items()
+        else:
+            current_flows_dict = copy.deepcopy(current_flows)
+            current_flows_items = current_flows_dict.items()
+            
+        flow_history = [current_flows_dict]
+        
+        # Access the underlying model
+        if not hasattr(self, 'maxflow_model') or self.maxflow_model is None:
+             return flow_history 
+
+        model = self.maxflow_model
+        
+        # Identify active edges (> 1e-4) - Use flow_var keys to ensure we match model variables
+        # Note: current_flows might be a dict or array. 
+        # If it's a dict, keys are edges. If array, we need mapping.
+        # Assuming dict as per solve_max_flow output.
+        
+        # Determine valid future action candidates to filter active edges
+        action_mask = self.mask_fn()
+        valid_actions_indices = np.where(action_mask[:self.num_interdictable] == 1)[0]
+        # Map indices to edge tuples
+        valid_action_edges = set()
+        for idx in valid_actions_indices:
+            if idx < len(self.both_edges):
+                valid_action_edges.add(self.both_edges[idx])
+
+        active_edges = set()
+        for e, f in current_flows_items:
+            # Intersection: Must have flow AND be a valid future action
+            if f > 1e-4 and e in valid_action_edges:
+                active_edges.add(e)
+                
+        prev_active_edges = None
+        
+        # Arbitrary high index for new objective (to avoid overwriting existing ones like MaxFlow at 0)
+        jitter_obj_index = 10 
+        
+        iteration = 0
+        max_iter = 20 # Safety limit
+        
+        try:
+            # Iterate until active set (intersection of flow and valid actions) stabilizes
+            while iteration < max_iter:
+                # Compare sets of active edges
+                if active_edges == prev_active_edges:
+                    break
+                    
+                prev_active_edges = active_edges.copy()
+                iteration += 1
+                
+                if not active_edges:
+                    break
+                
+                # Maximize -sum(flow on active_edges) => Minimize sum(flow)
+                # Priority 0 ensures we don't degrade primary/secondary objectives (which constitute max flow)
+                # We only want to minimize flow on edges that WERE active, without reducing total max flow.
+                
+                # Filter active_edges to ensure they exist in current flow_var (safety)
+                valid_active_edges = [e for e in active_edges if e in self.flow_var]
+                
+                if not valid_active_edges:
+                    break
+
+                expr = grb.quicksum(self.flow_var[e] for e in valid_active_edges)
+                model.setObjectiveN(-expr, index=jitter_obj_index, priority=0, weight=1.0, name="jitter_min_flow")
+                
+                # Optimize
+                callback = None
+                if strategy in ['divert', 'canalize', 'isolate'] and hasattr(self, '_subtour_callback'):
+                    if hasattr(self, '_update_sensitive_edges'):
+                        self._update_sensitive_edges(strategy)
+                    callback = self._subtour_callback
+
+                if callback:
+                    model.optimize(callback)
+                else:
+                    model.optimize()
+                
+                if model.status not in [grb.GRB.OPTIMAL, grb.GRB.SUBOPTIMAL]:
+                    break
+                
+                # Extract new flows directly from model variables
+                # This ensures we get the flows from the specific solution found
+                
+                # Update aggregated minimums
+                new_active_edges = set()
+                
+                # Get all flow vars
+                all_edges = list(self.flow_var.keys())
+                all_vars = [self.flow_var[e] for e in all_edges]
+                all_vals = model.getAttr("X", all_vars)
+                
+                current_iter_flows = copy.deepcopy(flow_history[-1]) if flow_history else current_flows_dict.copy()
+                
+                for i, e in enumerate(all_edges):
+                    f = all_vals[i]
+                    current_iter_flows[e] = f
+                    
+                    # Update active set: Must have flow AND be valid action
+                    # AND was already in the active set (can only shrink)
+                    if f > 1e-4 and e in valid_action_edges and e in active_edges:
+                        new_active_edges.add(e)
+                
+                flow_history.append(current_iter_flows)
+                active_edges = new_active_edges
+                
+        except Exception as e:
+            # Fallback to initial flows if anything fails
+            pass
+        
+        # Clean up objective
+        try:
+            model.setObjectiveN(0.0, index=jitter_obj_index, priority=0, weight=0.0)
+        except:
+            pass
+            
+        return flow_history
+
+    def _calculate_projections(self, valid_actions, flows, remaining_budget, projection_uses_flow):
+        projected_values = np.zeros(len(valid_actions))
+
+        # --- OPTIMIZATION 1: Cache static structural masks ---
+        if not hasattr(self, '_static_proj_mask'):
+            has_prob = self.state['edge_interdiction_probability'][:self.num_interdictable] > 0
+            if self.attacker_strategy == 'canalize':
+                strategy_mask = self.state['canalize_objective'][:self.num_interdictable] != 1
+            elif self.attacker_strategy == 'divert':
+                strategy_mask = self.state['divert_to_objective'][:self.num_interdictable] != 1
+            else:
+                strategy_mask = np.ones(self.num_interdictable, dtype=bool)
+            self._static_proj_mask = has_prob & strategy_mask
+
+        costs = self.state['edge_costs'][:self.num_interdictable]
+        limit_ok = (self.state['edge_interdicted'][:self.num_interdictable] + 1) <= self.max_interdictions
+        affordable = costs <= remaining_budget
+        
+        projection_mask = self._static_proj_mask & limit_ok & affordable
+        
+        # 2. Get Sorted Future Benefits
+        projection_indices = np.where(projection_mask)[0]
+        
+        if len(projection_indices) > 0:
+            # OPTIMIZATION: Use pre-computed base values if available
+            if not projection_uses_flow and hasattr(self, 'heuristic_base_values'):
+                benefits = self.heuristic_base_values[projection_indices]
+            elif projection_uses_flow:
+                probs_proj = self.state['edge_interdiction_probability'][projection_indices]
+                
+                if isinstance(flows, np.ndarray):
+                   proj_flow_vals = flows[projection_indices]
+                elif hasattr(self, 'cached_flow_array') and flows is getattr(self, 'reference_flows', None):
+                   proj_flow_vals = self.cached_flow_array[projection_indices]
+                else:
+                   proj_flow_vals = np.array([
+                       flows.get(self.both_edges[a], 0) + flows.get((self.both_edges[a][1], self.both_edges[a][0]), 0)
+                       for a in projection_indices
+                   ])
+                benefits = proj_flow_vals * probs_proj
+            else:
+                caps_proj = self.state['edge_capacity'][projection_indices]
+                probs_proj = self.state['edge_interdiction_probability'][projection_indices]
+                benefits = caps_proj * probs_proj
+            
+            # Optimization: Only sort the projection elements we might actually use
+            # --- OPTIMIZATION 3: Speedup Floor operation using int-division ---
+            max_required_k = int((remaining_budget + 1e-9) // self.min_edge_cost) + 1
+            max_available_k = min(max_required_k, len(benefits))
+            
+            if max_available_k > 0 and max_available_k < len(benefits):
+                # Use argpartition to find the top max_available_k elements in O(N) time
+                part_idx = np.argpartition(-benefits, max_available_k - 1)[:max_available_k]
+                # Sort only the top partitioned elements
+                top_sort_idx = np.argsort(-benefits[part_idx])
+                sorted_idx = part_idx[top_sort_idx]
+            else:
+                # Fallback to full sort if k is near the array size
+                sorted_idx = np.argsort(-benefits)
+                
+            sorted_benefits = benefits[sorted_idx]
+            sorted_global_indices = projection_indices[sorted_idx]
+            
+            # Rank Lookup (Map global edge index -> rank in sorted list)
+            # --- OPTIMIZATION 2: Direct mask evaluation & dropping redundant edge checks ---
+            rank_lookup = np.full(int(self.num_both_edges), -1, dtype=int)
+            rank_lookup[sorted_global_indices] = np.arange(len(sorted_global_indices))
+            
+            # Precompute cumulative sum (prefix sum) for fast range summation
+            # cumsum[k] = sum of top k items
+            cumsum_benefits = np.zeros(len(sorted_benefits) + 1)
+            np.cumsum(sorted_benefits, out=cumsum_benefits[1:])
+            
+            max_available = len(sorted_benefits)
+            
+            # 3. Calculate Projected Value per Action
+            action_costs = self.state['edge_costs'][valid_actions]
+            
+            # Fast Int Division:
+            future_moves_arr = ((remaining_budget - action_costs + 1e-9) // self.min_edge_cost).astype(int)
+            
+            # Fully Vectorized Logic replacing Python Loop
+            # Get ranks for all valid actions using the lookup table DIRECTLY!
+            action_ranks = rank_lookup[valid_actions]
+
+            # Create logical mask: Is the action considered part of the "top n"?
+            # Condition: It has a valid rank (> -1) AND its rank (0-indexed) is less than n (count)
+            in_top_set_mask = (action_ranks != -1) & (action_ranks < future_moves_arr)
+            
+            # Case A: Action IS in the top N set.
+            # We sum the top (n+1) items, then subtract the specific action's value.
+            # np.clip to ensure we don't exceed available items
+            idxs_in = np.clip(future_moves_arr + 1, 0, max_available)
+            
+            # Use maximum(rank, 0) to avoid -1 indexing (safe because masked out later if rank is -1)
+            safe_ranks = np.maximum(action_ranks, 0)
+            vals_in = cumsum_benefits[idxs_in] - sorted_benefits[safe_ranks]
+            
+            # Case B: Action IS NOT in the top N set.
+            # We simply sum the top n items.
+            idxs_out = np.clip(future_moves_arr, 0, max_available)
+            vals_out = cumsum_benefits[idxs_out]
+            
+            # Select value based on mask
+            projected_values = np.where(in_top_set_mask, vals_in, vals_out)
+            
+        return projected_values
+
+    def calculate_action_heuristics(self, valid_actions, flows, remaining_budget, include_projection=True, jitter=False, projection_uses_flow=False):
         """
         Calculate heuristic values for a batch of actions.
         Returns array of heuristic values aligned with valid_actions.
         """
-        projected_values = np.zeros(len(valid_actions))
-
-        if include_projection:
-             # 1. Identify valid projection edges (similar to mask_fn but without flow checks)
-             costs = self.state['edge_costs'][:self.num_interdictable]
-             # Basic validity constraints
-             has_prob = self.state['edge_interdiction_probability'][:self.num_interdictable] > 0
-             limit_ok = (self.state['edge_interdicted'][:self.num_interdictable] + 1) <= self.max_interdictions
-             
-             # Strategy-specific target constraints
-             if self.attacker_strategy == 'canalize':
-                 strategy_mask = self.state['canalize_objective'][:self.num_interdictable] != 1
-             elif self.attacker_strategy == 'divert':
-                 strategy_mask = self.state['divert_to_objective'][:self.num_interdictable] != 1
-                 # Divert specific: must enforce divert_from sequence
-                 from_path_interdicted = np.any((self.state['edge_interdicted'][:self.num_interdictable] > 0) & 
-                                                 (self.state['divert_from_objective'][:self.num_interdictable] == 1))
-                 if not from_path_interdicted:
-                     is_target = self.state['divert_from_objective'][:self.num_interdictable] == 1
-                     strategy_mask = strategy_mask & is_target
-             else:
-                 strategy_mask = np.ones(self.num_interdictable, dtype=bool)
-
-             # We check if edge is affordable within current budget
-             affordable = costs <= remaining_budget
-             
-             projection_mask = affordable & has_prob & limit_ok & strategy_mask
-             
-             # 2. Get Sorted Future Benefits
-             projection_indices = np.where(projection_mask)[0]
-             
-             if len(projection_indices) > 0:
-                 # OPTIMIZATION: Use pre-computed base values if available
-                 if hasattr(self, 'heuristic_base_values'):
-                     benefits = self.heuristic_base_values[projection_indices]
-                 else:
-                     caps_proj = self.state['edge_capacity'][projection_indices]
-                     probs_proj = self.state['edge_interdiction_probability'][projection_indices]
-                     benefits = caps_proj * probs_proj
-                 
-                 # Sort descending
-                 sorted_idx = np.argsort(-benefits)
-                 sorted_benefits = benefits[sorted_idx]
-                 sorted_global_indices = projection_indices[sorted_idx]
-                 
-                 # Rank Lookup (Map global edge index -> rank in sorted list)
-                 # Use self.num_both_edges as size limit to handle any valid_action index safely
-                 rank_lookup = np.full(int(self.num_both_edges), -1, dtype=int)
-                 # Only populate for valid projection indices that fit
-                 valid_mask_indices = sorted_global_indices < self.num_both_edges
-                 rank_lookup[sorted_global_indices[valid_mask_indices]] = np.arange(len(sorted_global_indices))[valid_mask_indices]
-                 
-                 # Precompute cumulative sum (prefix sum) for fast range summation
-                 # cumsum[k] = sum of top k items
-                 cumsum_benefits = np.zeros(len(sorted_benefits) + 1)
-                 np.cumsum(sorted_benefits, out=cumsum_benefits[1:])
-                 
-                 max_available = len(sorted_benefits)
-                 
-                 # 3. Calculate Projected Value per Action
-                 action_costs = self.state['edge_costs'][valid_actions]
-                 future_moves_arr = np.floor((remaining_budget - action_costs + 1e-9) / self.min_edge_cost).astype(int)
-                 
-                 # Fully Vectorized Logic replacing Python Loop
-                 # Get ranks for all valid actions using the lookup table
-                 # Ensure valid_actions are within bounds for rank_lookup
-                 safe_valid_actions = np.where(valid_actions < len(rank_lookup), valid_actions, 0)
-                 action_ranks = rank_lookup[safe_valid_actions]
-                 
-                 # Handle any valid_actions that were out of bounds (shouldn't happen for valid projection space but safe to check)
-                 # If valid_action >= num_both_edges, its rank is definitely -1 (not in projection list)
-                 if len(rank_lookup) < self.num_both_edges: 
-                     # This check handles edge cases where rank_lookup might be smaller than full range
-                     out_of_bounds = valid_actions >= len(rank_lookup)
-                     action_ranks[out_of_bounds] = -1
-
-                 # Create logical mask: Is the action considered part of the "top n"?
-                 # Condition: It has a valid rank (> -1) AND its rank (0-indexed) is less than n (count)
-                 in_top_set_mask = (action_ranks != -1) & (action_ranks < future_moves_arr)
-                 
-                 # Case A: Action IS in the top N set.
-                 # We sum the top (n+1) items, then subtract the specific action's value.
-                 # np.clip to ensure we don't exceed available items
-                 idxs_in = np.clip(future_moves_arr + 1, 0, max_available)
-                 
-                 # Use maximum(rank, 0) to avoid -1 indexing (safe because masked out later if rank is -1)
-                 safe_ranks = np.maximum(action_ranks, 0)
-                 vals_in = cumsum_benefits[idxs_in] - sorted_benefits[safe_ranks]
-                 
-                 # Case B: Action IS NOT in the top N set.
-                 # We simply sum the top n items.
-                 idxs_out = np.clip(future_moves_arr, 0, max_available)
-                 vals_out = cumsum_benefits[idxs_out]
-                 
-                 # Select value based on mask
-                 projected_values = np.where(in_top_set_mask, vals_in, vals_out)
-
-        # 4. Calculate heuristics for valid_actions
         probs = self.state['edge_interdiction_probability'][valid_actions]
         
-        # Calculate Current Flow on the candidate edges
-        if isinstance(flows, np.ndarray):
-            current_flow_vals = flows[valid_actions]
+        projected_values = np.zeros(len(valid_actions))
+        current_flow_vals = np.zeros(len(valid_actions))
+        
+        # Jitter logic
+        if not projection_uses_flow:
+            current_flow_vals = self.state['edge_capacity'][valid_actions]
+            if include_projection:
+                projected_values = self._calculate_projections(
+                    valid_actions, flows, remaining_budget, projection_uses_flow
+                )
+        elif jitter and hasattr(self, 'calculate_jittered_flows') and remaining_budget < 10:
+            flow_histories = self.calculate_jittered_flows(self.attacker_strategy, flows)
+            
+            # Compute flow values across all histories for all valid actions
+            # Shape: (len(valid_actions), len(flow_histories))
+            all_flow_vals = np.zeros((len(valid_actions), len(flow_histories)))
+            
+            for i, hist_flows in enumerate(flow_histories):
+                if isinstance(hist_flows, np.ndarray):
+                    all_flow_vals[:, i] = hist_flows[valid_actions]
+                else:
+                    all_flow_vals[:, i] = np.array([
+                        hist_flows.get(self.both_edges[a], 0) + hist_flows.get((self.both_edges[a][1], self.both_edges[a][0]), 0)
+                        for a in valid_actions
+                    ])
+            
+            # Find the history index where each action's flow is minimized
+            min_indices = np.argmin(all_flow_vals, axis=1)
+            
+            # Extract the minimized flow values
+            current_flow_vals = all_flow_vals[np.arange(len(valid_actions)), min_indices]
+            
+            # Projections (batch by history index to avoid redundant calls)
+            if include_projection:
+                unique_indices = np.unique(min_indices)
+                for idx in unique_indices:
+                    # Find which actions map to this history
+                    action_mask = (min_indices == idx)
+                    subset_actions = valid_actions[action_mask]
+                    
+                    if len(subset_actions) > 0:
+                        hist_flows = flow_histories[idx]
+                        subset_proj_vals = self._calculate_projections(
+                            subset_actions, hist_flows, remaining_budget, projection_uses_flow
+                        )
+                        projected_values[action_mask] = subset_proj_vals
+                        
         else:
-            current_flow_vals = np.array([
-                flows.get(self.both_edges[a], 0) + flows.get((self.both_edges[a][1], self.both_edges[a][0]), 0)
-                for a in valid_actions
-            ])
+            # Standard single-flow logic
+            if isinstance(flows, np.ndarray):
+                current_flow_vals = flows[valid_actions]
+            elif hasattr(self, 'cached_flow_array') and flows is getattr(self, 'reference_flows', None):
+                current_flow_vals = self.cached_flow_array[valid_actions]
+            else:
+                current_flow_vals = np.array([
+                    flows.get(self.both_edges[a], 0) + flows.get((self.both_edges[a][1], self.both_edges[a][0]), 0)
+                    for a in valid_actions
+                ])
+                
+            if include_projection:
+                projected_values = self._calculate_projections(
+                    valid_actions, flows, remaining_budget, projection_uses_flow
+                )
         
         heuristics = (probs * current_flow_vals) + projected_values
         
@@ -2478,7 +2705,7 @@ class InterdictionSolverMixin:
 
     # --- Re-add solve_backward_induction_ray method to Mixin ---
     
-    def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=None, ray_address=None, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, rl_model_path=None, time_limit=3600, reduce_flow=False, parallel_expansion=False):
+    def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=None, ray_address=None, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, rl_model_path=None, time_limit=3600, reduce_flow=False, parallel_expansion=False, jitter=False, projection_uses_flow=False):
         """
         Parallelized backward induction using Ray with Adaptive Frontier Expansion.
         """
@@ -2507,9 +2734,9 @@ class InterdictionSolverMixin:
             outcome_memo_actors = [SharedOutcomeMemoActor.remote() for _ in range(num_outcome_shards)]
             self.outcome_memo_actors = outcome_memo_actors
 
-        # Calculate Initial Alpha (Heuristic or RL)
         initial_alpha = -float('inf')
         initial_alpha_actions = []
+        original_initial_alpha = -float('inf')
 
         if rl_model_path:
             if verbose:
@@ -2760,7 +2987,7 @@ class InterdictionSolverMixin:
                     self.state['budget'][0] = rem_budget
                     self.state['edge_interdicted'][:] = inter_state
                     
-                    heuristics = self.calculate_action_heuristics(valid_actions, flows, rem_budget)
+                    heuristics = self.calculate_action_heuristics(valid_actions, flows, rem_budget, projection_uses_flow=projection_uses_flow)
                     
                     # Restore state immediately
                     self.state['budget'][0] = old_budget
@@ -2820,6 +3047,9 @@ class InterdictionSolverMixin:
             if verbose:
                 print(f"Serial execution completed in {time.time() - t0:.2f}s")
                 
+            if opt_reward <= initial_alpha + 1.1e-4:
+                print("Note: The initial alpha (from heuristic or RL) was not beaten during backward induction.")
+
             optimal_actions = [self.both_edges[idx] for idx in opt_seq]
             
             # Match behavior of parallel implementation and Gurobi
@@ -2887,13 +3117,15 @@ class InterdictionSolverMixin:
                     memo_actors=memo_actors, # Pass list of actors
                     budget_levels=budget_levels,
                     progress_granularity=2000,
+                    jitter=jitter,
                     max_depth_inner=100,
                     outcome_memo_actors=outcome_memo_actors,
                     alpha_actor=alpha_actor,
                     enable_outcome_caching=enable_outcome_caching,
                     enable_alpha_pruning=enable_alpha_pruning,
                     sample_size=self.SAMPLE_SIZE,
-                    reduce_flow=reduce_flow
+                    reduce_flow=reduce_flow,
+                    projection_uses_flow=projection_uses_flow
                 )
                 for _ in range(n_workers)
             ]
@@ -3018,7 +3250,7 @@ class InterdictionSolverMixin:
                         break
                     
                     # Wait for results
-                    ready, _ = ray.wait(list(expansion_futures.keys()), num_returns=1)
+                    ready, _ = ray.wait(list(expansion_futures.keys()), num_returns=1, timeout=1.0)
                     
                     for future in ready:
                         worker, batch_ids = expansion_futures.pop(future)
@@ -3193,7 +3425,7 @@ class InterdictionSolverMixin:
                     running_futures[future] = (worker, node)
                 
                 if running_futures:
-                    done_ids, _ = ray.wait(list(running_futures.keys()), num_returns=1)
+                    done_ids, _ = ray.wait(list(running_futures.keys()), num_returns=1, timeout=1.0)
                     for done_id in done_ids:
                         worker, node = running_futures.pop(done_id)
                         try:
@@ -3328,6 +3560,9 @@ class InterdictionSolverMixin:
             except Exception:
                 pass
             pbar.close()
+
+            if optimal_reward is not None and optimal_reward <= initial_alpha + 1.1e-4:
+                print("Note: The initial alpha (from heuristic or RL) was not beaten during backward induction.")
 
             if self.attacker_strategy in ("zero_sum", "isolate"):
                 # The DP maximizes "reward" (negative flow). 
