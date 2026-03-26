@@ -953,6 +953,10 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                     bottleneck_capacity = np.min(self.state['edge_capacity'][:self.num_both_edges][canalize_mask])
                 else:
                     bottleneck_capacity = 0
+                
+                if bottleneck_capacity - self.reference_start_flow < 1:
+                    continue
+                    
                 self.canalize_norm_factor = max(bottleneck_capacity-self.reference_start_flow, 1e-6)
                 
                 self.reference_obj = self.reference_start_flow
@@ -1578,12 +1582,13 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             self.state['edge_interdicted'][action] += 1
             
             #Compute Rewards
+            action_cost = self.state['edge_costs'][action]
             strategy_calculators = {"zero_sum": self._calculate_zero_sum_reward,
                                     "canalize": self._calculate_canalize_reward,
                                     "isolate": self._calculate_isolate_reward,
                                     "divert": self._calculate_divert_reward}
             calculator = strategy_calculators.get(self.attacker_strategy)
-            reward = calculator()
+            reward = calculator(action_cost=action_cost)
             self._cache_flow_array()
         else:
             #Determine penalty and decrement budget
@@ -1598,7 +1603,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
     
         return self.state, float(reward), bool(done), False, {}
         
-    def _calculate_zero_sum_reward(self):                         
+    def _calculate_zero_sum_reward(self, action_cost=0):                         
         """Calculate reward for zero-sum strategy (maximize disruption)."""
         objective_value, self.reference_flows = self._compute_objective_and_flows()
         reward = max(self.last_obj - objective_value, 0) / self.reference_budget
@@ -1752,11 +1757,11 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             if strategy_type == "zero_sum":
                 objective = obj
             elif strategy_type == "canalize":                
-                target_flow = self._calculate_target_path_flow(flows, 'canalize_objective')
-                ref_start = getattr(self, 'reference_start_flow', 0)
-                if ref_start is None:
-                    ref_start = 0
-                objective = (target_flow - ref_start)
+                objective = self._calculate_target_path_flow(flows, 'canalize_objective')
+                #ref_start = getattr(self, 'reference_start_flow', 0)
+                #if ref_start is None:
+                #    ref_start = 0
+                #objective = (target_flow - ref_start)
             elif strategy_type == "isolate":
                 objective = self._calculate_target_edge_flow(flows, 'isolate_objective')
             elif strategy_type == "divert":
@@ -1887,15 +1892,20 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             objective, mean_flows_array = self._calculate_stochastic_objective_and_flow('canalize', return_full_flows=True)
             return objective, mean_flows_array
         
-    def _calculate_canalize_reward(self):
+    def _calculate_canalize_reward(self, action_cost=0):
         """Calculate reward for canalize strategy (force flow through specific path)."""
         # Reward for successful interdiction of non-target edges
         target_path_flow, self.reference_flows = self._calculate_canalize_objective_and_flows()
         
-        reward = (target_path_flow - self.last_obj) / self.canalize_norm_factor
+        effectiveness_reward = (target_path_flow - self.last_obj) / self.canalize_norm_factor
+
+        efficiency_reward = action_cost / self.reference_budget
+
+        reward = (0.95 * effectiveness_reward) - (0.05 * efficiency_reward)
+
         self.last_obj = target_path_flow
-        if reward == 0:
-            reward = self.PENALTY_VALUE
+        #if reward == 0:
+        #    reward = self.PENALTY_VALUE
         return reward
         
     def _calculate_isolate_objective_and_flows(self):
@@ -1908,7 +1918,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             objective, mean_flows_array = self._calculate_stochastic_objective_and_flow('isolate', return_full_flows=True)
             return objective, mean_flows_array
         
-    def _calculate_isolate_reward(self):
+    def _calculate_isolate_reward(self, action_cost=0):
         """Calculate reward for isolate strategy (reduce flow to specific nodes)."""
         # Reward reduction in flow to target nodes
         target_node_flow, self.reference_flows = self._calculate_isolate_objective_and_flows()
@@ -1938,7 +1948,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             mean_objective, mean_flows_array = self._calculate_stochastic_objective_and_flow('divert', return_full_flows=True)
             return mean_objective, mean_flows_array
 
-    def _calculate_divert_reward(self):
+    def _calculate_divert_reward(self, action_cost=0):
         """Calculate reward for divert strategy (redirect flow from one path to another)."""
         # Calculate reward based on flow diversion success
         diverted_flow, self.reference_flows = self._calculate_divert_objective_and_flows()
