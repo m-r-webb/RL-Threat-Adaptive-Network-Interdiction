@@ -2114,13 +2114,7 @@ class InterdictionSolverMixin:
         current_flow_vals = np.zeros(len(valid_actions))
         
         # Jitter logic
-        if not projection_uses_flow:
-            current_flow_vals = self.state['edge_capacity'][valid_actions]
-            if include_projection:
-                projected_values = self._calculate_projections(
-                    valid_actions, flows, remaining_budget, projection_uses_flow
-                )
-        elif jitter and hasattr(self, 'calculate_jittered_flows') and remaining_budget < 10:
+        if jitter and hasattr(self, 'calculate_jittered_flows') and remaining_budget > 8:
             flow_histories = self.calculate_jittered_flows(self.attacker_strategy, flows)
             
             # Compute flow values across all histories for all valid actions
@@ -2142,21 +2136,18 @@ class InterdictionSolverMixin:
             # Extract the minimized flow values
             current_flow_vals = all_flow_vals[np.arange(len(valid_actions)), min_indices]
             
-            # Projections (batch by history index to avoid redundant calls)
+            # Projections for jitter are based on capacity * probability (same as jitter=False, projection_uses_flow=False)
             if include_projection:
-                unique_indices = np.unique(min_indices)
-                for idx in unique_indices:
-                    # Find which actions map to this history
-                    action_mask = (min_indices == idx)
-                    subset_actions = valid_actions[action_mask]
-                    
-                    if len(subset_actions) > 0:
-                        hist_flows = flow_histories[idx]
-                        subset_proj_vals = self._calculate_projections(
-                            subset_actions, hist_flows, remaining_budget, projection_uses_flow
-                        )
-                        projected_values[action_mask] = subset_proj_vals
+                projected_values = self._calculate_projections(
+                    valid_actions, flows, remaining_budget, projection_uses_flow=False
+                )
                         
+        elif not projection_uses_flow:
+            current_flow_vals = self.state['edge_capacity'][valid_actions]
+            if include_projection:
+                projected_values = self._calculate_projections(
+                    valid_actions, flows, remaining_budget, projection_uses_flow
+                )
         else:
             # Standard single-flow logic
             if isinstance(flows, np.ndarray):
@@ -2713,6 +2704,10 @@ class InterdictionSolverMixin:
         import copy, numpy as np, ray as _ray, time
 
         start_time = time.time()
+        
+        if jitter:
+            enable_alpha_pruning = True
+            reduce_flow = True
 
         # init ray if not already
         if n_workers > 0 and not ray.is_initialized():
