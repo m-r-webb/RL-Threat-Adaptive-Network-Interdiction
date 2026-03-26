@@ -1858,143 +1858,6 @@ class InterdictionSolverMixin:
 
         return (self.optimal_stochastic_model_IM.objVal, interdicted_edges, interdicted_quantities)
 
-    def calculate_jittered_flows(self, strategy, initial_flows=None):
-        """
-        Iterative flow minimization on active edges (Jitter) to improve heuristic robustness.
-        """
-        
-        # 1. Get initial flows if not provided
-        if initial_flows is None:
-            _, initial_flows = self.solve_max_flow(routing_assumption=strategy)
-            
-        current_flows = initial_flows
-        
-        # Handle numpy array input by converting to dict
-        if isinstance(current_flows, np.ndarray):
-            current_flows_dict = {}
-            # Assume array corresponds to self.both_edges
-            for i, edge in enumerate(self.both_edges):
-                if i < len(current_flows):
-                    current_flows_dict[edge] = float(current_flows[i])
-            current_flows_items = current_flows_dict.items()
-        else:
-            current_flows_dict = copy.deepcopy(current_flows)
-            current_flows_items = current_flows_dict.items()
-            
-        flow_history = [current_flows_dict]
-        
-        # Access the underlying model
-        if not hasattr(self, 'maxflow_model') or self.maxflow_model is None:
-             return flow_history 
-
-        model = self.maxflow_model
-        
-        # Identify active edges (> 1e-4) - Use flow_var keys to ensure we match model variables
-        # Note: current_flows might be a dict or array. 
-        # If it's a dict, keys are edges. If array, we need mapping.
-        # Assuming dict as per solve_max_flow output.
-        
-        # Determine valid future action candidates to filter active edges
-        action_mask = self.mask_fn()
-        valid_actions_indices = np.where(action_mask[:self.num_interdictable] == 1)[0]
-        # Map indices to edge tuples
-        valid_action_edges = set()
-        for idx in valid_actions_indices:
-            if idx < len(self.both_edges):
-                valid_action_edges.add(self.both_edges[idx])
-
-        active_edges = set()
-        for e, f in current_flows_items:
-            # Intersection: Must have flow AND be a valid future action
-            if f > 1e-4 and e in valid_action_edges:
-                active_edges.add(e)
-                
-        prev_active_edges = None
-        
-        # Arbitrary high index for new objective (to avoid overwriting existing ones like MaxFlow at 0)
-        jitter_obj_index = 10 
-        
-        iteration = 0
-        max_iter = 20 # Safety limit
-        
-        try:
-            # Iterate until active set (intersection of flow and valid actions) stabilizes
-            while iteration < max_iter:
-                # Compare sets of active edges
-                if active_edges == prev_active_edges:
-                    break
-                    
-                prev_active_edges = active_edges.copy()
-                iteration += 1
-                
-                if not active_edges:
-                    break
-                
-                # Maximize -sum(flow on active_edges) => Minimize sum(flow)
-                # Priority 0 ensures we don't degrade primary/secondary objectives (which constitute max flow)
-                # We only want to minimize flow on edges that WERE active, without reducing total max flow.
-                
-                # Filter active_edges to ensure they exist in current flow_var (safety)
-                valid_active_edges = [e for e in active_edges if e in self.flow_var]
-                
-                if not valid_active_edges:
-                    break
-
-                expr = grb.quicksum(self.flow_var[e] for e in valid_active_edges)
-                model.setObjectiveN(-expr, index=jitter_obj_index, priority=0, weight=1.0, name="jitter_min_flow")
-                
-                # Optimize
-                callback = None
-                if strategy in ['divert', 'canalize', 'isolate'] and hasattr(self, '_subtour_callback'):
-                    if hasattr(self, '_update_sensitive_edges'):
-                        self._update_sensitive_edges(strategy)
-                    callback = self._subtour_callback
-
-                if callback:
-                    model.optimize(callback)
-                else:
-                    model.optimize()
-                
-                if model.status not in [grb.GRB.OPTIMAL, grb.GRB.SUBOPTIMAL]:
-                    break
-                
-                # Extract new flows directly from model variables
-                # This ensures we get the flows from the specific solution found
-                
-                # Update aggregated minimums
-                new_active_edges = set()
-                
-                # Get all flow vars
-                all_edges = list(self.flow_var.keys())
-                all_vars = [self.flow_var[e] for e in all_edges]
-                all_vals = model.getAttr("X", all_vars)
-                
-                current_iter_flows = copy.deepcopy(flow_history[-1]) if flow_history else current_flows_dict.copy()
-                
-                for i, e in enumerate(all_edges):
-                    f = all_vals[i]
-                    current_iter_flows[e] = f
-                    
-                    # Update active set: Must have flow AND be valid action
-                    # AND was already in the active set (can only shrink)
-                    if f > 1e-4 and e in valid_action_edges and e in active_edges:
-                        new_active_edges.add(e)
-                
-                flow_history.append(current_iter_flows)
-                active_edges = new_active_edges
-                
-        except Exception as e:
-            # Fallback to initial flows if anything fails
-            pass
-        
-        # Clean up objective
-        try:
-            model.setObjectiveN(0.0, index=jitter_obj_index, priority=0, weight=0.0)
-        except:
-            pass
-            
-        return flow_history
-
     def _calculate_projections(self, valid_actions, flows, remaining_budget, projection_uses_flow):
         projected_values = np.zeros(len(valid_actions))
 
@@ -2114,8 +1977,8 @@ class InterdictionSolverMixin:
         current_flow_vals = np.zeros(len(valid_actions))
         
         # Jitter logic
-        if jitter and hasattr(self, 'calculate_jittered_flows') and remaining_budget > 8:
-            flow_histories = self.calculate_jittered_flows(self.attacker_strategy, flows)
+        if jitter and hasattr(self, 'flow_histories') and remaining_budget < 10:
+            flow_histories = self.flow_histories
             
             # Compute flow values across all histories for all valid actions
             # Shape: (len(valid_actions), len(flow_histories))

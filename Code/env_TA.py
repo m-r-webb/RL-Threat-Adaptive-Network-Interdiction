@@ -400,9 +400,53 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                  obj_val = self.maxflow_model.ObjVal
             
             flow_results = {e: var.X for e, var in self.flow_var.items()}
+            self.flow_histories = [flow_results.copy()]
+
+            # --- NEW INJECTED JITTER LOGIC ---
+            if getattr(self, 'jitter', False) and current_budget >5:
+                action_mask = self.mask_fn()
+                valid_actions_indices = np.where(action_mask[:self.num_interdictable] == 1)[0]
+                valid_action_edges = {self.both_edges[idx] for idx in valid_actions_indices if idx < len(self.both_edges)}
+
+                active_edges = {e for e, f in flow_results.items() if f > 1e-4 and e in valid_action_edges}
+                prev_active_edges = None
+                
+                iteration = 0
+                while iteration < 20 and active_edges and active_edges != prev_active_edges:
+                    prev_active_edges = active_edges.copy()
+                    iteration += 1
+
+                    valid_active_edges = [e for e in active_edges if e in self.flow_var]
+                    if not valid_active_edges:
+                        break
+
+                    # Overwrite the reduce_flow objective (Index 3, Priority 1) to iteratively squeeze active elements
+                    squeeze_expr = grb.quicksum(self.flow_var[e] for e in valid_active_edges)
+                    self.maxflow_model.setObjectiveN(-squeeze_expr, index=reduce_flow_idx, priority=1, weight=1.0, name="jitter_min_flow")
+                    
+                    self.maxflow_model.optimize(callback)
+                    
+                    if self.maxflow_model.Status not in [grb.GRB.OPTIMAL, grb.GRB.SUBOPTIMAL]:
+                        break
+
+                    # Get new flow dict
+                    current_iter_flows = {e: var.X for e, var in self.flow_var.items()}
+                    self.flow_histories.append(current_iter_flows)
+
+                    # Next active edges
+                    active_edges = {e for e in valid_active_edges if current_iter_flows[e] > 1e-4}
+
+                # Restore original reduce_flow objective state for future calls
+                if use_reduce_flow:
+                    self.maxflow_model.setObjectiveN(reduce_flow_expr, index=reduce_flow_idx, priority=1, weight=-1.0, name="reduce_flow_min_edges")
+                else:
+                    self.maxflow_model.setObjectiveN(0.0, index=reduce_flow_idx, priority=0, weight=0.0, name="reduce_flow_disabled")
+            # ---------------------------------
+            
         else:
             obj_val = 0
             flow_results = {e: 0 for e in self.flow_var.keys()}
+            self.flow_histories = [flow_results.copy()]
         return obj_val, flow_results 
 
     def _update_sensitive_edges(self, routing_assumption):
