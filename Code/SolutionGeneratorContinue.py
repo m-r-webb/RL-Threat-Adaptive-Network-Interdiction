@@ -26,21 +26,23 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 import ray
 
 #User Determined Settings
-graphName = "G5x5"
+graphName = "UKR"
 env_params = {'deterministic_agent': False,
               'multiple_interdiction_attempts': False,
-              'attacker_strategy': 'zero_sum',  # canalize   isolate   divert  zero_sum
-              'training_budget_range': (5,15),  #G5x5: zero_sum/isolate: (5,15), canalize/divert: (12,24) G10x10: zero_sum/isolate: (10,20), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (18,30) G15x15: zero_sum/isolate: (25,45)
+              'attacker_strategy': 'divert',  # canalize   isolate   divert  zero_sum
+              'training_budget_range': (12,20),  #G5x5: zero_sum/isolate: (5,15), canalize/divert: (12,24) G10x10: zero_sum/isolate: (10,20), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (18,30) G15x15: zero_sum/isolate: (25,45)
               'max_path_length': 2,  #G5x5: 2,  G10x10: 3, UKR: 4
               'sample_size': None,
               'penalty_value': -0.01,
              }
               
-version_date = "02_19" # numeric month_day
-version_type = "opt_m"  # bi for backward induction or opt_m or opt_d for optimal MIP
+version_date = "03_20" # numeric month_day
+version_type = "bi"  # bi for backward induction or opt_m or opt_d for optimal MIP
 num_cpus_run = 36   # 36  44
 
-model_name = "G5x5_S_MaskablePPO_zero_sum_B_v01_16_GCN"
+model_name = None #"UKR_S_MaskablePPO_zero_sum_B_v03_06"
+model_timesteps = None #17640000         # Set a number, 1512000, or  None
+
 
 # Number of scenarios to generate
 num_of_scenarios = 500 
@@ -77,10 +79,12 @@ elif version_type == "opt_d":
 # LOAD Previous saved model
 current_dir = os.getcwd()
 models_dir = os.path.join(current_dir, '..', 'Trained_RL_Models')
-model_timesteps = None #17640000 #None #4830000 #None #          # Set a number, 1512000, or  None
-if model_timesteps == None:
-    model_path = f"{models_dir}/{model_name}/best_model"
-else:    model_path = f"{models_dir}/{model_name}/{model_name}_{model_timesteps}_steps"
+if model_name == None:
+    model_path = None
+else:
+    if model_timesteps == None:
+        model_path = f"{models_dir}/{model_name}/best_model"
+    else:    model_path = f"{models_dir}/{model_name}/{model_name}_{model_timesteps}_steps"
 
 if env_params['multiple_interdiction_attempts'] == True:
     MI_letter = 'M'
@@ -202,12 +206,12 @@ else:
                         optimal_obj_val, optimal_interdiction_edges = env.solve_optimal_interdiction(method=opt_method, time_limit=time_limit_sec) 
                     elif version_type == 'bi':
                         # Reduced n_workers to avoid thread resource exhaustion
-                        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = num_cpus_run-6, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, reduce_flow=True, rl_model_path=model_path, time_limit=time_limit_sec) 
+                        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = num_cpus_run-6, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, reduce_flow=True, jitter = False, parallel_expansion=True, projection_uses_flow=False, rl_model_path=model_path, time_limit=time_limit_sec)
                     end_time = time.perf_counter()
                 else:
                     start_time = time.perf_counter()
                     # Reduced n_workers to avoid thread resource exhaustion
-                    optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = num_cpus_run-6, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, reduce_flow=True, rl_model_path=model_path, time_limit=time_limit_sec) 
+                    optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = num_cpus_run-6, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, reduce_flow=True, jitter=False, parallel_expansion=True, projection_uses_flow=False, rl_model_path=model_path, time_limit=time_limit_sec)
                     end_time = time.perf_counter()
                 
                 solve_time = end_time - start_time
