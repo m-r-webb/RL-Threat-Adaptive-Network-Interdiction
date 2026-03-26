@@ -1977,7 +1977,7 @@ class InterdictionSolverMixin:
         current_flow_vals = np.zeros(len(valid_actions))
         
         # Jitter logic
-        if jitter and hasattr(self, 'flow_histories') and remaining_budget < 10:
+        if jitter and hasattr(self, 'flow_histories') and remaining_budget > 5:
             flow_histories = self.flow_histories
             
             # Compute flow values across all histories for all valid actions
