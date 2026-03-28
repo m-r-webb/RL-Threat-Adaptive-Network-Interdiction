@@ -403,7 +403,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             self.flow_histories = [flow_results.copy()]
 
             # --- NEW INJECTED JITTER LOGIC ---
-            if getattr(self, 'jitter', False) and current_budget >5:
+            if getattr(self, 'jitter', False) and current_budget > 5:
                 action_mask = self.mask_fn()
                 valid_actions_indices = np.where(action_mask[:self.num_interdictable] == 1)[0]
                 valid_action_edges = {self.both_edges[idx] for idx in valid_actions_indices if idx < len(self.both_edges)}
@@ -1941,15 +1941,22 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         # Reward for successful interdiction of non-target edges
         target_path_flow, self.reference_flows = self._calculate_canalize_objective_and_flows()
         
-        effectiveness_reward = (target_path_flow - self.last_obj) / self.canalize_norm_factor
+        #effectiveness_reward = (target_path_flow - self.last_obj) / self.canalize_norm_factor
 
-        efficiency_reward = action_cost / self.reference_budget
+        #efficiency_reward = action_cost / self.reference_budget
 
-        reward = (0.95 * effectiveness_reward) - (0.05 * efficiency_reward)
+        #reward = (0.98 * effectiveness_reward) - (0.02 * efficiency_reward)
 
-        self.last_obj = target_path_flow
+        #self.last_obj = target_path_flow
         #if reward == 0:
         #    reward = self.PENALTY_VALUE
+        
+        reward = (target_path_flow - self.last_obj) / self.reference_budget  
+        self.last_obj = target_path_flow
+        if reward == 0:
+            reward = self.PENALTY_VALUE / self.reference_budget
+        return reward
+        
         return reward
         
     def _calculate_isolate_objective_and_flows(self):
