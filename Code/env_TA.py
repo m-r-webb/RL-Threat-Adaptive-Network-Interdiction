@@ -1015,7 +1015,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                 self.reference_obj = 0
                 
                 # Check if restart is needed for divert strategy (objective must have 3 edges and some from_flow to divert)
-                if self.reference_start_flows[0] == 0 or np.sum(self.state['divert_to_objective']) < 3:
+                if self.reference_start_flows[0] == 0 or np.sum(self.state['divert_to_objective']) < 2:
                     continue
             
             # If we made it here, the environment is valid
@@ -1488,14 +1488,14 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             divert_to_post = self._find_alternate_segment(breakpoint_node, divert_from_segments, avoid_nodes, breakpoint_dist)
             
             if divert_to_post:
-                divert_to_segments = [start_edge] + divert_to_post
-                candidates.append((divert_from_segments, divert_to_segments))
+                divert_to_segments = divert_to_post
+                candidates.append((divert_from_segments[1:], divert_to_segments))
 
         if not candidates:
             # Fallback if no valid configuration found
             divert_from_edges = []
             if top_edges:
-                divert_from_edges = [top_edges[0]]
+                divert_from_edges = [top_edges[0]]  # Or keep it empty depending on requirements
             divert_to_edges = []
         else:
             # Randomly choose a breakpoint configuration
