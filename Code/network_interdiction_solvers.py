@@ -23,12 +23,24 @@ import zlib
 class _ProgressActor:
     def __init__(self):
         self.count = 0
-    def increment(self, n: int = 1):
+        self.pruned_count = 0
+        self.invalid_count = 0
+        self.memo_count = 0
+        self.base_count = 0
+    def increment(self, n: int = 1, pruned: int = 0, invalid: int = 0, memo: int = 0, base: int = 0):
         self.count += int(n)
+        self.pruned_count += int(pruned)
+        self.invalid_count += int(invalid)
+        self.memo_count += int(memo)
+        self.base_count += int(base)
     def get_count(self):
-        return self.count
+        return self.count, self.pruned_count, self.invalid_count, self.memo_count, self.base_count
     def reset(self):
         self.count = 0
+        self.pruned_count = 0
+        self.invalid_count = 0
+        self.memo_count = 0
+        self.base_count = 0
 
 @ray.remote
 class _SharedMemoActor:
@@ -162,6 +174,10 @@ class _RemoteEnvWorker:
         # Use persistent local cache (hot between tasks)
         memo_local = self.memo_local 
         local_counter = 0
+        local_pruned_counter = 0
+        local_invalid_counter = 0
+        local_memo_counter = 0
+        local_base_counter = 0
         
         # Local cache of the global alpha value
         local_alpha_cache = -float('inf')
@@ -181,16 +197,20 @@ class _RemoteEnvWorker:
         report_interval = 0.5  # Max 2 reports per second per worker
 
         def maybe_flush_progress():
-            nonlocal local_counter, last_report_time, local_alpha_cache, pending_alpha_ref
+            nonlocal local_counter, local_pruned_counter, local_invalid_counter, local_memo_counter, local_base_counter, last_report_time, local_alpha_cache, pending_alpha_ref
             # 1. Check if we have enough accumulated progress (batch size)
-            if self.progress_actor is not None and local_counter >= self.progress_granularity:
+            if self.progress_actor is not None and (local_counter >= self.progress_granularity or local_pruned_counter >= self.progress_granularity or local_invalid_counter >= self.progress_granularity or local_memo_counter >= self.progress_granularity or local_base_counter >= self.progress_granularity):
                 # 2. Check if enough time has passed (throttle)
                 now = time.time()
                 if (now - last_report_time) > report_interval:
                     try:
                         # report and reset local counter (best-effort)
-                        self.progress_actor.increment.remote(local_counter)
+                        self.progress_actor.increment.remote(local_counter, local_pruned_counter, local_invalid_counter, local_memo_counter, local_base_counter)
                         local_counter = 0
+                        local_pruned_counter = 0
+                        local_invalid_counter = 0
+                        local_memo_counter = 0
+                        local_base_counter = 0
                         last_report_time = now
                         
                         # Sync alpha asynchronously (NON-BLOCKING)
@@ -214,7 +234,7 @@ class _RemoteEnvWorker:
         self.env.state['edge_interdicted'][:] = interdicted_state
 
         def dp_local(d, alpha=-float('inf')):
-            nonlocal local_counter, local_alpha_cache
+            nonlocal local_counter, local_pruned_counter, local_invalid_counter, local_memo_counter, local_base_counter, local_alpha_cache
             
             # Read current state directly from env (already synchronized)
             # Use slice for key generation
@@ -230,6 +250,7 @@ class _RemoteEnvWorker:
                 # ADDED: Count volume for cached hit
                 vol = int(int(self.num_both_edges) ** max(0, self.budget_levels - d))
                 local_counter += vol
+                local_memo_counter += vol
                 maybe_flush_progress()
                 return memo_local[key]
 
@@ -252,6 +273,7 @@ class _RemoteEnvWorker:
                 # ADDED: Count volume for cached hit
                 vol = int(int(self.num_both_edges) ** max(0, self.budget_levels - d))
                 local_counter += vol
+                local_memo_counter += vol
                 maybe_flush_progress()
                 return shared_val
 
@@ -285,6 +307,7 @@ class _RemoteEnvWorker:
                 # Count the volume of the skipped subtree (leaves)
                 volume = int(int(self.num_both_edges) ** max(0, self.budget_levels - d))
                 local_counter += volume
+                local_base_counter += volume
                 maybe_flush_progress()
                 # publish to central memo (best-effort, async)
                 if target_actor is not None:
@@ -304,7 +327,9 @@ class _RemoteEnvWorker:
                 try:
                     # estimated states pruned by each invalid action
                     est_per_invalid = int(int(self.num_both_edges) ** max(0, self.budget_levels - (d + 1)))
-                    local_counter += num_invalid * est_per_invalid
+                    invalid_vol = num_invalid * est_per_invalid
+                    local_counter += invalid_vol
+                    local_invalid_counter += invalid_vol
                     maybe_flush_progress()
                 except Exception:
                     pass
@@ -345,7 +370,9 @@ class _RemoteEnvWorker:
                      if n_pruned > 0:
                          # 1. Update progress for the entire batch of pruned subtrees
                          est_per_skipped = int(int(self.num_both_edges) ** max(0, self.budget_levels - (d + 1)))
-                         local_counter += n_pruned * est_per_skipped
+                         pruned_vol = n_pruned * est_per_skipped
+                         local_counter += pruned_vol
+                         local_pruned_counter += pruned_vol
                          maybe_flush_progress()
                          
                          # 2. Apply filter to reduce array sizes
@@ -372,7 +399,9 @@ class _RemoteEnvWorker:
                      if final_objective + heuristics[i] < alpha - 1e-6:
                          skipped_actions = len(valid_actions) - i
                          est_per_skipped = int(self.num_both_edges ** max(0, self.budget_levels - (d + 1)))
-                         local_counter += skipped_actions * est_per_skipped
+                         pruned_vol = skipped_actions * est_per_skipped
+                         local_counter += pruned_vol
+                         local_pruned_counter += pruned_vol
                          maybe_flush_progress()
                          # Do not memoize results from pruned nodes as they may be valid for lower alphas
                          return best_reward, best_seq
@@ -422,9 +451,9 @@ class _RemoteEnvWorker:
 
         result = dp_local(depth)
         # flush any remaining progress
-        if self.progress_actor is not None and local_counter > 0:
+        if self.progress_actor is not None and (local_counter > 0 or local_pruned_counter > 0 or local_invalid_counter > 0 or local_memo_counter > 0 or local_base_counter > 0):
             try:
-                self.progress_actor.increment.remote(local_counter)
+                self.progress_actor.increment.remote(local_counter, local_pruned_counter, local_invalid_counter, local_memo_counter, local_base_counter)
             except Exception:
                 pass
         return result
@@ -478,8 +507,8 @@ class _RemoteEnvWorker:
                 # remaining_depth = budget_levels - (current_depth + 1)
                 child_remaining_depth = max(0, self.budget_levels - (depth + 1))
                 child_volume = int(self.num_both_edges) ** child_remaining_depth
-                pruned_volume = num_invalid * child_volume
-                self.progress_actor.increment.remote(pruned_volume)
+                inv_vol = num_invalid * child_volume
+                self.progress_actor.increment.remote(inv_vol, 0, inv_vol, 0, 0)
             
             # 5. Generate Children Data
             children_data = []
@@ -2751,9 +2780,13 @@ class InterdictionSolverMixin:
             # Define recursive solver for serial execution
             best_incumbent_reward = initial_alpha
             best_incumbent_seq = [self.edge_to_index[e] for e in initial_alpha_actions]
+            serial_pruned_count = 0
+            serial_invalid_count = 0
+            serial_memo_count = 0
+            serial_base_count = 0
 
             def dp_serial(rem_budget, inter_state, d, alpha=-float('inf'), path_to_here=[]):
-                nonlocal best_incumbent_reward, best_incumbent_seq
+                nonlocal best_incumbent_reward, best_incumbent_seq, serial_pruned_count, serial_invalid_count, serial_memo_count, serial_base_count
                 
                 if time.time() - start_time > time_limit:
                     raise TimeoutError("Time limit exceeded")
@@ -2765,6 +2798,7 @@ class InterdictionSolverMixin:
 
                 if enable_memoization and key in memo_serial:
                     pbar.update(current_volume)
+                    serial_memo_count += current_volume
                     return memo_serial[key]
                 
                 # Save state
@@ -2812,6 +2846,7 @@ class InterdictionSolverMixin:
                     if enable_memoization:
                         memo_serial[key] = (val, [])
                     pbar.update(current_volume)
+                    serial_base_count += current_volume
                     return val, []
 
                 # Get actions
@@ -2827,7 +2862,9 @@ class InterdictionSolverMixin:
                 num_invalid = int(self.num_both_edges) - len(valid_actions)
                 if num_invalid > 0:
                     child_volume = int(int(self.num_both_edges) ** max(0, budget_levels - (d + 1)))
-                    pbar.update(num_invalid * child_volume)
+                    inv_vol = num_invalid * child_volume
+                    pbar.update(inv_vol)
+                    serial_invalid_count += inv_vol
 
                 if len(valid_actions) == 0:
                     if enable_memoization:
@@ -2861,7 +2898,9 @@ class InterdictionSolverMixin:
                          if val + heuristics[i] < alpha- 1e-6:
                              skipped_actions = len(valid_actions) - i
                              child_volume = int(int(self.num_both_edges) ** max(0, budget_levels - (d + 1)))
-                             pbar.update(skipped_actions * child_volume)
+                             pruned_vol = skipped_actions * child_volume
+                             pbar.update(pruned_vol)
+                             serial_pruned_count += pruned_vol
                              break
 
                     inter_state[action] += 1
@@ -2901,6 +2940,21 @@ class InterdictionSolverMixin:
                 opt_seq = best_incumbent_seq
 
             pbar.close()
+
+            total_states_evaluated = estimated_states
+            if total_states_evaluated > 0:
+                pruned_pct = (serial_pruned_count / total_states_evaluated * 100)
+                invalid_pct = (serial_invalid_count / total_states_evaluated * 100)
+                memo_pct = (serial_memo_count / total_states_evaluated * 100)
+                base_pct = (serial_base_count / total_states_evaluated * 100)
+                
+                print(f"--- DP State Traversal Breakdown ---")
+                print(f"Alpha Pruning States Dropped:   {serial_pruned_count:,} ({pruned_pct:.2f}%)")
+                print(f"Invalid Actions States Dropped: {serial_invalid_count:,} ({invalid_pct:.2f}%)")
+                print(f"Memoization Cache Hits:         {serial_memo_count:,} ({memo_pct:.2f}%)")
+                print(f"Leaves Actually Visited:        {serial_base_count:,} ({base_pct:.2f}%)")
+                print(f"Total States (Estimated):       {total_states_evaluated:,}")
+                print(f"------------------------------------")
 
             if verbose:
                 print(f"Serial execution completed in {time.time() - t0:.2f}s")
@@ -3002,7 +3056,7 @@ class InterdictionSolverMixin:
                 nonlocal last_reported
                 while not stop_event.is_set():
                     try:
-                        current = ray.get(progress_actor.get_count.remote(), timeout=1)
+                        current, _, _, _, _ = ray.get(progress_actor.get_count.remote(), timeout=1)
                     except Exception:
                         current = last_reported
                     delta = current - last_reported
@@ -3179,7 +3233,7 @@ class InterdictionSolverMixin:
                         node.value, node.best_sequence = memo_driver[node.key]
                         node.is_terminal = True
                         # Driver pruned this whole subtree -> Report progress
-                        progress_actor.increment.remote(node_volume)
+                        progress_actor.increment.remote(node_volume, 0, 0, node_volume, 0)
                         continue
 
                     # Check base cases
@@ -3243,7 +3297,7 @@ class InterdictionSolverMixin:
                         child_remaining_depth = max(0, budget_levels_local - (node.depth + 1))
                         child_volume = int(self.num_both_edges) ** child_remaining_depth
                         pruned_volume = num_invalid * child_volume
-                        progress_actor.increment.remote(pruned_volume)
+                        progress_actor.increment.remote(pruned_volume, 0, pruned_volume, 0, 0)
 
                     # Expand children
                     for action in valid_actions:
@@ -3412,12 +3466,31 @@ class InterdictionSolverMixin:
             # Cleanup
             stop_event.set()
             poll_thread.join(timeout=2)
+            final_pruned = 0
+            final_invalid = 0
+            final_memo = 0
+            final_base = 0
             try:
-                final = ray.get(progress_actor.get_count.remote())
+                final, final_pruned, final_invalid, final_memo, final_base = ray.get(progress_actor.get_count.remote())
                 pbar.update(final - last_reported)
             except Exception:
                 pass
             pbar.close()
+
+            total_states_evaluated = estimated_states
+            if total_states_evaluated > 0:
+                pruned_pct = (final_pruned / total_states_evaluated * 100)
+                invalid_pct = (final_invalid / total_states_evaluated * 100)
+                memo_pct = (final_memo / total_states_evaluated * 100)
+                base_pct = (final_base / total_states_evaluated * 100)
+                
+                print(f"--- DP State Traversal Breakdown ---")
+                print(f"Alpha Pruning States Dropped:   {final_pruned:,} ({pruned_pct:.2f}%)")
+                print(f"Invalid Actions States Dropped: {final_invalid:,} ({invalid_pct:.2f}%)")
+                print(f"Memoization Cache Hits:         {final_memo:,} ({memo_pct:.2f}%)")
+                print(f"Leaves Actually Visited:        {final_base:,} ({base_pct:.2f}%)")
+                print(f"Total States (Estimated):       {total_states_evaluated:,}")
+                print(f"------------------------------------")
 
             if optimal_reward is not None and optimal_reward <= initial_alpha + 1.1e-4:
                 print("Note: The initial alpha (from heuristic or RL) was not beaten during backward induction.")
