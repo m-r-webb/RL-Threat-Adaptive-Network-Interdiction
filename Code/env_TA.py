@@ -1008,11 +1008,14 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             elif self.attacker_strategy == 'isolate':
                 self.reference_obj, self.reference_flows = self._calculate_isolate_objective_and_flows()
             elif self.attacker_strategy == 'divert':
-                _, self.reference_flows = self.solve_max_flow(routing_assumption = 'divert')
-                from_flow = self._calculate_target_path_flow(self.reference_flows, 'divert_from_objective')
-                to_flow = self._calculate_target_path_flow(self.reference_flows, 'divert_to_objective')
+                _, self.reference_flows_dict = self.solve_max_flow(routing_assumption = 'divert')
+                from_flow = self._calculate_target_path_flow(self.reference_flows_dict, 'divert_from_objective')
+                to_flow = self._calculate_target_path_flow(self.reference_flows_dict, 'divert_to_objective')
                 self.reference_start_flows = (from_flow, to_flow)
                 self.reference_obj = 0
+                self.last_from_flow = self._calculate_total_path_flow(self.reference_flows_dict, 'divert_from_objective')
+                self.last_to_flow = self._calculate_total_path_flow(self.reference_flows_dict, 'divert_to_objective')
+                self.reference_flows = self._flows_dict_to_array(self.reference_flows_dict)
                 
                 # Check if restart is needed for divert strategy (objective must have 3 edges and some from_flow to divert)
                 if self.reference_start_flows[0] == 0 or np.sum(self.state['divert_to_objective']) < 2:
@@ -1989,6 +1992,11 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             _, flows = self.solve_max_flow(routing_assumption = 'divert')
             from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
             to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
+            
+            # Store current path flows to be used in reward calculation
+            self.current_from_flow = self._calculate_total_path_flow(flows, 'divert_from_objective')
+            self.current_to_flow = self._calculate_total_path_flow(flows, 'divert_to_objective')
+            
             diverted_flow_from = (self.reference_start_flows[0] - from_flow)
             diverted_flow_to = (to_flow - self.reference_start_flows[1]) 
             objective = np.min([diverted_flow_from,diverted_flow_to])
@@ -1996,6 +2004,8 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             return objective, self._flows_dict_to_array(flows)
         else:
             # Stochastic calculation - returns mean objectives directly
+            # Note: you still need to ensure stochastic implementation of current_from_flow/to_flow if needed here.
+            # But the user calculates stochastic reward returning mean objectives.
             mean_objective, mean_flows_array = self._calculate_stochastic_objective_and_flow('divert', return_full_flows=True)
             return mean_objective, mean_flows_array
 
@@ -2004,11 +2014,76 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         # Calculate reward based on flow diversion success
         diverted_flow, self.reference_flows = self._calculate_divert_objective_and_flows()
         
-        reward = (diverted_flow - self.last_obj) / self.reference_start_flows[0] #reference_budget  
+        # Base reward scaled by initial budget
+        base_reward = (diverted_flow - self.last_obj) / self.reference_budget  
+        
+        # Get current path flows using array method
+        current_from_flow = self._calculate_total_path_flow_from_array(self.reference_flows, 'divert_from_objective')
+        current_to_flow = self._calculate_total_path_flow_from_array(self.reference_flows, 'divert_to_objective')
+
+        # Get number of edges in each objective
+        num_from_edges = np.sum(self.state['divert_from_objective'][:self.num_both_edges])
+        num_to_edges = np.sum(self.state['divert_to_objective'][:self.num_both_edges])
+        
+        num_from_edges = num_from_edges if num_from_edges > 0 else 1
+        num_to_edges = num_to_edges if num_to_edges > 0 else 1
+        
+        # Calculate marginal flow changes
+        marginal_from_reduction = self.last_from_flow - current_from_flow
+        marginal_to_increase = current_to_flow - self.last_to_flow
+        
+        term1 = marginal_from_reduction / (num_from_edges * self.reference_budget)
+        term2 = marginal_to_increase / (num_to_edges * self.reference_budget)
+        
+        reward = base_reward + term1 + term2
+
+        # Update historical values
         self.last_obj = diverted_flow
+        self.last_from_flow = current_from_flow
+        self.last_to_flow = current_to_flow
+        
         if reward == 0:
             reward = self.PENALTY_VALUE / self.reference_budget
-        return reward
+        return float(reward)
+
+    def _calculate_total_path_flow_from_array(self, flow_array, objective_key):
+        """Calculate total sum of flow through edges marked in the objective using a flow array."""
+        path_edges = self._extract_directed_path_edges(objective_key)
+
+        if not path_edges:
+            return 0.0
+    
+        target_flows = [flow_array[self.edge_to_index[edge]] for edge in path_edges if edge in self.edge_to_index]
+        
+        if not target_flows:
+            return 0.0
+    
+        return sum(target_flows)
+
+    def _calculate_total_path_flow(self, flows, objective_key):
+        """Calculate total sum of flow through edges marked in the objective."""
+        path_edges = self._extract_directed_path_edges(objective_key)
+
+        if not path_edges:
+            return 0.0
+    
+        target_flows = [flows.get(edge, 0) for edge in path_edges]
+    
+        return sum(target_flows)
+
+    def _calculate_target_path_flow_from_array(self, flow_array, objective_key):
+        """Calculate total flow through edges marked in the objective using a flow array."""
+        path_edges = self._extract_directed_path_edges(objective_key)
+
+        if not path_edges:
+            return 0.0
+    
+        target_flows = [flow_array[self.edge_to_index[edge]] for edge in path_edges if edge in self.edge_to_index]
+        
+        if not target_flows:
+            return 0.0
+    
+        return min(target_flows)
 
     def _calculate_target_path_flow(self, flows, objective_key):
         """Calculate total flow through edges marked in the objective."""
@@ -2199,11 +2274,14 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         elif self.attacker_strategy == 'isolate':
             self.reference_obj, self.reference_flows = self._calculate_isolate_objective_and_flows()
         elif self.attacker_strategy == 'divert':
-            _, self.reference_flows = self.solve_max_flow(routing_assumption = 'divert')
-            from_flow = self._calculate_target_path_flow(self.reference_flows, 'divert_from_objective')
-            to_flow = self._calculate_target_path_flow(self.reference_flows, 'divert_to_objective')
+            _, self.reference_flows_dict = self.solve_max_flow(routing_assumption = 'divert')
+            from_flow = self._calculate_target_path_flow(self.reference_flows_dict, 'divert_from_objective')
+            to_flow = self._calculate_target_path_flow(self.reference_flows_dict, 'divert_to_objective')
             self.reference_start_flows = (from_flow, to_flow)
             self.reference_obj = 0
+            self.last_from_flow = self._calculate_total_path_flow(self.reference_flows_dict, 'divert_from_objective')
+            self.last_to_flow = self._calculate_total_path_flow(self.reference_flows_dict, 'divert_to_objective')
+            self.reference_flows = self._flows_dict_to_array(self.reference_flows_dict)
         
         self.last_obj = self.reference_obj
         self.reference_budget = state['budget'][0]
