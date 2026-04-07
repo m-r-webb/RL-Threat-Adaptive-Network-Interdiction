@@ -169,7 +169,7 @@ class _RemoteEnvWorker:
             self.env.state['edge_interdiction_probability'][:self.num_both_edges]
         )
 
-    def evaluate_subtree(self, remaining_budget, interdicted_state, depth):
+    def evaluate_subtree(self, remaining_budget, interdicted_state, depth, objective_tolerance=1e-5):
         import numpy as np, ray as _ray, time, zlib # Added zlib for stable hashing
         # Use persistent local cache (hot between tasks)
         memo_local = self.memo_local 
@@ -178,6 +178,7 @@ class _RemoteEnvWorker:
         local_invalid_counter = 0
         local_memo_counter = 0
         local_base_counter = 0
+        self.objective_tolerance = objective_tolerance
         
         # Local cache of the global alpha value
         local_alpha_cache = -float('inf')
@@ -364,7 +365,7 @@ class _RemoteEnvWorker:
                 if alpha > -1e9: 
                      # Calculate pruning mask for all actions at once
                      # Condition: Is valid_upper_bound < best_known_alpha?
-                     keep_mask = (final_objective + heuristics) >= (alpha - 1e-6)
+                     keep_mask = (final_objective + heuristics) >= (alpha - self.objective_tolerance)
                      n_pruned = len(valid_actions) - np.count_nonzero(keep_mask)
                      
                      if n_pruned > 0:
@@ -396,7 +397,7 @@ class _RemoteEnvWorker:
                 # Pruning
                 if self.enable_alpha_pruning:
                      # Pruning condition using the new consolidated heuristic
-                     if final_objective + heuristics[i] < alpha - 1e-6:
+                     if final_objective + heuristics[i] < alpha - self.objective_tolerance:
                          skipped_actions = len(valid_actions) - i
                          est_per_skipped = int(self.num_both_edges ** max(0, self.budget_levels - (d + 1)))
                          pruned_vol = skipped_actions * est_per_skipped
@@ -419,7 +420,7 @@ class _RemoteEnvWorker:
                 self.env.state['edge_interdicted'][action] -= 1
                 self.env.state['budget'][0] += cost
                 
-                if fut_reward > best_reward + 1e-6:
+                if fut_reward > best_reward + self.objective_tolerance:
                     best_reward = fut_reward
                     best_seq = [action] + fut_seq
                     alpha = max(alpha, best_reward)
@@ -431,8 +432,8 @@ class _RemoteEnvWorker:
                             try:
                                 self.alpha_actor.update.remote(alpha)
                             except: pass
-                elif abs(fut_reward - best_reward) <= 1e-6:
-                    # Tie-breaking: favor sequence with the minimal total cost
+                elif abs(fut_reward - best_reward) <= self.objective_tolerance:
+                    # Tie-breaking within tolerance: favor sequence with the minimal total cost (highest remaining depth)
                     current_cost = sum(self.env.state['edge_costs'][a] for a in best_seq)
                     new_cost = self.env.state['edge_costs'][action] + sum(self.env.state['edge_costs'][a] for a in fut_seq)
                     if new_cost < current_cost:
@@ -2588,7 +2589,7 @@ class InterdictionSolverMixin:
 
     # --- Re-add solve_backward_induction_ray method to Mixin ---
     
-    def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=None, ray_address=None, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, rl_model_path=None, time_limit=3600, reduce_flow=False, parallel_expansion=False, jitter=False, projection_uses_flow=False):
+    def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=None, ray_address=None, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, rl_model_path=None, time_limit=3600, reduce_flow=False, parallel_expansion=False, jitter=False, projection_uses_flow=False, objective_tolerance=1e-5):
         """
         Parallelized backward induction using Ray with Adaptive Frontier Expansion.
         """
@@ -2825,10 +2826,10 @@ class InterdictionSolverMixin:
                     flows = {}
                 
                 # Update incumbent if we found a better terminal value (or stopping here)
-                if val > best_incumbent_reward + 1e-6:
+                if val > best_incumbent_reward + objective_tolerance:
                     best_incumbent_reward = val
                     best_incumbent_seq = list(path_to_here)
-                elif abs(val - best_incumbent_reward) <= 1e-6:
+                elif abs(val - best_incumbent_reward) <= objective_tolerance:
                     current_cost = sum(self.state['edge_costs'][a] for a in best_incumbent_seq)
                     new_cost = sum(self.state['edge_costs'][a] for a in path_to_here)
                     if new_cost < current_cost:
@@ -2895,7 +2896,7 @@ class InterdictionSolverMixin:
                 for i, action in enumerate(valid_actions):
                     # Pruning
                     if enable_alpha_pruning:
-                         if val + heuristics[i] < alpha- 1e-6:
+                         if val + heuristics[i] < alpha- objective_tolerance:
                              skipped_actions = len(valid_actions) - i
                              child_volume = int(int(self.num_both_edges) ** max(0, budget_levels - (d + 1)))
                              pruned_vol = skipped_actions * child_volume
@@ -2912,11 +2913,12 @@ class InterdictionSolverMixin:
                     
                     inter_state[action] -= 1
                     
-                    if fut_reward > best_reward + 1e-6:
+                    if fut_reward > best_reward + objective_tolerance:
                         best_reward = fut_reward
                         best_seq = [action] + fut_seq
                         alpha = max(alpha, best_reward)
-                    elif abs(fut_reward - best_reward) <= 1e-6:
+                    elif abs(fut_reward - best_reward) <= objective_tolerance:
+                        # Tie-breaking within tolerance: favor sequence with the minimal total cost (highest depth)
                         current_cost = sum(self.state['edge_costs'][a] for a in best_seq)
                         new_cost = self.state['edge_costs'][action] + sum(self.state['edge_costs'][a] for a in fut_seq)
                         if new_cost < current_cost:
@@ -3333,7 +3335,7 @@ class InterdictionSolverMixin:
                         idle_workers.append(worker)
                         continue
                         
-                    future = worker.evaluate_subtree.remote(node.budget, node.state, node.depth)
+                    future = worker.evaluate_subtree.remote(node.budget, node.state, node.depth, objective_tolerance)
                     running_futures[future] = (worker, node)
                 
                 if running_futures:
@@ -3354,11 +3356,11 @@ class InterdictionSolverMixin:
                             prefix.reverse()
                             full_seq = prefix + seq
                             
-                            if val > best_incumbent_val + 1e-6:
+                            if val > best_incumbent_val + objective_tolerance:
                                 best_incumbent_val = val
                                 best_incumbent_seq = full_seq
                                 alpha_actor.update.remote(val, full_seq)
-                            elif abs(val - best_incumbent_val) <= 1e-6:
+                            elif abs(val - best_incumbent_val) <= objective_tolerance:
                                 current_cost = sum(self.state['edge_costs'][a] for a in best_incumbent_seq)
                                 new_cost = sum(self.state['edge_costs'][a] for a in full_seq)
                                 if new_cost < current_cost:
@@ -3432,10 +3434,10 @@ class InterdictionSolverMixin:
                                 # Should not happen if logic is correct
                                 continue
                                 
-                            if child.value > best_val + 1e-6:
+                            if child.value > best_val + objective_tolerance:
                                 best_val = child.value
                                 best_seq = [child.action_from_parent] + child.best_sequence
-                            elif abs(child.value - best_val) <= 1e-6:
+                            elif abs(child.value - best_val) <= objective_tolerance:
                                 current_cost = sum(self.state['edge_costs'][a] for a in best_seq)
                                 new_cost = self.state['edge_costs'][child.action_from_parent] + sum(self.state['edge_costs'][a] for a in child.best_sequence)
                                 if new_cost < current_cost:
