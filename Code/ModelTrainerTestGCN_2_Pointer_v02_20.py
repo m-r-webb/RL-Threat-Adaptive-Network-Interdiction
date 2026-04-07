@@ -1,6 +1,6 @@
 # Train an RL agent with a Pointer Network
 ##Inputs
-graphName = "G5x5"
+graphName = "UKR"
 
 # Type of agent to train (uncomment only one)
 #agent = "A2C"
@@ -8,24 +8,24 @@ graphName = "G5x5"
 agent = "MaskablePPO"
 #agent = "PPO"
 
-version = "v02_20" #V[Month]_[Day] 
+version = "v04_07" #V[Month]_[Day] 
 
 # Initial Learning Rate
 initial_learning_rate = 0.0003  #0.0001
 
 # Time Steps to Train
-timesteps = 5000000
+timesteps = 10000000
 
 # Number of parallel cpus
 n_cpus = 100  # Number of environments
 
 env_params = {'deterministic_agent': False,
               'multiple_interdiction_attempts': False,
-              'attacker_strategy': 'canalize',  # canalize   isolate   divert  zero_sum
-              'training_budget_range': (12, 24),  #G5x5: zero_sum/isolate: (5,15), canalize/divert: (12,24) G10x10: zero_sum/isolate: (15,30), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (18,30)
-              'max_path_length': 2,  #G5x5: 2,  G10x10: 3, UKR: 4
+              'attacker_strategy': 'divert',  # canalize   isolate   divert  zero_sum
+              'training_budget_range': (9, 17),  #G5x5: zero_sum/isolate: (5,15), canalize/divert: (12,24) G10x10: zero_sum/isolate: (15,30), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (18,30)
+              'max_path_length': 4,  #G5x5: 2,  G10x10: 3, UKR: 4
               'sample_size': None,
-              'penalty_value': -0.01,
+              'penalty_value': -0.01,  #-0.001
              }
 
 if env_params['deterministic_agent']:
@@ -379,7 +379,7 @@ class AttentionPointerNetwork(nn.Module):
         # Increased layers allow for transitive reasoning (A->B->C)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=input_dim, 
-            nhead=2, #4, 
+            nhead=4, #4, 
             dim_feedforward=hidden_dim, 
             batch_first=True,
             norm_first=True # Usually stabilizes deep transformers
@@ -646,20 +646,21 @@ def make_env():
 policy_kwargs = dict(
     features_extractor_class=GCNFeatureExtractor,
     features_extractor_kwargs={
-        'edge_embedding_dim': 64, #128,
-        'hidden_dim': 128, #256,
-        'gcn_hidden_dim': 64,       # Hidden dimension for GCN layers
-        'num_gcn_layers': 2,         # Number of GCN message passing layers
+        'edge_embedding_dim': 128, #128,
+        'hidden_dim': 256, #256,
+        'gcn_hidden_dim': 128,       # Hidden dimension for GCN layers
+        'num_gcn_layers': 3,         # Number of GCN message passing layers
         'max_nodes': 500,            # Maximum number of nodes in graph (increased for safety)
         'multiple_interdiction_attempts': env_params['multiple_interdiction_attempts'],
         'attacker_strategy': env_params['attacker_strategy']
     },
-    edge_embedding_dim=64, #128,
-    hidden_dim=128, #256,
+    edge_embedding_dim=128, #128,
+    hidden_dim=256, #256,
     attacker_strategy=env_params['attacker_strategy'],
-    net_arch=[64, 64], #[256, 256],
+    net_arch=[256, 256], #[256, 256],
     activation_fn=nn.ReLU,
 )
+print(policy_kwargs)
 
 # Update your training setup to use MaskablePPO
 if __name__ == "__main__":
@@ -684,7 +685,7 @@ if __name__ == "__main__":
         eval_env,
         best_model_save_path=f"{models_dir}/{model_name}",
         log_path=f"{models_dir}/{model_name}",
-        eval_freq=250,
+        eval_freq=500,
         n_eval_episodes=100,
         deterministic=True,
         render=False,
@@ -698,15 +699,16 @@ if __name__ == "__main__":
         verbose=1,
         learning_rate=linear_schedule(initial_learning_rate),
         n_steps=50,  #128
-        n_epochs=5,   #5
-        ent_coef=0.03,  # Increased entropy for Divert strategy!
-        batch_size=500,  # Reduced from 2400 to fix CUDA OOM (Attention layer is memory hungry)
+        n_epochs=2,   #5
+        ent_coef=0.05,  # Increased entropy for Divert strategy!
+        batch_size=1000,  # Reduced from 2400 to fix CUDA OOM (Attention layer is memory hungry)
         gamma=0.999,
+        #target_kl=0.03,
         policy_kwargs=policy_kwargs
     )
     
     # Train with callbacks
-    checkpoint_callback = CheckpointCallback(save_freq=500, 
+    checkpoint_callback = CheckpointCallback(save_freq=1000, 
                                            save_path=f"{models_dir}/{model_name}",
                                            name_prefix=model_name)
     
