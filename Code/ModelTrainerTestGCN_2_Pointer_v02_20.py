@@ -13,6 +13,9 @@ version = "v04_07" #V[Month]_[Day]
 # Initial Learning Rate
 initial_learning_rate = 0.0003  #0.0001
 
+# Minimum Learning Rate
+min_learning_rate = 0.00001
+
 # Time Steps to Train
 timesteps = 10000000
 
@@ -89,9 +92,9 @@ if not any(isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', '')
 root_logger.setLevel(logging.INFO)
 
 # Custom learning rate function
-def linear_schedule(initial_value: float):
+def linear_schedule(initial_value: float, min_value: float = 0.0):
     def func(progress_remaining: float) -> float:
-        return progress_remaining * initial_value
+        return min_value + progress_remaining * (initial_value - min_value)
     return func
 
 import torch as th
@@ -697,7 +700,7 @@ if __name__ == "__main__":
         policy=MaskablePointerNetworkPolicy,
         env=vec_env,
         verbose=1,
-        learning_rate=linear_schedule(initial_learning_rate),
+        learning_rate=linear_schedule(initial_learning_rate, min_learning_rate),
         n_steps=50,  #128
         n_epochs=2,   #5
         ent_coef=0.05,  # Increased entropy for Divert strategy!
