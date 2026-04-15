@@ -984,7 +984,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
 
             # Calculate reference objective value for the attacker's strategy
             if self.attacker_strategy == 'zero_sum':
-                self.reference_obj, self.reference_flows = self._compute_objective_and_flows()
+                self.reference_obj, self.reference_flows = self.evaluate_state_objective()
             elif self.attacker_strategy == 'canalize':
                 # Explicitly calculate reference (raw) flow on reset
                 _, flows = self.solve_max_flow(routing_assumption = 'canalize')
@@ -1012,7 +1012,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                 self.reference_flows = flows
                 #self.last_canalize_flow = self._calculate_total_path_flow(flows, 'canalize_objective') # NO LONGER USED
             elif self.attacker_strategy == 'isolate':
-                self.reference_obj, self.reference_flows = self._calculate_isolate_objective_and_flows()
+                self.reference_obj, self.reference_flows = self.evaluate_state_objective()
             elif self.attacker_strategy == 'divert':
                 _, self.reference_flows_dict = self.solve_max_flow(routing_assumption = 'divert')
                 from_flow = self._calculate_target_path_flow(self.reference_flows_dict, 'divert_from_objective')
@@ -1615,7 +1615,6 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         """Execute one step in the environment based on the given action."""
         # Initialize step variables
         done = False
-        do_nothing = False
         remaining_budget = self.state['budget'].copy()
 
         # Determine if action was "do nothing"
@@ -1640,37 +1639,56 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
     
             # Mark edge as interdicted
             self.state['edge_interdicted'][action] += 1
-            
-            #Compute Rewards
-            action_cost = self.state['edge_costs'][action]
-            strategy_calculators = {"zero_sum": self._calculate_zero_sum_reward,
-                                    "canalize": self._calculate_canalize_reward,
-                                    "isolate": self._calculate_isolate_reward,
-                                    "divert": self._calculate_divert_reward}
-            calculator = strategy_calculators.get(self.attacker_strategy)
-            reward = calculator(action_cost=action_cost)
             self._cache_flow_array()
         else:
-            #Determine penalty and decrement budget
-            reward = self.PENALTY_VALUE
+            # Determine penalty decrement budget
             remaining_budget[0] = max(0, remaining_budget[0] - self.state['edge_costs'][action])
 
         # Check if episode is complete
         done = self._is_episode_complete(remaining_budget)
     
+        # Compute Reward
+        reward = self._calculate_potential_based_reward(done=done)
+
         # Update state
         self.state['budget'] = remaining_budget
     
         return self.state, float(reward), bool(done), False, {}
         
-    def _calculate_zero_sum_reward(self, action_cost=0):                         
-        """Calculate reward for zero-sum strategy (maximize disruption)."""
-        objective_value, self.reference_flows = self._compute_objective_and_flows()
-        reward = max(self.last_obj - objective_value, 0) / self.reference_budget
-        if reward > 0:
-            self.last_obj = objective_value   
-        elif reward == 0:
-            reward = self.PENALTY_VALUE
+    def _calculate_potential_based_reward(self, done):                         
+        """Calculate potential-based reward using a unified evaluation architecture."""
+        strategy = self.attacker_strategy
+        
+        # 1. State potential BEFORE action
+        phi_s = getattr(self, 'last_obj', 0.0)
+
+        # 2. State potential AFTER action
+        if self.deterministic_outcomes:
+            obj, flows = self.solve_max_flow(routing_assumption=strategy)
+            phi_s_prime = self._evaluate_potential(obj, flows, strategy)
+            self.reference_flows = self._flows_dict_to_array(flows)
+        else:
+            phi_s_prime, mean_flows_array = self._calculate_stochastic_objective_and_flow(strategy, return_full_flows=True, for_reward=True)
+            self.reference_flows = mean_flows_array
+
+        # 3. Base Reward only at terminal step
+        if done:
+            if self.deterministic_outcomes:
+                obj_base, flows_base = self.solve_max_flow(routing_assumption=strategy)
+                r_s_a_s_prime = self._evaluate_objective(obj_base, flows_base, strategy)
+            else:
+                r_s_a_s_prime, _ = self._calculate_stochastic_objective_and_flow(strategy, return_full_flows=False, for_reward=False)
+        else:
+            r_s_a_s_prime = 0.0
+            
+        # 4. Compute shaped reward
+        gamma = 0.999
+        F = (gamma * phi_s_prime) - phi_s
+        reward = r_s_a_s_prime + F
+        
+        # Update last_obj for the next step 
+        self.last_obj = phi_s_prime
+        
         return reward
 
     def _flows_dict_to_array(self, flows_dict):
@@ -1814,63 +1832,10 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         
             # Solve max flow
             obj, flows = self.solve_max_flow(capacity_dict, routing_assumption=strategy_type)
-        
-            if strategy_type == "zero_sum":
-                objective = obj
-            elif strategy_type == "canalize":                
-                if for_reward:
-                    canalize_mask = self.state['canalize_objective'][:self.num_both_edges] == 1
-                    
-                    flow_diffs = []
-                    for i, m in enumerate(canalize_mask):
-                        if m:
-                            edge = self.both_edges[i]
-                            f_after = flows.get(edge, 0)
-                            f_before = self.reference_flows_dict.get(edge, 0)
-                            flow_diffs.append(min(f_after - f_before, getattr(self, 'max_canalize_objective', 0)))
-                            
-                    objective = sum(flow_diffs) / len(flow_diffs) if flow_diffs else 0
-                else:
-                    objective = self._calculate_target_path_flow(flows, 'canalize_objective')
-            elif strategy_type == "isolate":
-                objective = self._calculate_target_edge_flow(flows, 'isolate_objective')
-            elif strategy_type == "divert":
-                if for_reward:
-                    divert_from_mask = self.state['divert_from_objective'][:self.num_both_edges] == 1
-                    divert_to_mask = self.state['divert_to_objective'][:self.num_both_edges] == 1
-                    
-                    to_flow_diffs = []
-                    for i, m in enumerate(divert_to_mask):
-                        if m:
-                            edge = self.both_edges[i]
-                            f_after = flows.get(edge, 0)
-                            f_before = self.reference_flows_dict.get(edge, 0)
-                            to_flow_diffs.append(min(f_after - f_before, getattr(self, 'max_divert_objective', 0)))
-                            
-                    from_flow_diffs = []
-                    for i, m in enumerate(divert_from_mask):
-                        if m:
-                            edge = self.both_edges[i]
-                            f_after = flows.get(edge, 0)
-                            f_before = self.reference_flows_dict.get(edge, 0)
-                            from_flow_diffs.append(min(f_before - f_after, getattr(self, 'max_divert_objective', 0)))
-                            
-                    to_obj = sum(to_flow_diffs) / len(to_flow_diffs) if to_flow_diffs else 0
-                    from_obj = sum(from_flow_diffs) / len(from_flow_diffs) if from_flow_diffs else 0
-                    
-                    objective = to_obj + from_obj
-                else:
-                    from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
-                    to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
-                    ref_flows = getattr(self, 'reference_start_flows', None)
-                    if ref_flows is None:
-                        ref_a, ref_b = 0, 0
-                    else:
-                        try:
-                            ref_a, ref_b = ref_flows[0], ref_flows[1]
-                        except Exception:
-                            ref_a, ref_b = 0, 0
-                    objective = np.min([(ref_a - from_flow), (to_flow - ref_b)])
+            if for_reward:
+                objective = self._evaluate_potential(obj, flows, strategy_type)
+            else:
+                objective = self._evaluate_objective(obj, flows, strategy_type)
 
             res = {
                 'objective': objective
@@ -1963,196 +1928,88 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
              final_flow_array = np.dot(weights, flow_matrix)
              return weighted_objective, final_flow_array
     
-    def _compute_objective_and_flows(self, deterministic_mode=None):
-        """Calculate the max flow objective and edge flows."""
-        if deterministic_mode is None:
-            deterministic_mode = self.deterministic_outcomes
-        
-        if deterministic_mode:
-            objective, flows = self.solve_max_flow()
-            # Consistent API: Convert to array
-            return objective, self._flows_dict_to_array(flows)
-        else:
-            # Stochastic outcome calculation
-            objective, flows_array = self._calculate_stochastic_objective_and_flow('zero_sum', return_full_flows=True)
-            return objective, flows_array
+    def _evaluate_objective(self, obj, flows, strategy_type):
+        if strategy_type == "zero_sum":
+            objective = obj
+        elif strategy_type == "canalize":                
+            objective = self._calculate_target_path_flow(flows, 'canalize_objective')
+        elif strategy_type == "isolate":
+            objective = self._calculate_target_edge_flow(flows, 'isolate_objective')
+        elif strategy_type == "divert":
+            from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
+            to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
+            
+            ref_flows = getattr(self, 'reference_start_flows', None)
+            if ref_flows is None:
+                ref_a, ref_b = 0, 0
+            else:
+                try:
+                    ref_a, ref_b = ref_flows[0], ref_flows[1]
+                except Exception:
+                    ref_a, ref_b = 0, 0
+            diverted_flow_from = (ref_a - from_flow) 
+            diverted_flow_to = (to_flow - ref_b) 
+            objective = np.min([diverted_flow_from, diverted_flow_to])
+        return objective
 
-    def _calculate_canalize_objective_and_flows(self, for_reward=False):
-        """Calculate objective for canalize strategy (flow through specific path)."""
+    def _evaluate_potential(self, obj, flows, strategy_type):
+        if strategy_type == "zero_sum":
+            potential = obj
+        elif strategy_type == "canalize":                
+            canalize_mask = self.state['canalize_objective'][:self.num_both_edges] == 1
+            
+            flow_diffs = []
+            for i, m in enumerate(canalize_mask):
+                if m:
+                    edge = self.both_edges[i]
+                    f_after = flows.get(edge, 0)
+                    f_before = self.reference_flows_dict.get(edge, 0)
+                    flow_diffs.append(min(f_after - f_before, getattr(self, 'max_canalize_objective', 0)))
+                    
+            potential = sum(flow_diffs) / len(flow_diffs) if flow_diffs else 0
+        elif strategy_type == "isolate":
+            potential = self._calculate_target_edge_flow(flows, 'isolate_objective')
+        elif strategy_type == "divert":
+            divert_from_mask = self.state['divert_from_objective'][:self.num_both_edges] == 1
+            divert_to_mask = self.state['divert_to_objective'][:self.num_both_edges] == 1
+            
+            to_flow_diffs = []
+            for i, m in enumerate(divert_to_mask):
+                if m:
+                    edge = self.both_edges[i]
+                    f_after = flows.get(edge, 0)
+                    f_before = self.reference_flows_dict.get(edge, 0)
+                    to_flow_diffs.append(min(f_after - f_before, getattr(self, 'max_divert_objective', 0)))
+                    
+            from_flow_diffs = []
+            for i, m in enumerate(divert_from_mask):
+                if m:
+                    edge = self.both_edges[i]
+                    f_after = flows.get(edge, 0)
+                    f_before = self.reference_flows_dict.get(edge, 0)
+                    from_flow_diffs.append(min(f_before - f_after, getattr(self, 'max_divert_objective', 0)))
+                    
+            to_obj = sum(to_flow_diffs) / len(to_flow_diffs) if to_flow_diffs else 0
+            from_obj = sum(from_flow_diffs) / len(from_flow_diffs) if from_flow_diffs else 0
+            
+            potential = to_obj + from_obj
+        return potential
+
+    def evaluate_state_objective(self, return_full_flows=True, for_reward=False):
+        """Evaluate the objective logic accounting for the deterministic/stochastic state routing assumptions natively"""
         if self.deterministic_outcomes:
-            _, flows = self.solve_max_flow(routing_assumption = 'canalize')
+            obj, flows = self.solve_max_flow(routing_assumption=self.attacker_strategy)
             
             if for_reward:
-                canalize_mask = self.state['canalize_objective'][:self.num_both_edges] == 1
-                
-                flow_diffs = []
-                for i, m in enumerate(canalize_mask):
-                    if m:
-                        edge = self.both_edges[i]
-                        f_after = flows.get(edge, 0)
-                        f_before = self.reference_flows_dict.get(edge, 0)
-                        flow_diffs.append(min(f_after - f_before, getattr(self, 'max_canalize_objective', 0)))
-                        
-                objective = sum(flow_diffs) / len(flow_diffs) if flow_diffs else 0
+                objective = self._evaluate_potential(obj, flows, self.attacker_strategy)
             else:
-                objective = self._calculate_target_path_flow(flows, 'canalize_objective')
-            
-            return objective, self._flows_dict_to_array(flows)
+                objective = self._evaluate_objective(obj, flows, self.attacker_strategy)
+                
+            if return_full_flows:
+                return objective, self._flows_dict_to_array(flows)
+            return objective, flows
         else:
-            objective, mean_flows_array = self._calculate_stochastic_objective_and_flow('canalize', return_full_flows=True, for_reward=for_reward)
-            return objective, mean_flows_array
-        
-    def _calculate_canalize_reward(self, action_cost=0):
-        """Calculate reward for canalize strategy (force flow through specific path)."""
-        # --- OLD REWARD COMPUTATION START ---
-        # # Reward for successful interdiction of non-target edges
-        # target_path_flow, self.reference_flows = self._calculate_canalize_objective_and_flows()
-        # 
-        # base_reward = (target_path_flow - self.last_obj) / self.reference_budget  
-        # 
-        # if isinstance(self.reference_flows, np.ndarray):
-        #     current_canalize_flow = self._calculate_total_path_flow_from_array(self.reference_flows, 'canalize_objective')
-        # else:
-        #     current_canalize_flow = self._calculate_total_path_flow(self.reference_flows, 'canalize_objective')
-        # 
-        # num_canalize_edges = np.sum(self.state['canalize_objective'][:self.num_both_edges])
-        # num_canalize_edges = num_canalize_edges if num_canalize_edges > 0 else 1
-        # 
-        # marginal_canalize_increase = current_canalize_flow - getattr(self, 'last_canalize_flow', current_canalize_flow)
-        # 
-        # term = marginal_canalize_increase / (num_canalize_edges * self.reference_budget)
-        # 
-        # reward = base_reward + term
-        # 
-        # self.last_obj = target_path_flow
-        # self.last_canalize_flow = current_canalize_flow
-        # 
-        # if reward == 0:
-        #     reward = self.PENALTY_VALUE / self.reference_budget
-        #     
-        # return float(reward)
-        # --- OLD REWARD COMPUTATION END ---
-
-        # Reward based on flow canalization success
-        canalized_flow, self.reference_flows = self._calculate_canalize_objective_and_flows(for_reward=True)
-        
-        # Base reward scaled by initial budget
-        reward = (canalized_flow - self.last_obj - (0.01 * action_cost)) / self.reference_budget
-        
-        # Update historical values
-        self.last_obj = canalized_flow
-        
-        return float(reward)
-        
-    def _calculate_isolate_objective_and_flows(self):
-        """Calculate objective for isolate strategy (reduce flow on specific edges)."""
-        if self.deterministic_outcomes:
-            _, flows = self.solve_max_flow(routing_assumption = 'isolate')
-            target_node_flow = self._calculate_target_edge_flow(flows, 'isolate_objective')
-            return target_node_flow, self._flows_dict_to_array(flows)
-        else:
-            objective, mean_flows_array = self._calculate_stochastic_objective_and_flow('isolate', return_full_flows=True)
-            return objective, mean_flows_array
-        
-    def _calculate_isolate_reward(self, action_cost=0):
-        """Calculate reward for isolate strategy (reduce flow to specific nodes)."""
-        # Reward reduction in flow to target nodes
-        target_node_flow, self.reference_flows = self._calculate_isolate_objective_and_flows()
-        
-        reward = (self.last_obj-target_node_flow) / self.reference_budget
-        self.last_obj = target_node_flow
-        if reward == 0:
-            reward = self.PENALTY_VALUE
-        return reward
-
-    def _calculate_divert_objective_and_flows(self, mode = None, for_reward=False):
-        """Calculate objective for divert strategy (redirect flow from one path to another)."""
-        if mode is None:
-            mode = self.deterministic_outcomes
-
-        if mode:
-            _, flows = self.solve_max_flow(routing_assumption = 'divert')
-            
-            if for_reward:
-                divert_from_mask = self.state['divert_from_objective'][:self.num_both_edges] == 1
-                divert_to_mask = self.state['divert_to_objective'][:self.num_both_edges] == 1
-                
-                to_flow_diffs = []
-                for i, m in enumerate(divert_to_mask):
-                    if m:
-                        edge = self.both_edges[i]
-                        f_after = flows.get(edge, 0)
-                        f_before = self.reference_flows_dict.get(edge, 0)
-                        to_flow_diffs.append(min(f_after - f_before, self.max_divert_objective))
-                        
-                from_flow_diffs = []
-                for i, m in enumerate(divert_from_mask):
-                    if m:
-                        edge = self.both_edges[i]
-                        f_after = flows.get(edge, 0)
-                        f_before = self.reference_flows_dict.get(edge, 0)
-                        from_flow_diffs.append(min(f_before - f_after, self.max_divert_objective))
-                        
-                to_obj = sum(to_flow_diffs) / len(to_flow_diffs) if to_flow_diffs else 0
-                from_obj = sum(from_flow_diffs) / len(from_flow_diffs) if from_flow_diffs else 0
-                
-                objective = to_obj + from_obj
-            else:
-                from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
-                to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
-                
-                # Store current path flows to be used in reward calculation (if legacy reward logic is ever restored)
-                # self.current_from_flow = self._calculate_total_path_flow(flows, 'divert_from_objective')
-                # self.current_to_flow = self._calculate_total_path_flow(flows, 'divert_to_objective')
-                
-                diverted_flow_from = (self.reference_start_flows[0] - from_flow)
-                diverted_flow_to = (to_flow - self.reference_start_flows[1]) 
-                objective = np.min([diverted_flow_from,diverted_flow_to])
-            
-            return objective, self._flows_dict_to_array(flows)
-        else:
-            # Stochastic calculation - returns mean objectives directly
-            # Note: you still need to ensure stochastic implementation of current_from_flow/to_flow if needed here.
-            # But the user calculates stochastic reward returning mean objectives.
-            mean_objective, mean_flows_array = self._calculate_stochastic_objective_and_flow('divert', return_full_flows=True, for_reward=for_reward)
-            return mean_objective, mean_flows_array
-
-    def _calculate_divert_reward(self, action_cost=0):
-        """Calculate reward for divert strategy (redirect flow from one path to another)."""
-        # Calculate reward based on flow diversion success
-        diverted_flow, self.reference_flows = self._calculate_divert_objective_and_flows(for_reward=True)
-        
-        # Base reward scaled by initial budget
-        reward = (diverted_flow - self.last_obj -(0.01*action_cost)) / self.reference_budget
-        
-        # Get current path flows using array method
-        #current_from_flow = self._calculate_total_path_flow_from_array(self.reference_flows, 'divert_from_objective')
-        #current_to_flow = self._calculate_total_path_flow_from_array(self.reference_flows, 'divert_to_objective')
-
-        # Get number of edges in each objective
-        #num_from_edges = np.sum(self.state['divert_from_objective'][:self.num_both_edges])
-        #num_to_edges = np.sum(self.state['divert_to_objective'][:self.num_both_edges])
-        
-        #num_from_edges = num_from_edges if num_from_edges > 0 else 1
-        #num_to_edges = num_to_edges if num_to_edges > 0 else 1
-        
-        # Calculate marginal flow changes
-        #marginal_from_reduction = self.last_from_flow - current_from_flow
-        #marginal_to_increase = current_to_flow - self.last_to_flow
-        
-        #term1 = marginal_from_reduction / (num_from_edges * self.reference_budget)
-        #term2 = marginal_to_increase / (num_to_edges * self.reference_budget)
-        
-        #reward = base_reward + term1 + term2 #04_06 version
-
-        # Update historical values
-        self.last_obj = diverted_flow
-        #self.last_from_flow = current_from_flow
-        #self.last_to_flow = current_to_flow
-        
-        #if reward == 0:
-        #    reward = self.PENALTY_VALUE / self.reference_budget
-        return float(reward)
+            return self._calculate_stochastic_objective_and_flow(self.attacker_strategy, return_full_flows=return_full_flows, for_reward=for_reward)
 
     def _calculate_total_path_flow_from_array(self, flow_array, objective_key):
         """Calculate total sum of flow through edges marked in the objective using a flow array."""
@@ -2360,7 +2217,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
 
         # Calculate reference objective value for the attacker's strategy
         if self.attacker_strategy == 'zero_sum':
-            self.reference_obj, self.reference_flows = self._compute_objective_and_flows()
+            self.reference_obj, self.reference_flows = self.evaluate_state_objective()
         elif self.attacker_strategy == 'canalize':
             # Use original method to get raw flow without subtraction to initialize start flow
             # We temporarily bypass the objective subtraction logic effectively by checking if attribute exists
@@ -2386,7 +2243,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             margins = [self.state['edge_capacity'][i] - flows.get(self.both_edges[i], 0) for i, m in enumerate(canalize_mask) if m]
             self.max_canalize_objective = min(margins) if margins else 0
         elif self.attacker_strategy == 'isolate':
-            self.reference_obj, self.reference_flows = self._calculate_isolate_objective_and_flows()
+            self.reference_obj, self.reference_flows = self.evaluate_state_objective()
         elif self.attacker_strategy == 'divert':
             _, self.reference_flows_dict = self.solve_max_flow(routing_assumption = 'divert')
             from_flow = self._calculate_target_path_flow(self.reference_flows_dict, 'divert_from_objective')

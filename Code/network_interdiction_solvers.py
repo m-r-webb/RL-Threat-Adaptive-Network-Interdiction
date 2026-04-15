@@ -282,21 +282,9 @@ class _RemoteEnvWorker:
 
             # terminal objective
             # Capture flows to update environment state for mask_fn
-            current_flows = None
-            
-            if self.attacker_strategy == "zero_sum":
-                final_objective, current_flows = self.env._compute_objective_and_flows()
+            final_objective, current_flows = self.env.evaluate_state_objective()
+            if self.attacker_strategy in ("zero_sum", "isolate"):
                 final_objective = -final_objective
-            elif self.attacker_strategy == 'canalize':
-                final_objective, current_flows = self.env._calculate_canalize_objective_and_flows()
-            elif self.attacker_strategy == 'isolate':
-                final_objective, current_flows = self.env._calculate_isolate_objective_and_flows()
-                final_objective = -final_objective
-            elif self.attacker_strategy == 'divert':
-                final_objective, current_flows = self.env._calculate_divert_objective_and_flows()
-            else:
-                final_objective = -float('inf')
-                current_flows = {}
 
             # Update reference flows and cache for mask_fn
             self.env.reference_flows = current_flows
@@ -479,19 +467,9 @@ class _RemoteEnvWorker:
             check_interdicted[:] = state
             
             # 2. Compute Objective & Flows (Heavy Compute)
-            if self.attacker_strategy == "zero_sum":
-                val, flows = env._compute_objective_and_flows()
-                val = -val 
-            elif self.attacker_strategy == 'canalize':
-                val, flows = env._calculate_canalize_objective_and_flows()
-            elif self.attacker_strategy == 'isolate':
-                val, flows = env._calculate_isolate_objective_and_flows()
+            val, flows = env.evaluate_state_objective()
+            if self.attacker_strategy in ("zero_sum", "isolate"):
                 val = -val
-            elif self.attacker_strategy == 'divert':
-                val, flows = env._calculate_divert_objective_and_flows()
-            else:
-                val = -float('inf')
-                flows = {}
             
             # Update reference flows for mask_fn mechanism
             env.reference_flows = flows
@@ -1555,22 +1533,17 @@ class InterdictionSolverMixin:
                     obj_div_to = 0.0
 
                     try:
-                        if self.attacker_strategy == "zero_sum":
-                            _, flow_dict = self._compute_objective_and_flows()
-                        elif self.attacker_strategy == "canalize":
-                            obj_iso_can, flow_dict = self._calculate_canalize_objective_and_flows()
-                        elif self.attacker_strategy == "isolate":
-                            obj_iso_can, flow_dict = self._calculate_isolate_objective_and_flows()
+                        _, flow_dict = self.evaluate_state_objective()
+                        
+                        if self.attacker_strategy in ("canalize", "isolate"):
+                            obj_iso_can = _
                         elif self.attacker_strategy == "divert":
-                            _, flow_dict = self._calculate_divert_objective_and_flows()
                             # Use dict flows for components
                             _, flows_dict = self.solve_max_flow(routing_assumption = 'divert')
                             from_flow = self._calculate_target_path_flow(flows_dict, 'divert_from_objective')
                             to_flow = self._calculate_target_path_flow(flows_dict, 'divert_to_objective')
                             obj_div_from = (getattr(self, 'reference_start_flows', [0,0])[0] - from_flow)
                             obj_div_to = (to_flow - getattr(self, 'reference_start_flows', [0,0])[1])
-                        else:
-                            _, flow_dict = self.solve_max_flow()
                     except Exception:
                         _, flow_dict = self.solve_max_flow()
                     
@@ -1682,14 +1655,11 @@ class InterdictionSolverMixin:
                 obj_div_to = 0.0
 
                 try:
-                    if self.attacker_strategy == "zero_sum":
-                        _, self.reference_flows = self._compute_objective_and_flows()
-                    elif self.attacker_strategy == "canalize":
-                        obj_iso_can, self.reference_flows = self._calculate_canalize_objective_and_flows()
-                    elif self.attacker_strategy == "isolate":
-                        obj_iso_can, self.reference_flows = self._calculate_isolate_objective_and_flows()
+                    _, self.reference_flows = self.evaluate_state_objective()
+                    
+                    if self.attacker_strategy in ("canalize", "isolate"):
+                        obj_iso_can = _
                     elif self.attacker_strategy == "divert":
-                        _, self.reference_flows = self._calculate_divert_objective_and_flows()
                         # Use dict flows for components
                         _, flows_dict = self.solve_max_flow(routing_assumption = 'divert')
                         from_flow = self._calculate_target_path_flow(flows_dict, 'divert_from_objective')
@@ -2099,15 +2069,8 @@ class InterdictionSolverMixin:
                  break
              
              # Get expected edge flows
-             if self.deterministic_outcomes:
-                 # Deterministic case: solve max flow directly
-                 _, flows = self.solve_max_flow(routing_assumption=self.attacker_strategy)
-             else:
-                 # Stochastic case: get expected flows from stochastic calculation
-                 _, flows = self._calculate_stochastic_objective_and_flow(
-                     strategy_type=self.attacker_strategy, 
-                     return_full_flows=True
-                 )
+             _, flows = self.evaluate_state_objective()
+            
              
              masked_values = np.full(self.num_interdictable, -np.inf)
              
@@ -2224,16 +2187,7 @@ class InterdictionSolverMixin:
                  break
         
         # Determine final objective value based on strategy
-        if self.attacker_strategy == "zero_sum":
-            objVal, _ = self._compute_objective_and_flows()
-        elif self.attacker_strategy == "isolate":
-            objVal, _ = self._calculate_isolate_objective_and_flows()
-        elif self.attacker_strategy == "canalize":
-            objVal, _ = self._calculate_canalize_objective_and_flows()
-        elif self.attacker_strategy == "divert":
-            objVal, _ = self._calculate_divert_objective_and_flows()
-        else:
-            objVal, _ = self._compute_objective_and_flows()
+        objVal, _ = self.evaluate_state_objective()
 
         return objVal, actions_taken
 
@@ -2646,15 +2600,7 @@ class InterdictionSolverMixin:
                 done = False
                 while not done:
                     # Update flows for mask calculation
-                    if self.attacker_strategy == "zero_sum":
-                         _, self.reference_flows = self._compute_objective_and_flows()
-                    elif self.attacker_strategy == 'canalize':
-                         _, self.reference_flows = self._calculate_canalize_objective_and_flows()
-                    elif self.attacker_strategy == 'isolate':
-                         _, self.reference_flows = self._calculate_isolate_objective_and_flows()
-                    elif self.attacker_strategy == 'divert':
-                         _, self.reference_flows = self._calculate_divert_objective_and_flows()
-                    
+                    _, self.reference_flows = self.evaluate_state_objective()
                     self._cache_flow_array()
 
                     # Get observation
@@ -2680,18 +2626,9 @@ class InterdictionSolverMixin:
                         initial_alpha_actions.append(self.both_edges[int(action)])
 
                 # Get final objective
-                if self.attacker_strategy == "zero_sum":
-                    obj_val, _ = self._compute_objective_and_flows()
+                obj_val, _ = self.evaluate_state_objective()
+                if self.attacker_strategy in ("zero_sum", "isolate"):
                     obj_val = -obj_val
-                elif self.attacker_strategy == "isolate":
-                    obj_val, _ = self._calculate_isolate_objective_and_flows()
-                    obj_val = -obj_val
-                elif self.attacker_strategy == "canalize":
-                    obj_val, _ = self._calculate_canalize_objective_and_flows()
-                elif self.attacker_strategy == "divert":
-                    obj_val, _ = self._calculate_divert_objective_and_flows()
-                else:
-                    obj_val = -float('inf')
 
                 initial_alpha = obj_val
                 
@@ -2743,15 +2680,7 @@ class InterdictionSolverMixin:
 
                  # Recalculate flows for state restoration (fix for reference_flows error)
                 try:
-                    if self.attacker_strategy == "zero_sum":
-                        _, self.reference_flows = self._compute_objective_and_flows()
-                    elif self.attacker_strategy == 'canalize':
-                        _, self.reference_flows = self._calculate_canalize_objective_and_flows()
-                    elif self.attacker_strategy == 'isolate':
-                        _, self.reference_flows = self._calculate_isolate_objective_and_flows()
-                    elif self.attacker_strategy == 'divert':
-                        _, self.reference_flows = self._calculate_divert_objective_and_flows()
-                    
+                    _, self.reference_flows = self.evaluate_state_objective()
                     self._cache_flow_array()
                 except Exception:
                     pass
