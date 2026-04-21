@@ -90,8 +90,7 @@ class _RemoteEnvWorker:
                  num_both_edges, deterministic_outcomes, multiple_interdiction_attempts,
                  progress_actor=None, memo_actors=None, budget_levels=1, progress_granularity=50,
                  max_depth_inner=100, outcome_memo_actor=None, outcome_memo_actors=None, alpha_actor=None,
-                 enable_outcome_caching=True, enable_alpha_pruning=True, sample_size=1000, reduce_flow=False, jitter=False, projection_uses_flow=False,
-                 reference_start_flows=None, reference_start_flow=None, max_canalize_objective=None, max_divert_objective=None):
+                 enable_outcome_caching=True, enable_alpha_pruning=True, sample_size=1000, reduce_flow=False, jitter=False, projection_uses_flow=False, env_references=None):
         """
         Worker now accepts a progress_actor handle, a shared memo_actor handle,
         and budget_levels so it can estimate progress for invalid actions.
@@ -140,21 +139,10 @@ class _RemoteEnvWorker:
 
         # Restore state on the worker
         self.env.load_network_from_state(seed, self.state)
-        
-        # Manually restore reference initial flows (crucial for evaluating divert strategy accurately on workers)
-        if reference_start_flows is not None:
-            self.env.reference_start_flows = reference_start_flows
-        if reference_start_flow is not None:
-            self.env.reference_start_flow = reference_start_flow
-        if max_canalize_objective is not None:
-            self.env.max_canalize_objective = max_canalize_objective
-        if max_divert_objective is not None:
-            self.env.max_divert_objective = max_divert_objective
-            
-            # FORCE objective rebuild so the injected references are used
-            self.env.strategy_objectives_setup = False
-        # FORCE REBUILD OF GUROBI OBJECTIVES NOW THAT WE HAVE CORRECT REFERENCE BASES
-        self.env.strategy_objectives_setup = False
+
+        if env_references:
+            for k, v in env_references.items():
+                setattr(self.env, k, v)
 
         # Attach shared actors after loading state
         self.env.outcome_memo_actor = outcome_memo_actor
@@ -185,7 +173,7 @@ class _RemoteEnvWorker:
             self.env.state['edge_interdiction_probability'][:self.num_both_edges]
         )
 
-    def evaluate_subtree(self, remaining_budget, interdicted_state, depth, objective_tolerance=1e-5, ref_flows=None):
+    def evaluate_subtree(self, remaining_budget, interdicted_state, depth, objective_tolerance=1e-5):
         import numpy as np, ray as _ray, time, zlib # Added zlib for stable hashing
         # Use persistent local cache (hot between tasks)
         memo_local = self.memo_local 
@@ -250,10 +238,6 @@ class _RemoteEnvWorker:
         self.env.state['budget'][0] = remaining_budget
         self.env.state['edge_interdicted'][:] = interdicted_state
 
-        if ref_flows is not None:
-            self.env.reference_flows = ref_flows.copy()
-            self.env._cache_flow_array()
-
         def dp_local(d, alpha=-float('inf')):
             nonlocal local_counter, local_pruned_counter, local_invalid_counter, local_memo_counter, local_base_counter, local_alpha_cache
             
@@ -302,9 +286,21 @@ class _RemoteEnvWorker:
 
             # terminal objective
             # Capture flows to update environment state for mask_fn
-            final_objective, current_flows = self.env.evaluate_state_objective()
-            if self.attacker_strategy in ("zero_sum", "isolate"):
+            current_flows = None
+            
+            if self.attacker_strategy == "zero_sum":
+                final_objective, current_flows = self.env._compute_objective_and_flows()
                 final_objective = -final_objective
+            elif self.attacker_strategy == 'canalize':
+                final_objective, current_flows = self.env._calculate_canalize_objective_and_flows()
+            elif self.attacker_strategy == 'isolate':
+                final_objective, current_flows = self.env._calculate_isolate_objective_and_flows()
+                final_objective = -final_objective
+            elif self.attacker_strategy == 'divert':
+                final_objective, current_flows = self.env._calculate_divert_objective_and_flows()
+            else:
+                final_objective = -float('inf')
+                current_flows = {}
 
             # Update reference flows and cache for mask_fn
             self.env.reference_flows = current_flows
@@ -401,9 +397,6 @@ class _RemoteEnvWorker:
                 valid_actions = valid_actions[sorted_indices]
                 heuristics = heuristics[sorted_indices]
             
-            old_ref_flows = self.env.reference_flows.copy() if hasattr(self.env, 'reference_flows') and self.env.reference_flows is not None else None
-            old_cached = self.env.cached_flow_array.copy() if hasattr(self.env, 'cached_flow_array') and self.env.cached_flow_array is not None else None
-            
             for i, action in enumerate(valid_actions):
                 # Pruning
                 if self.enable_alpha_pruning:
@@ -431,12 +424,6 @@ class _RemoteEnvWorker:
                 self.env.state['edge_interdicted'][action] -= 1
                 self.env.state['budget'][0] += cost
                 
-                # NEW: Restore flow cache
-                if old_ref_flows is not None:
-                    self.env.reference_flows = old_ref_flows.copy()
-                if old_cached is not None:
-                    self.env.cached_flow_array = old_cached.copy()
-
                 if fut_reward > best_reward + self.objective_tolerance:
                     best_reward = fut_reward
                     best_seq = [action] + fut_seq
@@ -454,7 +441,6 @@ class _RemoteEnvWorker:
                     current_cost = sum(self.env.state['edge_costs'][a] for a in best_seq)
                     new_cost = self.env.state['edge_costs'][action] + sum(self.env.state['edge_costs'][a] for a in fut_seq)
                     if new_cost < current_cost:
-                        best_reward = fut_reward
                         best_seq = [action] + fut_seq
 
             memo_local[key] = (best_reward, best_seq)
@@ -491,19 +477,25 @@ class _RemoteEnvWorker:
         check_budget = env.state['budget']
         check_interdicted = env.state['edge_interdicted']
         
-        for n_id, budget, state, depth, ref_flows in nodes_data:
+        for n_id, budget, state, depth in nodes_data:
             # 1. Restore State
             check_budget[0] = budget
             check_interdicted[:] = state
             
-            if ref_flows is not None:
-                env.reference_flows = ref_flows.copy()
-                env._cache_flow_array()
-
             # 2. Compute Objective & Flows (Heavy Compute)
-            val, flows = env.evaluate_state_objective()
-            if self.attacker_strategy in ("zero_sum", "isolate"):
+            if self.attacker_strategy == "zero_sum":
+                val, flows = env._compute_objective_and_flows()
+                val = -val 
+            elif self.attacker_strategy == 'canalize':
+                val, flows = env._calculate_canalize_objective_and_flows()
+            elif self.attacker_strategy == 'isolate':
+                val, flows = env._calculate_isolate_objective_and_flows()
                 val = -val
+            elif self.attacker_strategy == 'divert':
+                val, flows = env._calculate_divert_objective_and_flows()
+            else:
+                val = -float('inf')
+                flows = {}
             
             # Update reference flows for mask_fn mechanism
             env.reference_flows = flows
@@ -544,9 +536,7 @@ class _RemoteEnvWorker:
                     children_data.append((new_budget, new_state, action))
             
             is_terminal = (len(children_data) == 0)
-
-            worker_flows = flows.copy() if hasattr(flows, 'copy') else flows
-            results.append((n_id, val, children_data, is_terminal, worker_flows))
+            results.append((n_id, val, children_data, is_terminal))
             
         return results
 
@@ -676,7 +666,7 @@ class InterdictionSolverMixin:
 
         try:
             # Calculate objective (returns expected value)
-            objective, _ = self.evaluate_state_objective(return_full_flows=False)
+            objective, _ = self._calculate_stochastic_objective_and_flow(self.attacker_strategy, return_full_flows=False)
         finally:
             # Restore state
             self.state['budget'][0] = old_budget
@@ -1569,17 +1559,22 @@ class InterdictionSolverMixin:
                     obj_div_to = 0.0
 
                     try:
-                        _, flow_dict = self.evaluate_state_objective()
-                        
-                        if self.attacker_strategy in ("canalize", "isolate"):
-                            obj_iso_can = _
+                        if self.attacker_strategy == "zero_sum":
+                            _, flow_dict = self._compute_objective_and_flows()
+                        elif self.attacker_strategy == "canalize":
+                            obj_iso_can, flow_dict = self._calculate_canalize_objective_and_flows()
+                        elif self.attacker_strategy == "isolate":
+                            obj_iso_can, flow_dict = self._calculate_isolate_objective_and_flows()
                         elif self.attacker_strategy == "divert":
+                            _, flow_dict = self._calculate_divert_objective_and_flows()
                             # Use dict flows for components
                             _, flows_dict = self.solve_max_flow(routing_assumption = 'divert')
                             from_flow = self._calculate_target_path_flow(flows_dict, 'divert_from_objective')
                             to_flow = self._calculate_target_path_flow(flows_dict, 'divert_to_objective')
                             obj_div_from = (getattr(self, 'reference_start_flows', [0,0])[0] - from_flow)
                             obj_div_to = (to_flow - getattr(self, 'reference_start_flows', [0,0])[1])
+                        else:
+                            _, flow_dict = self.solve_max_flow()
                     except Exception:
                         _, flow_dict = self.solve_max_flow()
                     
@@ -1691,11 +1686,14 @@ class InterdictionSolverMixin:
                 obj_div_to = 0.0
 
                 try:
-                    _, self.reference_flows = self.evaluate_state_objective()
-                    
-                    if self.attacker_strategy in ("canalize", "isolate"):
-                        obj_iso_can = _
+                    if self.attacker_strategy == "zero_sum":
+                        _, self.reference_flows = self._compute_objective_and_flows()
+                    elif self.attacker_strategy == "canalize":
+                        obj_iso_can, self.reference_flows = self._calculate_canalize_objective_and_flows()
+                    elif self.attacker_strategy == "isolate":
+                        obj_iso_can, self.reference_flows = self._calculate_isolate_objective_and_flows()
                     elif self.attacker_strategy == "divert":
+                        _, self.reference_flows = self._calculate_divert_objective_and_flows()
                         # Use dict flows for components
                         _, flows_dict = self.solve_max_flow(routing_assumption = 'divert')
                         from_flow = self._calculate_target_path_flow(flows_dict, 'divert_from_objective')
@@ -1927,7 +1925,7 @@ class InterdictionSolverMixin:
                 if isinstance(flows, np.ndarray):
                    proj_flow_vals = flows[projection_indices]
                 elif hasattr(self, 'cached_flow_array') and flows is getattr(self, 'reference_flows', None):
-                   proj_flow_vals = self.cached_flow_array[projection_indices]
+                   proj_flow_vals = self.cached_flow_array[projection_indices].sum(axis=1)
                 else:
                    proj_flow_vals = np.array([
                        flows.get(self.both_edges[a], 0) + flows.get((self.both_edges[a][1], self.both_edges[a][0]), 0)
@@ -2052,7 +2050,7 @@ class InterdictionSolverMixin:
             if isinstance(flows, np.ndarray):
                 current_flow_vals = flows[valid_actions]
             elif hasattr(self, 'cached_flow_array') and flows is getattr(self, 'reference_flows', None):
-                current_flow_vals = self.cached_flow_array[valid_actions]
+                current_flow_vals = self.cached_flow_array[valid_actions].sum(axis=1)
             else:
                 current_flow_vals = np.array([
                     flows.get(self.both_edges[a], 0) + flows.get((self.both_edges[a][1], self.both_edges[a][0]), 0)
@@ -2105,8 +2103,15 @@ class InterdictionSolverMixin:
                  break
              
              # Get expected edge flows
-             _, flows = self.evaluate_state_objective()
-            
+             if self.deterministic_outcomes:
+                 # Deterministic case: solve max flow directly
+                 _, flows = self.solve_max_flow(routing_assumption=self.attacker_strategy)
+             else:
+                 # Stochastic case: get expected flows from stochastic calculation
+                 _, flows = self._calculate_stochastic_objective_and_flow(
+                     strategy_type=self.attacker_strategy, 
+                     return_full_flows=True
+                 )
              
              masked_values = np.full(self.num_interdictable, -np.inf)
              
@@ -2223,7 +2228,16 @@ class InterdictionSolverMixin:
                  break
         
         # Determine final objective value based on strategy
-        objVal, _ = self.evaluate_state_objective()
+        if self.attacker_strategy == "zero_sum":
+            objVal, _ = self._compute_objective_and_flows()
+        elif self.attacker_strategy == "isolate":
+            objVal, _ = self._calculate_isolate_objective_and_flows()
+        elif self.attacker_strategy == "canalize":
+            objVal, _ = self._calculate_canalize_objective_and_flows()
+        elif self.attacker_strategy == "divert":
+            objVal, _ = self._calculate_divert_objective_and_flows()
+        else:
+            objVal, _ = self._compute_objective_and_flows()
 
         return objVal, actions_taken
 
@@ -2561,7 +2575,16 @@ class InterdictionSolverMixin:
                             actions_taken.append(edge)
             
         # Determine final objective value based on strategy
-        objVal, _ = self.evaluate_state_objective()
+        if self.attacker_strategy == "zero_sum":
+            objVal, _ = self._compute_objective_and_flows()
+        elif self.attacker_strategy == "isolate":
+            objVal, _ = self._calculate_isolate_objective_and_flows()
+        elif self.attacker_strategy == "canalize":
+            objVal, _ = self._calculate_canalize_objective_and_flows()
+        elif self.attacker_strategy == "divert":
+            objVal, _ = self._calculate_divert_objective_and_flows()
+        else:
+            objVal, _ = self._compute_objective_and_flows()
 
         if return_details:
             return objVal, actions_taken, cut_set, node_partitions
@@ -2576,6 +2599,23 @@ class InterdictionSolverMixin:
         """
         # Import locally to ensure availability in all paths and avoid scope issues
         import copy, numpy as np, ray as _ray, time
+
+        original_state = copy.deepcopy(self.state)
+        original_enable_outcome_caching = getattr(self, 'enable_outcome_caching', True)
+        original_reduce_flow = getattr(self, 'reduce_flow', False)
+        original_local_outcome_cache = copy.deepcopy(getattr(self, 'local_outcome_cache', {}))
+        original_outcome_memo_actors = getattr(self, 'outcome_memo_actors', None)
+        original_reference_flows = copy.deepcopy(getattr(self, 'reference_flows', None))
+        original_reference_flows_dict = copy.deepcopy(getattr(self, 'reference_flows_dict', None))
+        original_reference_start_flow = getattr(self, 'reference_start_flow', None)
+        original_reference_start_flows = copy.deepcopy(getattr(self, 'reference_start_flows', None))
+        original_reference_obj = getattr(self, 'reference_obj', None)
+        original_reference_budget = getattr(self, 'reference_budget', None)
+        original_last_obj = getattr(self, 'last_obj', None)
+        original_canalize_norm_factor = getattr(self, 'canalize_norm_factor', None)
+        original_max_canalize_objective = getattr(self, 'max_canalize_objective', None)
+        original_max_divert_objective = getattr(self, 'max_divert_objective', None)
+        original_cached_flow_array = copy.deepcopy(getattr(self, 'cached_flow_array', None))
 
         start_time = time.time()
         
@@ -2627,7 +2667,15 @@ class InterdictionSolverMixin:
                 done = False
                 while not done:
                     # Update flows for mask calculation
-                    _, self.reference_flows = self.evaluate_state_objective()
+                    if self.attacker_strategy == "zero_sum":
+                         _, self.reference_flows = self._compute_objective_and_flows()
+                    elif self.attacker_strategy == 'canalize':
+                         _, self.reference_flows = self._calculate_canalize_objective_and_flows()
+                    elif self.attacker_strategy == 'isolate':
+                         _, self.reference_flows = self._calculate_isolate_objective_and_flows()
+                    elif self.attacker_strategy == 'divert':
+                         _, self.reference_flows = self._calculate_divert_objective_and_flows()
+                    
                     self._cache_flow_array()
 
                     # Get observation
@@ -2653,9 +2701,18 @@ class InterdictionSolverMixin:
                         initial_alpha_actions.append(self.both_edges[int(action)])
 
                 # Get final objective
-                obj_val, _ = self.evaluate_state_objective()
-                if self.attacker_strategy in ("zero_sum", "isolate"):
+                if self.attacker_strategy == "zero_sum":
+                    obj_val, _ = self._compute_objective_and_flows()
                     obj_val = -obj_val
+                elif self.attacker_strategy == "isolate":
+                    obj_val, _ = self._calculate_isolate_objective_and_flows()
+                    obj_val = -obj_val
+                elif self.attacker_strategy == "canalize":
+                    obj_val, _ = self._calculate_canalize_objective_and_flows()
+                elif self.attacker_strategy == "divert":
+                    obj_val, _ = self._calculate_divert_objective_and_flows()
+                else:
+                    obj_val = -float('inf')
 
                 initial_alpha = obj_val
                 
@@ -2691,8 +2748,6 @@ class InterdictionSolverMixin:
                 
                 # Store actions for optimal sequence initialization
                 initial_alpha_actions = heuristic_actions
-                original_initial_alpha = initial_alpha
-
 
             except Exception as e:
                 if verbose:
@@ -2709,7 +2764,15 @@ class InterdictionSolverMixin:
 
                  # Recalculate flows for state restoration (fix for reference_flows error)
                 try:
-                    _, self.reference_flows = self.evaluate_state_objective()
+                    if self.attacker_strategy == "zero_sum":
+                        _, self.reference_flows = self._compute_objective_and_flows()
+                    elif self.attacker_strategy == 'canalize':
+                        _, self.reference_flows = self._calculate_canalize_objective_and_flows()
+                    elif self.attacker_strategy == 'isolate':
+                        _, self.reference_flows = self._calculate_isolate_objective_and_flows()
+                    elif self.attacker_strategy == 'divert':
+                        _, self.reference_flows = self._calculate_divert_objective_and_flows()
+                    
                     self._cache_flow_array()
                 except Exception:
                     pass
@@ -2769,10 +2832,20 @@ class InterdictionSolverMixin:
                 self.state['edge_interdicted'][:] = inter_state
                 
                 # Compute objective
-                val, flows = self.evaluate_state_objective()
-                if self.attacker_strategy in ['zero_sum', 'isolate']:
+                if self.attacker_strategy == "zero_sum":
+                    val, flows = self._compute_objective_and_flows()
+                    val = -val # Attacker maximizes negative flow (minimizes flow)
+                elif self.attacker_strategy == 'canalize':
+                    val, flows = self._calculate_canalize_objective_and_flows()
+                elif self.attacker_strategy == 'isolate':
+                    val, flows = self._calculate_isolate_objective_and_flows()
                     val = -val
-
+                elif self.attacker_strategy == 'divert':
+                    val, flows = self._calculate_divert_objective_and_flows()
+                else:
+                    val = -float('inf')
+                    flows = {}
+                
                 # Update incumbent if we found a better terminal value (or stopping here)
                 if val > best_incumbent_reward + objective_tolerance:
                     best_incumbent_reward = val
@@ -2781,7 +2854,6 @@ class InterdictionSolverMixin:
                     current_cost = sum(self.state['edge_costs'][a] for a in best_incumbent_seq)
                     new_cost = sum(self.state['edge_costs'][a] for a in path_to_here)
                     if new_cost < current_cost:
-                        best_incumbent_reward = val
                         best_incumbent_seq = list(path_to_here)
 
                 self.reference_flows = flows
@@ -2842,9 +2914,6 @@ class InterdictionSolverMixin:
                     valid_actions = valid_actions[sorted_indices]
                     heuristics = heuristics[sorted_indices]
 
-                old_ref_flows = self.reference_flows.copy() if hasattr(self, 'reference_flows') and self.reference_flows is not None else None
-                old_cached = self.cached_flow_array.copy() if hasattr(self, 'cached_flow_array') and self.cached_flow_array is not None else None
-
                 for i, action in enumerate(valid_actions):
                     # Pruning
                     if enable_alpha_pruning:
@@ -2865,11 +2934,6 @@ class InterdictionSolverMixin:
                     
                     inter_state[action] -= 1
                     
-                    if old_ref_flows is not None:
-                        self.reference_flows = old_ref_flows.copy()
-                    if old_cached is not None:
-                        self.cached_flow_array = old_cached.copy()
-
                     if fut_reward > best_reward + objective_tolerance:
                         best_reward = fut_reward
                         best_seq = [action] + fut_seq
@@ -2879,7 +2943,6 @@ class InterdictionSolverMixin:
                         current_cost = sum(self.state['edge_costs'][a] for a in best_seq)
                         new_cost = self.state['edge_costs'][action] + sum(self.state['edge_costs'][a] for a in fut_seq)
                         if new_cost < current_cost:
-                            best_reward = fut_reward
                             best_seq = [action] + fut_seq
                         
                 if enable_memoization:
@@ -2920,12 +2983,9 @@ class InterdictionSolverMixin:
                 print(f"Serial execution completed in {time.time() - t0:.2f}s")
                 
             if opt_reward <= initial_alpha + 1.1e-4:
-                print("Note: The initial alpha (from heuristic or RL) was not beaten during backward induction. Using the heuristic solution.")
-                opt_reward = original_initial_alpha
-                opt_seq = [self.edge_to_index[e] for e in initial_alpha_actions]
+                print("Note: The initial alpha (from heuristic or RL) was not beaten during backward induction.")
 
             optimal_actions = [self.both_edges[idx] for idx in opt_seq]
-
             
             # Match behavior of parallel implementation and Gurobi
             if self.attacker_strategy in ("zero_sum", "isolate"):
@@ -2937,10 +2997,6 @@ class InterdictionSolverMixin:
         # snapshot state to send to workers
         state_snapshot = copy.deepcopy(self.state)
         seed = getattr(self, 'seed', None)
-        reference_start_flows = getattr(self, 'reference_start_flows', None)
-        reference_start_flow = getattr(self, 'reference_start_flow', None)
-        max_canalize_objective = getattr(self, 'max_canalize_objective', None)
-        max_divert_objective = getattr(self, 'max_divert_objective', None)
 
         # Initialize actors to None for safe cleanup
         progress_actor = None
@@ -2981,6 +3037,11 @@ class InterdictionSolverMixin:
             edges_ref = ray.put(self.edges_reset)
             state_ref = ray.put(state_snapshot)
 
+            env_refs = {}
+            for attr in ['reference_flows_dict', 'reference_start_flow', 'canalize_norm_factor', 'reference_obj', 'reference_flows', 'max_canalize_objective', 'reference_start_flows', 'max_divert_objective']:
+                if hasattr(self, attr):
+                    env_refs[attr] = getattr(self, attr)
+
             workers = [
                 _RemoteEnvWorker.remote(
                     nodes_ref,
@@ -3005,10 +3066,7 @@ class InterdictionSolverMixin:
                     sample_size=self.SAMPLE_SIZE,
                     reduce_flow=reduce_flow,
                     projection_uses_flow=projection_uses_flow,
-                    reference_start_flows=reference_start_flows,
-                    reference_start_flow=reference_start_flow,
-                    max_canalize_objective=max_canalize_objective,
-                    max_divert_objective=max_divert_objective
+                    env_references=env_refs
                 )
                 for _ in range(n_workers)
             ]
@@ -3045,7 +3103,7 @@ class InterdictionSolverMixin:
             num_edges_limit = int(self.num_both_edges)
 
             class TreeNode:
-                def __init__(self, budget, state, depth, parent=None, action_from_parent=None, ref_flows=None):
+                def __init__(self, budget, state, depth, parent=None, action_from_parent=None):
                     self.budget = budget
                     self.state = state
                     self.depth = depth
@@ -3057,14 +3115,12 @@ class InterdictionSolverMixin:
                     self.stopping_value = None
                     self.best_sequence = []
                     self.key = state[:num_edges_limit].tobytes()
-                    self.ref_flows = ref_flows
 
             # Root node
             root_node = TreeNode(
                 self.state['budget'][0], 
                 self.state['edge_interdicted'].copy(), 
-                0,
-                ref_flows=getattr(self, 'reference_flows', None)
+                0
             )
             
             # Frontier of nodes that need processing (either expansion or solving)
@@ -3119,7 +3175,7 @@ class InterdictionSolverMixin:
                                     tasks_to_solve.append(node)
                                     continue
                                 
-                                batch.append((id(node), node.budget, node.state, node.depth, node.ref_flows))
+                                batch.append((id(node), node.budget, node.state, node.depth))
                                 batch_ids.append(id(node))
                             
                             if batch:
@@ -3143,8 +3199,9 @@ class InterdictionSolverMixin:
                         
                         try:
                             results = ray.get(future)
-                            # Update unpacking to expect 5 values
-                            for n_id, val, children_data, is_terminal, worker_flows in results:
+                            # results: list of (n_id, val, children_data, is_terminal)
+                            
+                            for n_id, val, children_data, is_terminal in results:
                                 node = node_registry[n_id]
                                 node.stopping_value = val # Cache the costly max-flow value
                                 
@@ -3158,9 +3215,11 @@ class InterdictionSolverMixin:
                                     for c_budget, c_state, action in children_data:
                                         child = TreeNode(
                                             c_budget, c_state, node.depth + 1, 
-                                            parent=node, action_from_parent=action,
-                                            ref_flows=worker_flows # NEW: Attach the parent's flow state
+                                            parent=node, action_from_parent=action
                                         )
+                                        node.children.append(child)
+                                        node_registry[id(child)] = child
+                                        frontier.append(child)
                                         
                         except Exception as e:
                             print(f"Expansion task failed: {e}")
@@ -3225,15 +3284,20 @@ class InterdictionSolverMixin:
                     for a in path_actions:
                         self.state['edge_interdicted'][a] += 1
                         self.state['budget'][0] -= int(self.state['edge_costs'][a])
-                    
-                    if node.ref_flows is not None:
-                        self.reference_flows = node.ref_flows.copy()
-                        self._cache_flow_array()
-                    
+
                     # Update flows and cache for mask_fn
-                    stop_val, self.reference_flows = self.evaluate_state_objective()
-                    if self.attacker_strategy in ['zero_sum', 'isolate']:
+                    if self.attacker_strategy == "zero_sum":
+                        stop_val, self.reference_flows = self._compute_objective_and_flows()
                         stop_val = -stop_val
+                    elif self.attacker_strategy == 'canalize':
+                        stop_val, self.reference_flows = self._calculate_canalize_objective_and_flows()
+                    elif self.attacker_strategy == 'isolate':
+                        stop_val, self.reference_flows = self._calculate_isolate_objective_and_flows()
+                        stop_val = -stop_val
+                    elif self.attacker_strategy == 'divert':
+                        stop_val, self.reference_flows = self._calculate_divert_objective_and_flows()
+                    else:
+                        stop_val = -float('inf')
 
                     node.stopping_value = stop_val
 
@@ -3270,7 +3334,7 @@ class InterdictionSolverMixin:
                         new_state[action] += 1
                         new_budget = node.budget - self.state['edge_costs'][action]
                         
-                        child = TreeNode(new_budget, new_state, node.depth + 1, parent=node, action_from_parent=action, ref_flows=self.reference_flows.copy() if hasattr(self, 'reference_flows') and self.reference_flows is not None else None)
+                        child = TreeNode(new_budget, new_state, node.depth + 1, parent=node, action_from_parent=action)
                         node.children.append(child)
                         frontier.append(child)
 
@@ -3298,7 +3362,7 @@ class InterdictionSolverMixin:
                         idle_workers.append(worker)
                         continue
                         
-                    future = worker.evaluate_subtree.remote(node.budget, node.state, node.depth, objective_tolerance, node.ref_flows)
+                    future = worker.evaluate_subtree.remote(node.budget, node.state, node.depth, objective_tolerance)
                     running_futures[future] = (worker, node)
                 
                 if running_futures:
@@ -3327,7 +3391,6 @@ class InterdictionSolverMixin:
                                 current_cost = sum(self.state['edge_costs'][a] for a in best_incumbent_seq)
                                 new_cost = sum(self.state['edge_costs'][a] for a in full_seq)
                                 if new_cost < current_cost:
-                                    best_incumbent_val = val
                                     best_incumbent_seq = full_seq
                                     alpha_actor.update.remote(val, full_seq)
 
@@ -3368,13 +3431,18 @@ class InterdictionSolverMixin:
                             self.state['budget'][0] = node.budget
                             self.state['edge_interdicted'][:] = node.state
                             
-                            if node.ref_flows is not None:
-                                self.reference_flows = node.ref_flows.copy()
-                                self._cache_flow_array()
-
-                            val, _ = self.evaluate_state_objective()
-                            if self.attacker_strategy in ['zero_sum', 'isolate']:
+                            if self.attacker_strategy == "zero_sum":
+                                val, _ = self._compute_objective_and_flows()
                                 val = -val
+                            elif self.attacker_strategy == 'canalize':
+                                val, _ = self._calculate_canalize_objective_and_flows()
+                            elif self.attacker_strategy == 'isolate':
+                                val, _ = self._calculate_isolate_objective_and_flows()
+                                val = -val
+                            elif self.attacker_strategy == 'divert':
+                                val, _ = self._calculate_divert_objective_and_flows()
+                            else:
+                                val = -float('inf')
                             
                             self.state['budget'][0] = old_budget
                             self.state['edge_interdicted'][:] = old_interdicted
@@ -3400,7 +3468,6 @@ class InterdictionSolverMixin:
                                 current_cost = sum(self.state['edge_costs'][a] for a in best_seq)
                                 new_cost = self.state['edge_costs'][child.action_from_parent] + sum(self.state['edge_costs'][a] for a in child.best_sequence)
                                 if new_cost < current_cost:
-                                    best_val = child.value
                                     best_seq = [child.action_from_parent] + child.best_sequence
                         
                         node.value = best_val
@@ -3455,9 +3522,7 @@ class InterdictionSolverMixin:
                 print(f"------------------------------------")
 
             if optimal_reward is not None and optimal_reward <= initial_alpha + 1.1e-4:
-                print("Note: The initial alpha (from heuristic or RL) was not beaten during backward induction. Using the heuristic solution.")
-                optimal_reward = original_initial_alpha
-                optimal_sequence = [self.edge_to_index[e] for e in initial_alpha_actions]
+                print("Note: The initial alpha (from heuristic or RL) was not beaten during backward induction.")
 
             if self.attacker_strategy in ("zero_sum", "isolate"):
                 # The DP maximizes "reward" (negative flow). 
@@ -3470,6 +3535,32 @@ class InterdictionSolverMixin:
             return optimal_reward, optimal_actions
             
         finally:
+            self.state = copy.deepcopy(original_state)
+            self.enable_outcome_caching = original_enable_outcome_caching
+            self.reduce_flow = original_reduce_flow
+            self.local_outcome_cache = copy.deepcopy(original_local_outcome_cache)
+            self.outcome_memo_actors = original_outcome_memo_actors
+            self.reference_flows = copy.deepcopy(original_reference_flows)
+            self.reference_flows_dict = copy.deepcopy(original_reference_flows_dict)
+            self.reference_start_flow = original_reference_start_flow
+            self.reference_start_flows = copy.deepcopy(original_reference_start_flows)
+            self.reference_obj = original_reference_obj
+            self.reference_budget = original_reference_budget
+            self.last_obj = original_last_obj
+            self.canalize_norm_factor = original_canalize_norm_factor
+            self.max_canalize_objective = original_max_canalize_objective
+            self.max_divert_objective = original_max_divert_objective
+            if original_cached_flow_array is not None:
+                self.cached_flow_array = copy.deepcopy(original_cached_flow_array)
+            elif hasattr(self, 'cached_flow_array'):
+                del self.cached_flow_array
+
+            if self.reference_flows is not None and hasattr(self, '_cache_flow_array'):
+                try:
+                    self._cache_flow_array()
+                except Exception:
+                    pass
+
             # SAFETY CLEANUP: Ensure all actors are killed even if exception occurs
             # This prevents zombie actors from accumulating between episodes
             for w in workers:
