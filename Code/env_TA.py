@@ -361,16 +361,16 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         # Use robustness only if we have budget for another interdiction and depth is low
         use_reduce_flow = getattr(self, 'reduce_flow', False) and has_budget
 
+        # Dynamically determine the correct objective index (avoid gapped indexing)
+        reduce_flow_idx = self.maxflow_model.NumObj
+        
         # Apply Reduce Flow (Lowest Priority Objective: Minimize Edges Used)
-        # Minimize sum(edge_used) -> Maximize -sum(edge_used)
-        reduce_flow_idx = 3 # Assumes 0, 1, 2 are used by other strategies
         if use_reduce_flow:
             reduce_flow_expr = grb.quicksum(self.flow_var[e] for e in self.both_edges)
-            #reduce_flow_expr = grb.quicksum(self.edge_used[e] for e in self.both_edges)
             self.maxflow_model.setObjectiveN(reduce_flow_expr, index=reduce_flow_idx, priority=1, weight=-1.0, name="reduce_flow_min_edges")
-        else:
+        #else:
             # Disable reduce_flow objective if budget not sufficient
-            self.maxflow_model.setObjectiveN(0.0, index=reduce_flow_idx, priority=0, weight=0.0, name="reduce_flow_disabled")
+        #    self.maxflow_model.setObjectiveN(0.0, index=reduce_flow_idx, priority=0, weight=0.0, name="reduce_flow_disabled")
 
         # Standard single solution
         self.maxflow_model.setParam('PoolSearchMode', 0)
@@ -623,13 +623,16 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
     
         # Remove old capacity constraints if they exist
         if hasattr(self, 'forward_cons'):
-             if isinstance(self.forward_cons, dict) and not isinstance(self.forward_cons, grb.tupledict):
+             try:
                  for c in self.forward_cons.values(): self.maxflow_model.remove(c)
+             except: pass
+             try:
                  for c in self.reverse_cons.values(): self.maxflow_model.remove(c)
-             else:
-                 self.maxflow_model.remove(self.forward_cons)
-                 self.maxflow_model.remove(self.reverse_cons)
+             except: pass
 
+             # Flush removals to Gurobi backend before adding new capacity constraints
+             self.maxflow_model.update()
+        
         # Single batch addition for forward constraints
         self.forward_cons = self.maxflow_model.addConstrs((
             self.flow_var[e] <= upper_bounds[idx % self.num_both_edges] * self.edge_used[e] 
@@ -720,6 +723,8 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                 except: pass
             self.aux_constrs = []
         
+        self.maxflow_model.update()
+
         self.aux_vars = []
         self.aux_constrs = []
         
@@ -862,7 +867,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                     gc_obj = self.maxflow_model.addGenConstrMin(obj_divert, [term1, term2], name="gc_obj_divert")
                     self.aux_constrs.append(gc_obj)
 
-                    self.maxflow_model.setObjectiveN(obj_divert, index=2, priority=5, weight=-1.0, name="min_divert_metric")
+                    self.maxflow_model.setObjectiveN(obj_divert, index=1, priority=5, weight=-1.0, name="min_divert_metric")
 
             else:
                 # INITIALIZATION PHASE: Maximize (Min(F) - Min(T))
@@ -889,7 +894,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                     self.aux_constrs.append(c)
                     
                     # Maximize diff (Weight 1.0)
-                    self.maxflow_model.setObjectiveN(diff, index=2, priority=5, weight=1.0, name="max_init_diff")
+                    self.maxflow_model.setObjectiveN(diff, index=1, priority=5, weight=1.0, name="max_init_diff")
 
                 elif from_edges:
                     # Fallback
@@ -901,7 +906,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                         name="min_from_constr"
                     )
                     self.aux_constrs.extend(constrs.values())
-                    self.maxflow_model.setObjectiveN(z_from, index=2, priority=5, weight=1.0, name="max_min_divert_from")
+                    self.maxflow_model.setObjectiveN(z_from, index=1, priority=5, weight=1.0, name="max_min_divert_from")
 
         self.maxflow_model.update()
     
