@@ -457,12 +457,11 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             indices = np.where(self.state['isolate_objective'][:self.num_both_edges] == 1)[0]
             self.sensitive_edges = [self.both_edges[i] for i in indices]
         elif routing_assumption == 'canalize':
-            indices = np.where(self.state['canalize_objective'][:self.num_both_edges] == 1)[0]
-            self.sensitive_edges = [self.both_edges[i] for i in indices]
+            # FIX: Pull true directed edges rather than canonical mask edges
+            self.sensitive_edges = self._get_canalize_path_edges()
         elif routing_assumption == 'divert':
-            idx1 = np.where(self.state['divert_from_objective'][:self.num_both_edges] == 1)[0]
-            idx2 = np.where(self.state['divert_to_objective'][:self.num_both_edges] == 1)[0]
-            self.sensitive_edges = [self.both_edges[i] for i in idx1] + [self.both_edges[i] for i in idx2]
+            # FIX: Pull true directed edges rather than canonical mask edges
+            self.sensitive_edges = self._get_divert_path_edges('divert_from_objective') + self._get_divert_path_edges('divert_to_objective')
 
     def _subtour_callback(self, model, where):
         """Callback to eliminate subtours efficiently."""
@@ -1121,105 +1120,51 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         _, flows = self.solve_max_flow()
         max_flow_edge_set = self._extract_max_flow_path(flows)
         
-        # 2. Identify nodes to avoid (all intermediate nodes on max flow path)
+        # 2. Identify nodes to avoid (all nodes on max flow path)
         avoid_nodes = set()
         for u, v in max_flow_edge_set:
             avoid_nodes.add(u)
             avoid_nodes.add(v)
-        
-        # 3. Generate alternative paths
-        candidates = []
-        max_len = len(max_flow_edge_set) + self.MAX_PATH_LENGTH
-        
-        # Try to find valid alternative paths (try 50 times)
-        for _ in range(20):  #50
-            if len(candidates) >= 5: break #10
             
-            alt_path = self._find_random_path_from_supersource(avoid_nodes, max_len)
-            if alt_path:
-                pool_source = [edge for edge in alt_path[1:-1] if edge in self.edge_to_index or (edge[1], edge[0]) in self.edge_to_index]
-
-                start_idx = random.randint(0, len(pool_source) - 2)
-                possible_seq = pool_source[start_idx : start_idx + 2]
-                if possible_seq not in candidates:
-                    candidates.append(possible_seq)
-
-        # Fallback: if no disjoint paths found, use max_flow_path
-        if not candidates and max_flow_edge_set:
+        # 3. Find candidate start nodes
+        # Must not be in avoid_nodes and must have enough distance to sink 
+        # (>= 2 is required to allow a 2-edge path to step strictly closer to the sink)
+        valid_start_nodes = [
+            n for n in self.nodes 
+            if n not in avoid_nodes and self.node_distances.get(n, float('inf')) >= 2
+        ]
+        
+        random.shuffle(valid_start_nodes)
+        
+        best_path = None
+        
+        # 4. Attempt to find a 2-edge segment approaching the sink
+        for start_node in valid_start_nodes:
+            breakpoint_dist = self.node_distances.get(start_node)
+            
+            # Repurpose the divert path generator to compute the canalize segment
+            candidate_path = self._find_alternate_segment(
+                start_node=start_node, 
+                divert_from_edges=[], # No specific edges to avoid other than nodes
+                avoid_nodes=avoid_nodes, 
+                breakpoint_dist=breakpoint_dist
+            )
+            
+            if candidate_path:
+                best_path = candidate_path
+                break
+                
+        # 5. Fallback: if no valid disjoint path found (e.g., severe bottlenecks), use max_flow_path
+        if not best_path and max_flow_edge_set:
             # Re-validate max flow edges against environment indices
             valid_mf_edges = [edge for edge in max_flow_edge_set if edge in self.edge_to_index or (edge[1], edge[0]) in self.edge_to_index]
             
             if valid_mf_edges:
-                possible_seq = None
                 if len(valid_mf_edges) >= 2:
                     start_idx = random.randint(0, len(valid_mf_edges) - 2)
-                    possible_seq = valid_mf_edges[start_idx : start_idx + 2]
+                    best_path = valid_mf_edges[start_idx : start_idx + 2]
                 else:
-                    possible_seq = valid_mf_edges
-                
-                if possible_seq is not None:
-                    candidates.append(possible_seq)
-        
-        # 4. Filter Candidates based on Capacity Bottleneck (Heuristic: prefer paths with high capacity)
-        if not candidates:
-             best_path = []
-        elif len(candidates) == 1:
-            best_path = candidates[0]
-        else:
-            candidates_with_caps = []
-            for seg in candidates:
-                caps = []
-                for edge in seg:
-                    if edge in self.edge_to_index:
-                        caps.append(self.state['edge_capacity'][self.edge_to_index[edge]])
-                    elif (edge[1], edge[0]) in self.edge_to_index:
-                        caps.append(self.state['edge_capacity'][self.edge_to_index[(edge[1], edge[0])]])
-            
-                # Bottleneck is minimum capacity in the segment
-                bottleneck = min(caps) if caps else -1
-                candidates_with_caps.append((bottleneck, seg))
-
-            candidates_with_caps.sort(key=lambda x: x[0], reverse=True)
-            
-            # Take top 3
-            final_candidates = [seg for _, seg in candidates_with_caps[:3]]
-        
-            
-        # 5. Select Best Candidate (Least Flow)
-            best_path = None
-            min_candidate_flow = float('inf')
-        
-            for candidate in final_candidates:
-            # Construct objective vector for this candidate
-                temp_objective = np.zeros(self.max_num_edges, dtype=int)
-                for edge in candidate:
-                    # Coerce list/ndarray edges to tuple to allow dict membership checks
-                    if not isinstance(edge, tuple):
-                        try:
-                            edge = tuple(edge)
-                        except Exception:
-                            pass
-                    # Mark ONLY forward (directed) edge
-                    if edge in self.edge_to_index:
-                        temp_objective[self.edge_to_index[edge]] = 1
-                    elif (edge[1], edge[0]) in self.edge_to_index:
-                        temp_objective[self.edge_to_index[(edge[1], edge[0])]] = 1
-             
-                # Apply temporary objective
-                self.state['canalize_objective'] = temp_objective
-                 
-                # Solve and measure flow
-                _, candidate_flows = self.solve_max_flow(routing_assumption='canalize')
-             
-                     # Calculate total flow passing through the candidate edges
-                     # For bottleneck calculation, we want the flow through the sequence.
-                     # Using min flow is better than sum for bottleneck.
-                current_flow_vals = [candidate_flows.get(edge, 0) for edge in candidate]
-                current_flow = min(current_flow_vals) if current_flow_vals else 0
-        
-                if current_flow < min_candidate_flow:
-                    min_candidate_flow = current_flow
-                    best_path = candidate
+                    best_path = valid_mf_edges
 
         # 6. Set Final Objective
         final_objective = np.zeros(self.max_num_edges, dtype=int)
@@ -1232,6 +1177,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                         edge = tuple(edge)
                     except Exception:
                         pass
+                
                 # Mark ONLY forward (directed) edge
                 if edge in self.edge_to_index:
                     final_objective[self.edge_to_index[edge]] = 1
@@ -1409,11 +1355,14 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             else:
                 continue
 
-            ordered_edges.append(canonical_edge)
+            # FIX: Preserve the actual flow direction for solver and array evaluation
+            ordered_edges.append(edge)
+            
+            # Use canonical strictly for objective state masking indices
             ordered_indices.append(self.edge_to_index[canonical_edge])
             if not ordered_nodes:
-                ordered_nodes.append(canonical_edge[0])
-            ordered_nodes.append(canonical_edge[1])
+                ordered_nodes.append(edge[0])
+            ordered_nodes.append(edge[1])
 
         self.objective_path_cache[objective_key] = {
             'edges': tuple(ordered_edges),
@@ -1609,7 +1558,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             return None
             
         for edge1 in self.edge_groups[start_node]['out']:
-            if edge1 not in self.both_edges:
+            if edge1 not in self.all_both_edges:
                 continue
             if edge1 in avoid_edges:
                 continue
@@ -1626,7 +1575,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                 
             valid_second_edges = []
             for edge2 in self.edge_groups[node2]['out']:
-                if edge2 not in self.both_edges:
+                if edge2 not in self.all_both_edges:
                     continue
                 if edge2 in avoid_edges:
                     continue
