@@ -1,42 +1,22 @@
 # Import all required packages
-import pandas as pd                   # For data manipulation and analysis
-import io
-import gymnasium as gym
-
-#from gymnasium import spaces
 import numpy as np
 import os
 import pickle
-import copy
-import random
 import time
-import matplotlib.pyplot as plt
-from matplotlib.ticker import PercentFormatter
-import matplotlib.ticker as ticker
-import warnings
-from concurrent.futures import ProcessPoolExecutor
-import multiprocessing
-
-from tqdm import tqdm
-from scipy.stats import ttest_ind
-import seaborn as sns
-
-from stable_baselines3.common.vec_env import DummyVecEnv
-
 import ray
 
 #User Determined Settings
-graphName = "UKR"
+graphName = "G5x5"
 env_params = {'deterministic_agent': False,
               'multiple_interdiction_attempts': False,
-              'attacker_strategy': 'divert',  # canalize   isolate   divert  zero_sum
-              'training_budget_range': (12,20),  #G5x5: zero_sum/isolate: (5,15), canalize/divert: (12,24) G10x10: zero_sum/isolate: (10,20), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (18,30) G15x15: zero_sum/isolate: (25,45)
+              'attacker_strategy': 'zero_sum',  # canalize   isolate   divert  zero_sum
+              'training_budget_range': (5,15),  #G5x5: zero_sum/isolate: (5,15), canalize/divert: (12,24) G10x10: zero_sum/isolate: (10,20), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (18,30) G15x15: zero_sum/isolate: (25,45)
               'max_path_length': 2,  #G5x5: 2,  G10x10: 3, UKR: 4
               'sample_size': None,
               'penalty_value': -0.01,
              }
               
-version_date = "03_20" # numeric month_day
+version_date = "04_24" # numeric month_day
 version_type = "bi"  # bi for backward induction or opt_m or opt_d for optimal MIP
 num_cpus_run = 36   # 36  44
 
@@ -91,8 +71,6 @@ if env_params['multiple_interdiction_attempts'] == True:
 else:
     MI_letter = 'B'
     
-current_dir = os.getcwd()
-
 def save_partial_results(save_path, completed_episodes, obj_vals, interdictions, times, states):
     """Save partial results to pickle file."""
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -198,23 +176,25 @@ else:
                 
                 time_limit_sec = 3600 # 1 hour time limit
                 
-                if env_params['attacker_strategy'] == "zero_sum":
-                    start_time = time.perf_counter()
-                    if version_type == 'opt_m':
-                        optimal_obj_val, optimal_interdiction_edges = env.solve_optimal_interdiction(method=opt_method, time_limit=time_limit_sec) 
-                    elif version_type == "opt_d":
-                        optimal_obj_val, optimal_interdiction_edges = env.solve_optimal_interdiction(method=opt_method, time_limit=time_limit_sec) 
-                    elif version_type == 'bi':
-                        # Reduced n_workers to avoid thread resource exhaustion
-                        optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = num_cpus_run-6, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, reduce_flow=True, jitter = False, parallel_expansion=True, projection_uses_flow=False, rl_model_path=model_path, time_limit=time_limit_sec)
-                    end_time = time.perf_counter()
+                start_time = time.perf_counter()
+
+                if env_params['attacker_strategy'] == "zero_sum" and version_type in ['opt_m', 'opt_d']:
+                    optimal_obj_val, optimal_interdiction_edges = env.solve_optimal_interdiction(method=opt_method, time_limit=time_limit_sec) 
                 else:
-                    start_time = time.perf_counter()
                     # Reduced n_workers to avoid thread resource exhaustion
-                    optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False, n_workers = num_cpus_run-6, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, reduce_flow=True, jitter=False, parallel_expansion=True, projection_uses_flow=False, rl_model_path=model_path, time_limit=time_limit_sec)
-                    end_time = time.perf_counter()
-                
-                solve_time = end_time - start_time
+                    optimal_obj_val, optimal_interdiction_edges = env.solve_backward_induction_ray(verbose=False,
+                                                                                                   n_workers=num_cpus_run-6, 
+                                                                                                   enable_memoization=True, 
+                                                                                                   enable_outcome_caching=True, 
+                                                                                                   enable_alpha_pruning=True, 
+                                                                                                   reduce_flow=True, 
+                                                                                                   jitter=True, 
+                                                                                                   parallel_expansion=True, 
+                                                                                                   projection_uses_flow=False, 
+                                                                                                   rl_model_path=model_path, 
+                                                                                                   time_limit=time_limit_sec)
+
+                end_time = time.perf_counter()
             
                 #Save optimal solution value and interdiction set
                 optimal_obj_vals[episode] = optimal_obj_val
