@@ -102,7 +102,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                  max_sink_need=3, penalty_value=-0.1, 
                  sample_size=1000, max_path_length = 6,
                  max_num_edges=500, 
-                 max_num_nodes=250, old_routing="none", outcome_memo_actor=None, outcome_memo_actors=None):
+                 max_num_nodes=250, outcome_memo_actor=None, outcome_memo_actors=None):
         super(CustomEnv, self).__init__()
 
         #Setup core environment attributes
@@ -127,7 +127,6 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         self.MAX_PATH_LENGTH = max_path_length
         self.max_num_edges = max_num_edges
         self.max_num_nodes = max_num_nodes
-        self.old_routing = old_routing
         self.outcome_memo_actor = outcome_memo_actor
         self.outcome_memo_actors = outcome_memo_actors
         if self.outcome_memo_actors is None and self.outcome_memo_actor is not None:
@@ -457,11 +456,9 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             indices = np.where(self.state['isolate_objective'][:self.num_both_edges] == 1)[0]
             self.sensitive_edges = [self.both_edges[i] for i in indices]
         elif routing_assumption == 'canalize':
-            # FIX: Pull true directed edges rather than canonical mask edges
-            self.sensitive_edges = self._get_canalize_path_edges()
+            self.sensitive_edges = self._get_objective_path_edges('canalize_objective')
         elif routing_assumption == 'divert':
-            # FIX: Pull true directed edges rather than canonical mask edges
-            self.sensitive_edges = self._get_divert_path_edges('divert_from_objective') + self._get_divert_path_edges('divert_to_objective')
+            self.sensitive_edges =self._get_objective_path_edges('divert_from_objective') + self._get_objective_path_edges('divert_to_objective')
 
     def _subtour_callback(self, model, where):
         """Callback to eliminate subtours efficiently."""
@@ -479,7 +476,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                 expr = grb.quicksum(self.edge_used[e] for e in cycle)
                 model.cbLazy(expr <= len(cycle) - 1)
 
-    def _find_cycles(self, edges, use_networkx=True):
+    def _find_cycles(self, edges):
         """Find cycles in solution graph using targeted BFS on sensitive edges."""
         if not hasattr(self, 'sensitive_edges') or not self.sensitive_edges:
              return []
@@ -488,60 +485,21 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         active_sensitive = [e for e in self.sensitive_edges if e in active_edges_set]
         cycles = []
         
-        if use_networkx:
-            G = nx.DiGraph()
-            G.add_edges_from(edges)
+        G = nx.DiGraph()
+        G.add_edges_from(edges)
             
-            for u, v in active_sensitive:
-                if len(cycles) >= 20: break
-                try:
-                    # Find shortest path from v back to u to complete the cycle
-                    # Using nx.shortest_path is highly optimized compared to custom BFS
-                    path = nx.shortest_path(G, source=v, target=u)
-                    if len(path) <= 20: # Limiting length to match old behavior
-                        cycle_edges = [(u, v)]
-                        for i in range(len(path) - 1):
-                            cycle_edges.append((path[i], path[i+1]))
-                        cycles.append(cycle_edges)
-                except nx.NetworkXNoPath:
-                    continue
-        else:
-            # ORIGINAL CUSTOM BFS
-            adj = defaultdict(list)
-            for u, v in edges:
-                adj[u].append(v)
-            
-            for u, v in active_sensitive:
-                if len(cycles) >= 20: break
-                
-                # BFS to find shortest path from v back to u
-                # This confirms a cycle passing through (u, v)
-                queue = [(v, [v])]
-                visited = {v}
-                found_path = None
-                
-                while queue:
-                    curr, path = queue.pop(0)
-                    if curr == u:
-                        found_path = path
-                        break
-                    
-                    # Limit depth to avoid large search in complex graphs
-                    if len(path) > 20: 
-                        continue
-    
-                    for neighbor in adj[curr]:
-                        if neighbor not in visited:
-                            visited.add(neighbor)
-                            queue.append((neighbor, path + [neighbor]))
-                
-                if found_path:
-                    # Cycle found: (u, v) + (v -> ... -> u)
+        for u, v in active_sensitive:
+            if len(cycles) >= 20: break
+            try:
+                # Find shortest path from v back to u to complete the cycle
+                path = nx.shortest_path(G, source=v, target=u)
+                if len(path) <= 20: # Limiting length to match old behavior
                     cycle_edges = [(u, v)]
-                    for i in range(len(found_path) - 1):
-                        cycle_edges.append((found_path[i], found_path[i+1]))
+                    for i in range(len(path) - 1):
+                        cycle_edges.append((path[i], path[i+1]))
                     cycles.append(cycle_edges)
-            
+            except nx.NetworkXNoPath:
+                continue
         return cycles 
 
     def _initialize_maxflow_model(self):
@@ -747,7 +705,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
 
         elif routing_assumption == "canalize":
             # Secondary: Minimize the minimum forward flow through the canalized path (Priority 5)
-            ordered_fwd_edges = self._get_canalize_path_edges()
+            ordered_fwd_edges = self._get_objective_path_edges('canalize_objective')
             
             if ordered_fwd_edges:
                 # 1. Forward Direction Min Flow
@@ -763,8 +721,8 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
 
         elif routing_assumption == "divert":
             # Identify Edge Sets
-            from_edges = self._get_divert_path_edges('divert_from_objective')
-            to_edges = self._get_divert_path_edges('divert_to_objective')
+            from_edges = self._get_objective_path_edges('divert_from_objective')
+            to_edges = self._get_objective_path_edges('divert_to_objective')
 
             # Determine Phase based on existence of reference flows
             if hasattr(self, 'reference_start_flows') and self.reference_start_flows is not None:
@@ -860,8 +818,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
 
         # Clear local outcome cache on reset because capacities/objectives change
         self.local_outcome_cache = {}
-        self._clear_canalize_path_cache()
-        self._clear_divert_path_cache()
+        self._clear_objective_path_cache(('canalize_objective', 'divert_from_objective', 'divert_to_objective'))
 
         # Kill centralized outcome cache actors if they exist to free memory completely
         if self.outcome_memo_actors:
@@ -924,68 +881,20 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
 
             # Add strategy-specific components
             self.state = self._add_strategy_components(base_state)
-            self._cache_canalize_path()
-            self._cache_divert_paths()
+            if self.attacker_strategy == 'canalize':
+                self._cache_objective_path('canalize_objective')
+            elif self.attacker_strategy == 'divert':
+                self._cache_objective_paths(('divert_from_objective', 'divert_to_objective'))
 
             # Calculate reference objective value for the attacker's strategy
-            if self.attacker_strategy == 'zero_sum':
-                self.reference_obj, self.reference_flows = self._compute_objective_and_flows()
-            elif self.attacker_strategy == 'canalize':
-                # Explicitly calculate reference (raw) flow on reset
-                _, flows = self.solve_max_flow(routing_assumption = 'canalize')
-                self.reference_flows_dict = flows
-                target_path_flow = self._calculate_target_path_flow(flows, 'canalize_objective')
-                
-                self.reference_start_flow = target_path_flow
-                
-                canalize_mask = self.state['canalize_objective'][:self.num_both_edges] == 1
-                if np.any(canalize_mask):
-                    bottleneck_capacity = np.min(self.state['edge_capacity'][:self.num_both_edges][canalize_mask])
-                else:
-                    bottleneck_capacity = 0
-                
-                if bottleneck_capacity - self.reference_start_flow < 1:
-                    continue
-                    
-                self.canalize_norm_factor = max(bottleneck_capacity-self.reference_start_flow, 1e-6)
-                
-                # Compute max_canalize_objective
-                margins = [self.state['edge_capacity'][i] - flows.get(self.both_edges[i], 0) for i, m in enumerate(canalize_mask) if m]
-                self.max_canalize_objective = min(margins) if margins else 0
-                
-                self.reference_obj = self.reference_start_flow
-                self.reference_flows = flows
-                #self.last_canalize_flow = self._calculate_total_path_flow(flows, 'canalize_objective') # NO LONGER USED
-            elif self.attacker_strategy == 'isolate':
-                self.reference_obj, self.reference_flows = self._calculate_isolate_objective_and_flows()
-            elif self.attacker_strategy == 'divert':
-                _, self.reference_flows_dict = self.solve_max_flow(routing_assumption = 'divert')
-                from_flow = self._calculate_target_path_flow(self.reference_flows_dict, 'divert_from_objective')
-                to_flow = self._calculate_target_path_flow(self.reference_flows_dict, 'divert_to_objective')
-                self.reference_start_flows = (from_flow, to_flow)
-                self.reference_obj = 0
-                #self.last_from_flow = self._calculate_total_path_flow(self.reference_flows_dict, 'divert_from_objective') # NO LONGER USED
-                #self.last_to_flow = self._calculate_total_path_flow(self.reference_flows_dict, 'divert_to_objective') # NO LONGER USED
-                self.reference_flows = self._flows_dict_to_array(self.reference_flows_dict)
-                self.max_divert_objective = self._calculate_max_divert_objective(self.reference_flows_dict)
-                
-                # Check if restart is needed for divert strategy (objective must have 3 edges and some from_flow to divert)
-                if self.reference_start_flows[0] == 0 or np.sum(self.state['divert_to_objective']) < 2:
-                    continue
+            is_valid_network = self._initialize_strategy_references(is_reset_loop=True)
+            if not is_valid_network:
+                continue
             
             # If we made it here, the environment is valid
             break
         
-        self.last_obj = self.reference_obj
         self.reference_budget = remaining_budget[0]
-
-        self._cache_flow_array()
-
-        self.current_potential = 0.0
-
-        self.num_interdictable = min(self.num_both_edges, self.action_space.n)
-        self.has_probability = self.state['edge_interdiction_probability'][:self.num_interdictable] > 0
-        self.has_capacity = self.state['edge_capacity'][:self.num_interdictable] > 0
         
         return self.state, {}
     
@@ -1097,6 +1006,58 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             'budget': network_params['budget'],
             'padding_mask': padding_mask  # NEW - explicit padding information
         }
+
+    def _initialize_strategy_references(self, is_reset_loop=False):
+        """Initializes reference objectives, flows, and potentials based on the loaded state and strategy."""
+        if self.attacker_strategy == 'zero_sum':
+            self.reference_obj, self.reference_flows = self._compute_objective_and_flows()
+            self.current_potential = 0.0
+            
+        elif self.attacker_strategy == 'canalize':
+            _, flows = self.solve_max_flow(routing_assumption='canalize')
+            self.reference_flows_dict = flows
+            self.reference_start_flow = self._calculate_target_path_flow(flows, 'canalize_objective')
+            
+            self.max_canalize_objective = self._calculate_max_objective_potential('canalize_objective', self.reference_start_flow)
+
+            if self.max_canalize_objective < 10:
+                if is_reset_loop: return False
+                print("Warning: Max canalize objective is very low, may lead to uninformative episode. Consider regenerating state.")
+            
+            self.current_potential = self._calculate_canalize_potential(flows)
+            self.reference_obj = self.reference_start_flow
+            self.reference_flows = flows
+            
+        elif self.attacker_strategy == 'isolate':
+            self.reference_obj, self.reference_flows = self._calculate_isolate_objective_and_flows()
+            self.current_potential = 0.0
+            
+        elif self.attacker_strategy == 'divert':
+            _, self.reference_flows_dict = self.solve_max_flow(routing_assumption='divert')
+            from_flow = self._calculate_target_path_flow(self.reference_flows_dict, 'divert_from_objective')
+            to_flow = self._calculate_target_path_flow(self.reference_flows_dict, 'divert_to_objective')
+            self.reference_start_flows = (from_flow, to_flow)
+
+            self.max_divert_to_objective = self._calculate_max_objective_potential('divert_to_objective', to_flow)
+            self.max_divert_objective = min(self.max_divert_to_objective, from_flow) 
+
+            self.reference_obj = 0
+            self.current_potential = self._calculate_divert_potential(self.reference_flows_dict)
+            self.reference_flows = self._flows_dict_to_array(self.reference_flows_dict)
+                
+            if self.reference_start_flows[0] == 0 or np.sum(self.state['divert_to_objective']) < 2:
+                if is_reset_loop: return False
+                print("Warning: Divert strategy has no initial flow to divert or insufficient target edges, may lead to uninformative episode. Consider regenerating state.")
+        
+        # Standardize trackers and caches
+        self.last_obj = self.reference_obj
+        self._cache_flow_array()
+
+        self.num_interdictable = min(self.num_both_edges, self.action_space.n)
+        self.has_probability = self.state['edge_interdiction_probability'][:self.num_interdictable] > 0
+        self.has_capacity = self.state['edge_capacity'][:self.num_interdictable] > 0
+        
+        return True
 
     def _add_strategy_components(self, base_state):
         """Add strategy-specific components to the state."""
@@ -1388,58 +1349,6 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             return []
         return list(cache_entry.get('edges', ()) or ())
 
-    def _clear_canalize_path_cache(self):
-        """Clear cached canalize path data so it can be rebuilt for the next episode."""
-        self._clear_objective_path_cache(('canalize_objective',))
-
-    def _clear_divert_path_cache(self):
-        """Clear cached divert path data so it can be rebuilt for the next episode."""
-        self._clear_objective_path_cache(('divert_from_objective', 'divert_to_objective'))
-
-    def _cache_canalize_path(self):
-        """Build and store the directed canalize path once per episode."""
-        self._cache_objective_path('canalize_objective')
-
-    def _cache_divert_paths(self):
-        """Build and store directed divert paths once per episode."""
-        self._cache_objective_paths(('divert_from_objective', 'divert_to_objective'))
-
-    def _get_canalize_path_edges(self):
-        """Return the cached canalize path, rebuilding it only if needed."""
-        return self._get_objective_path_edges('canalize_objective')
-
-    def _get_divert_path_edges(self, objective_key):
-        """Return the cached divert path for an objective, rebuilding it only if needed."""
-        if objective_key not in ('divert_from_objective', 'divert_to_objective'):
-            return []
-
-        return self._get_objective_path_edges(objective_key)
-
-    def _get_cached_objective_path_edges(self, objective_key):
-        """Return cached directed objective path edges when available."""
-        if objective_key == 'canalize_objective':
-            return self._get_canalize_path_edges()
-        if objective_key in ('divert_from_objective', 'divert_to_objective'):
-            return self._get_divert_path_edges(objective_key)
-        return self._extract_directed_path_edges(objective_key)
-
-    def _calculate_max_divert_objective(self, reference_flows_dict):
-        """Compute diversion cap used to clip per-edge objective deltas."""
-        divert_from_edges = self._get_divert_path_edges('divert_from_objective')
-        divert_to_edges = self._get_divert_path_edges('divert_to_objective')
-
-        to_margins = []
-        for edge in divert_to_edges:
-            idx = self.edge_to_index.get(edge)
-            if idx is None:
-                idx = self.edge_to_index.get((edge[1], edge[0]))
-            if idx is None:
-                continue
-            to_margins.append(self.state['edge_capacity'][idx] - reference_flows_dict.get(edge, 0))
-
-        from_margins = [reference_flows_dict.get(edge, 0) for edge in divert_from_edges]
-        return min(min(to_margins) if to_margins else 0, min(from_margins) if from_margins else 0)
-
     def _add_divert_components(self, base_state):
         """Add divert-specific objectives to state."""
         # Temporarily set state for max flow calculation
@@ -1639,7 +1548,6 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             return self.state, float(reward), True, False, {}
 
         # Validate action
-        # Use mask_fn to validate action (unified logic)
         action_mask = self.mask_fn()
         
         # Check if action is valid: Must be within actual edges (not padding) and Must be allowed by mask_fn
@@ -1703,31 +1611,19 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
     
     def _calculate_original_reward(self, current_obj):
         """Calculates the original reward for the current state."""
-        if self.attacker_strategy == "zero_sum":
-            obj = self.reference_obj - current_obj
-        elif self.attacker_strategy == "canalize":
-            obj = current_obj - self.reference_obj
-        elif self.attacker_strategy == "isolate":
-            obj = self.reference_obj - current_obj
-        elif self.attacker_strategy == "divert":
-            obj = current_obj - self.reference_obj
-        else:
-            obj = current_obj
-        return obj
+        if self.attacker_strategy in ["zero_sum", "isolate"]:
+            return self.reference_obj - current_obj
+        elif self.attacker_strategy in ["canalize", "divert"]:
+            return current_obj - self.reference_obj
+        return current_obj
     
     def _calculate_potential(self, current_obj):
         """Calculates the potential Phi(s) of the current state."""
-        if self.attacker_strategy == "zero_sum":
-            obj = self.reference_obj - current_obj
-        elif self.attacker_strategy == "canalize":
-            obj = current_obj
-        elif self.attacker_strategy == "isolate":
-            obj = self.reference_obj - current_obj
-        elif self.attacker_strategy == "divert":
-            obj = current_obj
-        else:
-            obj = current_obj
-        return obj
+        if self.attacker_strategy in ["zero_sum", "isolate"]:
+            return self.reference_obj - current_obj
+        elif self.attacker_strategy in ["canalize", "divert"]:
+            return current_obj
+        return current_obj
 
     def _flows_dict_to_array(self, flows_dict):
         """Convert a flow dictionary to a compact float32 array aligned with self.both_edges."""
@@ -1881,62 +1777,9 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                 capacity_dict[edge] = 0 if is_interdicted else base_capacity
         
             # Solve max flow
-            obj, flows = self.solve_max_flow(capacity_dict, routing_assumption=strategy_type)
+            obj_val, flows = self.solve_max_flow(capacity_dict, routing_assumption=strategy_type)
         
-            if strategy_type == "zero_sum":
-                objective = obj
-            elif strategy_type == "canalize":                
-                if not for_potential:
-                    objective = self._calculate_target_path_flow(flows, 'canalize_objective')
-                else:
-                    path_edges = self._get_canalize_path_edges()
-
-                    flow_diffs = []
-                    reference_flows_dict = getattr(self, 'reference_flows_dict', {}) or {}
-                    max_canalize_objective = getattr(self, 'max_canalize_objective', 0)
-                    for edge in path_edges:
-                        f_after = flows.get(edge, 0)
-                        f_before = reference_flows_dict.get(edge, 0)
-                        flow_diffs.append(min(f_after - f_before, max_canalize_objective))
-                        
-                    objective = sum(flow_diffs) / len(flow_diffs) if flow_diffs else 0
-            elif strategy_type == "isolate":
-                objective = self._calculate_target_edge_flow(flows, 'isolate_objective')
-            elif strategy_type == "divert":
-                if not for_potential:
-                    from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
-                    to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
-            
-                    ref_flows = getattr(self, 'reference_start_flows', None)
-                    if ref_flows is None:
-                        ref_a, ref_b = 0, 0
-                    else:
-                        try:
-                            ref_a, ref_b = ref_flows[0], ref_flows[1]
-                        except Exception:
-                            ref_a, ref_b = 0, 0
-                        objective = np.min([(ref_a - from_flow), (to_flow - ref_b)])
-                else:
-                    divert_from_edges = self._get_divert_path_edges('divert_from_objective')
-                    divert_to_edges = self._get_divert_path_edges('divert_to_objective')
-
-                    to_flow_diffs = []
-                    for edge in divert_to_edges:
-                        f_after = flows.get(edge, 0)
-                        f_before = self.reference_flows_dict.get(edge, 0)
-                        to_flow_diffs.append(min(f_after - f_before, getattr(self, 'max_divert_objective', 0)))
-
-                    from_flow_diffs = []
-                    for edge in divert_from_edges:
-                        f_after = flows.get(edge, 0)
-                        f_before = self.reference_flows_dict.get(edge, 0)
-                        from_flow_diffs.append(min(f_before - f_after, getattr(self, 'max_divert_objective', 0)))
-                        
-                    to_obj = sum(to_flow_diffs) / len(to_flow_diffs) if to_flow_diffs else 0
-                    from_obj = sum(from_flow_diffs) / len(from_flow_diffs) if from_flow_diffs else 0
-
-                    obj_weight = 0.5
-                    objective = (obj_weight * to_obj) + ((1 - obj_weight) * from_obj)
+            objective = self._compute_raw_objective(strategy_type, flows, for_potential, obj_val)
 
             res = {
                 'objective': objective
@@ -1978,7 +1821,6 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                 self.outcome_memo_actors[idx].set_batch.remote(keys, vals)
 
         # 5. Compute weighted averages
-        
         ordered_outcomes = list(unique_outcomes)
         weights = np.array([outcome_weights[o] for o in ordered_outcomes])
         objectives = np.array([working_cache[_cache_key(o)]['objective'] for o in ordered_outcomes])
@@ -1989,47 +1831,35 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
              return weighted_objective, {}
 
         # Optimized Vectorized Flow Accumulation
-        # We accumulate directly into array format
         final_flow_array = np.zeros((self.num_both_edges, 2), dtype=np.float32)
         
-        # Stack all flow arrays: (n_outcomes, n_edges, 2)
-        # Verify first item has 'flow_array'
-        first_res = working_cache[_cache_key(ordered_outcomes[0])]
-        
-        if 'flow_array' in first_res:
-            # Fast path: All items have flow_array
-            # Efficient stacking
-            all_flow_arrays = np.stack([working_cache[_cache_key(o)]['flow_array'] for o in ordered_outcomes])
-            final_flow_array = np.average(all_flow_arrays, weights=weights, axis=0)
+        # Fast path: All items have flow_array, Efficient stacking
+        all_flow_arrays = np.stack([working_cache[_cache_key(o)]['flow_array'] for o in ordered_outcomes])
+        final_flow_array = np.average(all_flow_arrays, weights=weights, axis=0)
             
-            # Return array directly instead of dict
-            return weighted_objective, final_flow_array
-            
-        else:
-             # Legacy/Fallback path involving dicts or indices
-             # ... (Should not be hit if return_full_flows=True logic above worked)
-             flow_matrix = np.zeros((len(ordered_outcomes), self.num_both_edges, 2))
-             edge_to_idx = self.edge_to_index 
-
-             for i, outcome in enumerate(ordered_outcomes):
-                res = working_cache[_cache_key(outcome)]
-                if 'nonzero_flow_indices' in res and res['nonzero_flow_indices']:
-                    flow_matrix[i, res['nonzero_flow_indices'], 0] = 1.0 
-                    flow_matrix[i, res['nonzero_flow_indices'], 1] = 1.0 
-                elif 'flows' in res:
-                    for edge, val in res['flows'].items():
-                        if val <= 1e-9: continue
-                        idx = edge_to_idx.get(edge)
-                        if idx is not None:
-                            flow_matrix[i, idx, 0] += val
-                        else:
-                            idx = edge_to_idx.get((edge[1], edge[0]))
-                            if idx is not None:
-                                flow_matrix[i, idx, 1] += val
-                                
-             final_flow_array = np.average(flow_matrix, weights=weights, axis=0)
-             return weighted_objective, final_flow_array
+        # Return array directly instead of dict
+        return weighted_objective, final_flow_array
     
+    def _compute_raw_objective(self, strategy_type, flows, for_potential=False, max_flow_obj=0):
+        """Maps a flow dictionary to a scalar objective based on the strategy."""
+        if strategy_type == "zero_sum":
+            return max_flow_obj
+        elif strategy_type == "canalize":
+            if not for_potential:
+                return self._calculate_target_path_flow(flows, 'canalize_objective')
+            return self._calculate_canalize_potential(flows)
+        elif strategy_type == "isolate":
+            return self._calculate_target_edge_flow(flows, 'isolate_objective')
+        elif strategy_type == "divert":
+            if not for_potential:
+                from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
+                to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
+                ref_flows = getattr(self, 'reference_start_flows', None)
+                ref_a, ref_b = (ref_flows[0], ref_flows[1]) if ref_flows else (0, 0)
+                return min((ref_a - from_flow), (to_flow - ref_b))
+            return self._calculate_divert_potential(flows)
+        return 0.0
+
     def _compute_objective_and_flows(self, deterministic_mode=None):
         """Calculate the max flow objective and edge flows."""
         if deterministic_mode is None:
@@ -2047,125 +1877,31 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
     def _calculate_canalize_objective_and_flows(self, for_potential=False):
         """Calculate objective for canalize strategy (flow through specific path)."""
         if self.deterministic_outcomes:
-            _, flows = self.solve_max_flow(routing_assumption = 'canalize')
-            if not for_potential:
-                # --- OLD OBJECTIVE COMPUTATION START ---
-                target_path_flow = self._calculate_target_path_flow(flows, 'canalize_objective')
-                return target_path_flow, self._flows_dict_to_array(flows)
-                # --- OLD OBJECTIVE COMPUTATION END ---
-            else:
-                path_edges = self._get_canalize_path_edges()
-
-                flow_diffs = []
-                reference_flows_dict = getattr(self, 'reference_flows_dict', {}) or {}
-                max_canalize_objective = getattr(self, 'max_canalize_objective', 0)
-                for edge in path_edges:
-                    f_after = flows.get(edge, 0)
-                    f_before = reference_flows_dict.get(edge, 0)
-                    flow_diffs.append(min(f_after - f_before, max_canalize_objective))
-                    
-                obj = sum(flow_diffs) / len(flow_diffs) if flow_diffs else 0
-                return obj, self._flows_dict_to_array(flows)
-        else:
-            objective, mean_flows_array = self._calculate_stochastic_objective_and_flow('canalize', return_full_flows=True, for_potential=for_potential)
-            return objective, mean_flows_array
+            _, flows = self.solve_max_flow(routing_assumption='canalize')
+            obj = self._compute_raw_objective('canalize', flows, for_potential)
+            return obj, self._flows_dict_to_array(flows)
+        return self._calculate_stochastic_objective_and_flow('canalize', return_full_flows=True, for_potential=for_potential)
         
     def _calculate_isolate_objective_and_flows(self):
         """Calculate objective for isolate strategy (reduce flow on specific edges)."""
         if self.deterministic_outcomes:
-            _, flows = self.solve_max_flow(routing_assumption = 'isolate')
-            target_node_flow = self._calculate_target_edge_flow(flows, 'isolate_objective')
-            return target_node_flow, self._flows_dict_to_array(flows)
-        else:
-            objective, mean_flows_array = self._calculate_stochastic_objective_and_flow('isolate', return_full_flows=True)
-            return objective, mean_flows_array
+            _, flows = self.solve_max_flow(routing_assumption='isolate')
+            obj = self._compute_raw_objective('isolate', flows)
+            return obj, self._flows_dict_to_array(flows)
+        return self._calculate_stochastic_objective_and_flow('isolate', return_full_flows=True)
 
-    def _calculate_divert_objective_and_flows(self, mode = None, for_potential=False):
+    def _calculate_divert_objective_and_flows(self, mode=None, for_potential=False):
         """Calculate objective for divert strategy (redirect flow from one path to another)."""
-        if mode is None:
-            mode = self.deterministic_outcomes
-
+        mode = mode if mode is not None else self.deterministic_outcomes
         if mode:
-            _, flows = self.solve_max_flow(routing_assumption = 'divert')
-            
-            if not for_potential:
-                from_flow = self._calculate_target_path_flow(flows, 'divert_from_objective')
-                to_flow = self._calculate_target_path_flow(flows, 'divert_to_objective')
-            
-                ref_flows = getattr(self, 'reference_start_flows', None)
-                if ref_flows is None:
-                    ref_a, ref_b = 0, 0
-                else:
-                    try:
-                        ref_a, ref_b = ref_flows[0], ref_flows[1]
-                    except Exception:
-                        ref_a, ref_b = 0, 0
-                    objective = np.min([(ref_a - from_flow), (to_flow - ref_b)])
-            else:
-                divert_from_edges = self._get_divert_path_edges('divert_from_objective')
-                divert_to_edges = self._get_divert_path_edges('divert_to_objective')
-
-                to_flow_diffs = []
-                for edge in divert_to_edges:
-                    f_after = flows.get(edge, 0)
-                    f_before = self.reference_flows_dict.get(edge, 0)
-                    to_flow_diffs.append(min(f_after - f_before, self.max_divert_objective))
-
-                from_flow_diffs = []
-                for edge in divert_from_edges:
-                    f_after = flows.get(edge, 0)
-                    f_before = self.reference_flows_dict.get(edge, 0)
-                    from_flow_diffs.append(min(f_before - f_after, self.max_divert_objective))
-                    
-                to_obj = sum(to_flow_diffs) / len(to_flow_diffs) if to_flow_diffs else 0
-                from_obj = sum(from_flow_diffs) / len(from_flow_diffs) if from_flow_diffs else 0
-                obj_weight = 0.5
-                objective = (obj_weight*to_obj) + ((1-obj_weight)*from_obj)
-            
-            return objective, self._flows_dict_to_array(flows)
-        else:
-            # Stochastic calculation - returns mean objectives directly
-            # Note: you still need to ensure stochastic implementation of current_from_flow/to_flow if needed here.
-            # But the user calculates stochastic reward returning mean objectives.
-            mean_objective, mean_flows_array = self._calculate_stochastic_objective_and_flow('divert', return_full_flows=True, for_potential=for_potential)
-            return mean_objective, mean_flows_array
-
-    def _calculate_total_path_flow_from_array(self, flow_array, objective_key):
-        """Calculate total sum of flow through edges marked in the objective using a flow array."""
-        path_edges = self._get_cached_objective_path_edges(objective_key)
-
-        if not path_edges:
-            return 0.0
-    
-        target_flows = []
-        for edge in path_edges:
-            idx = self.edge_to_index.get(edge)
-            if idx is not None:
-                target_flows.append(flow_array[idx, 0])
-            else:
-                idx = self.edge_to_index.get((edge[1], edge[0]))
-                if idx is not None:
-                    target_flows.append(flow_array[idx, 1])
-        
-        if not target_flows:
-            return 0.0
-    
-        return sum(target_flows)
-
-    def _calculate_total_path_flow(self, flows, objective_key):
-        """Calculate total sum of flow through edges marked in the objective."""
-        path_edges = self._get_cached_objective_path_edges(objective_key)
-
-        if not path_edges:
-            return 0.0
-    
-        target_flows = [flows.get(edge, 0) for edge in path_edges]
-    
-        return sum(target_flows)
+            _, flows = self.solve_max_flow(routing_assumption='divert')
+            obj = self._compute_raw_objective('divert', flows, for_potential)
+            return obj, self._flows_dict_to_array(flows)
+        return self._calculate_stochastic_objective_and_flow('divert', return_full_flows=True, for_potential=for_potential)
 
     def _calculate_target_path_flow_from_array(self, flow_array, objective_key):
         """Calculate total flow through edges marked in the objective using a flow array."""
-        path_edges = self._get_cached_objective_path_edges(objective_key)
+        path_edges = self._get_objective_path_edges(objective_key)
 
         if not path_edges:
             return 0.0
@@ -2187,7 +1923,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
 
     def _calculate_target_path_flow(self, flows, objective_key):
         """Calculate total flow through edges marked in the objective."""
-        path_edges = self._get_cached_objective_path_edges(objective_key)
+        path_edges = self._get_objective_path_edges(objective_key)
 
         if not path_edges:
             return 0.0
@@ -2204,17 +1940,76 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         target_indices = np.where(objective[:self.num_both_edges] == 1)[0]
         
         target_edges = [self.both_edges[i] for i in target_indices]
-
-        # Filter to only include edges outgoing to super sink nodes to avoid double counting
-        # and internal flow between sink nodes.
-        #if objective_key == 'isolate_objective':
-        #     target_edges = [e for e in target_edges if e[1] in self.super_sink_nodes]
     
         # Batch get flows
         flows_array = np.array([(flows.get(edge, 0) + flows.get((edge[1], edge[0]), 0)) for edge in target_edges])
     
         # Return sum flow among target nodes
         return np.sum(flows_array) #np.sum(total_flow)
+    
+    def _calculate_max_objective_potential(self, objective_key, reference_start_flow):
+        """
+        Computes the maximum potential objective delta based on the bottleneck capacity
+        of the target edges minus the reference starting flow.
+        """
+        objective_mask = self.state[objective_key][:self.num_both_edges] == 1
+        
+        if np.any(objective_mask):
+            bottleneck_capacity = np.min(self.state['edge_capacity'][:self.num_both_edges][objective_mask])
+        else:
+            bottleneck_capacity = 0
+            
+        return bottleneck_capacity - reference_start_flow
+    
+    def _calculate_canalize_potential(self, flows):
+        """
+        Computes the potential of the canalize strategy by calculating the average 
+        capped flow difference along the canalize path.
+        """
+        path_edges = self._get_objective_path_edges('canalize_objective')
+        
+        if not path_edges:
+            return 0.0
+
+        flow_diffs = []
+        reference_start_flow = getattr(self, 'reference_start_flow', 0) or 0
+        max_canalize_objective = getattr(self, 'max_canalize_objective', 0) or 0
+        
+        for edge in path_edges:
+            f_after = flows.get(edge, 0)
+            flow_diffs.append(min(f_after - reference_start_flow, max_canalize_objective))
+                
+        return sum(flow_diffs) / len(flow_diffs)
+    
+    def _calculate_divert_potential(self, flows):
+        """
+        Computes the potential of the divert strategy.
+        Term 1: Average capped flow increase along the divert_to path.
+        Term 2: Capped bottleneck flow reduction on the divert_from path.
+        Returns the minimum of these two terms to enforce a strict flow transfer.
+        """
+        path_edges_to = self._get_objective_path_edges('divert_to_objective')
+        
+        if not path_edges_to or getattr(self, 'reference_start_flows', None) is None:
+            return 0.0
+
+        ref_from, ref_to = self.reference_start_flows
+        max_divert_obj = getattr(self, 'max_divert_objective', 0)
+
+        # Term 1: Canalize-style average increase on the 'to' path
+        to_flow_diffs = []
+        for edge in path_edges_to:
+            f_after = flows.get(edge, 0)
+            to_flow_diffs.append(min(f_after - ref_to, max_divert_obj))
+            
+        term1 = sum(to_flow_diffs) / len(to_flow_diffs) if to_flow_diffs else 0.0
+
+        # Term 2: Reduction of bottleneck flow on the 'from' path
+        from_bottleneck = self._calculate_target_path_flow(flows, 'divert_from_objective')
+        term2 = min(max_divert_obj, ref_from - from_bottleneck)
+
+        # The potential is strictly the amount of flow successfully transferred
+        return min(term1, term2)
 
     def _is_episode_complete(self, remaining_budget, current_obj=None):
         """Determine if the episode should end."""
@@ -2323,8 +2118,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
 
         # Clear local outcome cache when loading new state
         self.local_outcome_cache = {}
-        self._clear_canalize_path_cache()
-        self._clear_divert_path_cache()
+        self._clear_objective_path_cache(('canalize_objective', 'divert_from_objective', 'divert_to_objective'))
 
         # Clear centralized outcome cache if it exists
         if self.outcome_memo_actors:
@@ -2352,68 +2146,19 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         self.state = state
 
         if self.attacker_strategy == 'canalize':
-            self._cache_canalize_path()
+            self._cache_objective_path('canalize_objective')
         elif self.attacker_strategy == 'divert':
-            self._cache_divert_paths()
+            self._cache_objective_paths(('divert_from_objective', 'divert_to_objective'))
 
         # Calculate reference objective value for the attacker's strategy
-        if self.attacker_strategy == 'zero_sum':
-            self.reference_obj, self.reference_flows = self._compute_objective_and_flows()
-        elif self.attacker_strategy == 'canalize':
-            # Use original method to get raw flow without subtraction to initialize start flow
-            # We temporarily bypass the objective subtraction logic effectively by checking if attribute exists
-            # but since self.reference_start_flow is not set on self yet, it defaults to 0 in _calculate...
-            
-            # Recalculate reference flow based on CURRENT state (loaded state)
-            _, flows = self.solve_max_flow(routing_assumption = 'canalize')
-            self.reference_flows_dict = flows
-            self.reference_start_flow = self._calculate_target_path_flow(flows, 'canalize_objective')
-            
-            canalize_mask = self.state['canalize_objective'][:self.num_both_edges] == 1
-            if np.any(canalize_mask):
-                bottleneck_capacity = np.min(self.state['edge_capacity'][:self.num_both_edges][canalize_mask])
-            else:
-                bottleneck_capacity = 0
-            self.canalize_norm_factor = max(bottleneck_capacity-self.reference_start_flow, 1e-6)
-            
-            self.reference_obj = self.reference_start_flow
-            self.reference_flows = flows
-            #self.last_canalize_flow = self._calculate_total_path_flow(flows, 'canalize_objective') # NO LONGER USED
-
-            # Compute max_canalize_objective
-            margins = [self.state['edge_capacity'][i] - flows.get(self.both_edges[i], 0) for i, m in enumerate(canalize_mask) if m]
-            self.max_canalize_objective = min(margins) if margins else 0
-        elif self.attacker_strategy == 'isolate':
-            self.reference_obj, self.reference_flows = self._calculate_isolate_objective_and_flows()
-        elif self.attacker_strategy == 'divert':
-            _, self.reference_flows_dict = self.solve_max_flow(routing_assumption = 'divert')
-            from_flow = self._calculate_target_path_flow(self.reference_flows_dict, 'divert_from_objective')
-            to_flow = self._calculate_target_path_flow(self.reference_flows_dict, 'divert_to_objective')
-            self.reference_start_flows = (from_flow, to_flow)
-            self.reference_obj = 0
-            #self.last_from_flow = self._calculate_total_path_flow(self.reference_flows_dict, 'divert_from_objective') # NO LONGER USED
-            #self.last_to_flow = self._calculate_total_path_flow(self.reference_flows_dict, 'divert_to_objective') # NO LONGER USED
-            self.reference_flows = self._flows_dict_to_array(self.reference_flows_dict)
-            self.max_divert_objective = self._calculate_max_divert_objective(self.reference_flows_dict)
-        
-        self.last_obj = self.reference_obj
+        self._initialize_strategy_references(is_reset_loop=False)
         self.reference_budget = state['budget'][0]
-
-        self._cache_flow_array()
-
-        self.current_potential = 0.0
-
-
-        self.num_interdictable = min(self.num_both_edges, self.action_space.n)
-        self.has_probability = self.state['edge_interdiction_probability'][:self.num_interdictable] > 0
-        self.has_capacity = self.state['edge_capacity'][:self.num_interdictable] > 0
 
         return self.state, {}
 
     def get_edges_on_paths_to_source(self, start_nodes):
         """
-        Determine which edges have non-zero flow in self.cached_flow_array and lie along a path from the isolate_objective nodes to a source node.
-        Uses backward BFS from target nodes through edges with non-zero flow to reach source nodes.
+        Determine which edges have non-zero flow in self.cached_flow_array and lie along a path from the isolate_objective nodes to a source node. Uses backward BFS from target nodes through edges with non-zero flow to reach source nodes.
         Returns:
             np.ndarray: Boolean array of shape (self.numbothedges,) where True indicates the edge has non-zero flow and is on a path from an isolate_objective node to a source.
         """

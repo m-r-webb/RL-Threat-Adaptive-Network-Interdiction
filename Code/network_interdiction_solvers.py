@@ -2458,7 +2458,7 @@ class InterdictionSolverMixin:
                             self.state['budget'][0] -= self.state['edge_costs'][action_idx]
                             actions_taken.append(edge)
 
-        elif self.attacker_strategy == "divert":  #PICKUP HERE!!!
+        elif self.attacker_strategy == "divert":  
             # Identify canalize objective edges
             target_to_indices = np.where(self.state['divert_to_objective'][:self.num_both_edges] == 1)[0]
             target_from_indices = np.where(self.state['divert_from_objective'][:self.num_both_edges] == 1)[0]
@@ -2612,7 +2612,6 @@ class InterdictionSolverMixin:
         original_reference_obj = getattr(self, 'reference_obj', None)
         original_reference_budget = getattr(self, 'reference_budget', None)
         original_last_obj = getattr(self, 'last_obj', None)
-        original_canalize_norm_factor = getattr(self, 'canalize_norm_factor', None)
         original_max_canalize_objective = getattr(self, 'max_canalize_objective', None)
         original_max_divert_objective = getattr(self, 'max_divert_objective', None)
         original_cached_flow_array = copy.deepcopy(getattr(self, 'cached_flow_array', None))
@@ -2679,8 +2678,6 @@ class InterdictionSolverMixin:
                     self._cache_flow_array()
 
                     # Get observation
-                    # Assuming observation dict matches state or is part of it. 
-                    # The env_TA.py usually returns the state dict as obs.
                     obs = self.state 
                     
                     if "MaskablePPO" in rl_model_path:
@@ -2689,12 +2686,7 @@ class InterdictionSolverMixin:
                     else:
                         action, _ = agent.predict(obs, deterministic=True)
 
-                    # Step
-                    # Since we are In the env, we can just call step() directly?
-                    # self.step() might expect self to be a Gym Env.
-                    # We are in a Mixin, but the class using it is CustomEnv(gym.Env). 
-                    # So self.step(int(action)) should work.
-                    
+                    # Step environment
                     _, _, done, _, _ = self.step(int(action))
                     
                     if int(action) < self.num_interdictable:
@@ -3038,7 +3030,7 @@ class InterdictionSolverMixin:
             state_ref = ray.put(state_snapshot)
 
             env_refs = {}
-            for attr in ['reference_flows_dict', 'reference_start_flow', 'canalize_norm_factor', 'reference_obj', 'reference_flows', 'max_canalize_objective', 'reference_start_flows', 'max_divert_objective']:
+            for attr in ['reference_flows_dict', 'reference_start_flow', 'reference_obj', 'reference_flows', 'max_canalize_objective', 'reference_start_flows', 'max_divert_objective']:
                 if hasattr(self, attr):
                     env_refs[attr] = getattr(self, attr)
 
@@ -3547,7 +3539,6 @@ class InterdictionSolverMixin:
             self.reference_obj = original_reference_obj
             self.reference_budget = original_reference_budget
             self.last_obj = original_last_obj
-            self.canalize_norm_factor = original_canalize_norm_factor
             self.max_canalize_objective = original_max_canalize_objective
             self.max_divert_objective = original_max_divert_objective
             if original_cached_flow_array is not None:
