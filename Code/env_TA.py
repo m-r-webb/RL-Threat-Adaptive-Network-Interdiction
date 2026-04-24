@@ -90,8 +90,9 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                  max_interdiction_attempts=10, max_source_flow=3, 
                  max_sink_need=3, penalty_value=-0.1, 
                  sample_size=1000, max_path_length = 6,
-                 max_num_edges=500, 
-                 max_num_nodes=250, outcome_memo_actor=None, outcome_memo_actors=None):
+                 max_num_edges=500, max_num_nodes=250, 
+                 objective_path_length=2,
+                 outcome_memo_actor=None, outcome_memo_actors=None):
         super(CustomEnv, self).__init__()
 
         #Setup core environment attributes
@@ -116,6 +117,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         self.MAX_PATH_LENGTH = max_path_length
         self.max_num_edges = max_num_edges
         self.max_num_nodes = max_num_nodes
+        self.objective_path_length = max(1, objective_path_length)
         self.outcome_memo_actor = outcome_memo_actor
         self.outcome_memo_actors = outcome_memo_actors
         if self.outcome_memo_actors is None and self.outcome_memo_actor is not None:
@@ -1078,10 +1080,9 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             
         # 3. Find candidate start nodes
         # Must not be in avoid_nodes and must have enough distance to sink 
-        # (>= 2 is required to allow a 2-edge path to step strictly closer to the sink)
         valid_start_nodes = [
             n for n in self.nodes 
-            if n not in avoid_nodes and self.node_distances.get(n, float('inf')) >= 2
+            if n not in avoid_nodes and self.node_distances.get(n, float('inf')) >= self.objective_path_length
         ]
         
         random.shuffle(valid_start_nodes)
@@ -1110,9 +1111,9 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             valid_mf_edges = [edge for edge in max_flow_edge_set if edge in self.edge_to_index or (edge[1], edge[0]) in self.edge_to_index]
             
             if valid_mf_edges:
-                if len(valid_mf_edges) >= 2:
-                    start_idx = random.randint(0, len(valid_mf_edges) - 2)
-                    best_path = valid_mf_edges[start_idx : start_idx + 2]
+                if len(valid_mf_edges) >= self.objective_path_length:
+                    start_idx = random.randint(0, len(valid_mf_edges) - self.objective_path_length)
+                    best_path = valid_mf_edges[start_idx : start_idx + self.objective_path_length]
                 else:
                     best_path = valid_mf_edges
 
@@ -1354,14 +1355,16 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         edge_flows.sort(key=lambda x: x[1], reverse=True)
         
         valid_start_edges = []
+        # Calculate safe distance buffer for dynamic length
+        min_dist = max(3, self.objective_path_length + 1) 
+        
         for edge_tuple, flow_val in edge_flows:
-            # Both endpoints of the edge chosen must have a distance greater than 3 from the sink
+            # Both endpoints of the edge chosen must have sufficient distance from the sink
             dist0 = self.node_distances.get(edge_tuple[0], float('inf'))
             dist1 = self.node_distances.get(edge_tuple[1], float('inf'))
-            if dist0 > 3 and dist1 > 3:
+            if dist0 >= min_dist and dist1 >= min_dist:
                 valid_start_edges.append(edge_tuple)
         
-        # Take the top 5 valid edges with the most flow
         top_edges = valid_start_edges[:5]
         
         candidates = []
@@ -1389,7 +1392,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             visited_from_edges = {start_edge, (start_edge[1], start_edge[0])}
             visited_from_nodes = {start_edge[0], start_edge[1]}
             
-            for _ in range(2):
+            for _ in range(self.objective_path_length):
                 out_edges = self.edge_groups.get(curr, {}).get('out', [])
                 valid_out = [e for e in out_edges if e in self.both_edges and e not in visited_from_edges and e[1] not in visited_from_nodes]
                 
@@ -1403,7 +1406,8 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                 visited_from_nodes.add(next_edge[1])
                 curr = next_edge[1]
             
-            if not valid_trace or len(divert_from_segments) < 3:
+            # Ensure we captured the start edge + the required length
+            if not valid_trace or len(divert_from_segments) < self.objective_path_length + 1:
                 continue
 
             # Nodes to avoid for divert_to (other than nodes on first edge)
@@ -1446,52 +1450,52 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         return {**base_state, 'divert_from_objective': divert_from, 'divert_to_objective': divert_to}
 
     def _find_alternate_segment(self, start_node, divert_from_edges, avoid_nodes, breakpoint_dist):
-        """Find a random 2-segment path starting from start_node avoiding avoid_nodes."""
+        """Find a random n-segment path starting from start_node avoiding avoid_nodes."""
         avoid_edges = set(divert_from_edges)
         for e in divert_from_edges:
             avoid_edges.add((e[1], e[0]))
             
-        valid_first_edges = []
-        if start_node not in self.edge_groups:
-            return None
-            
-        for edge1 in self.edge_groups[start_node]['out']:
-            if edge1 not in self.all_both_edges:
-                continue
-            if edge1 in avoid_edges:
-                continue
-            if edge1[1] in avoid_nodes:
-                continue
-            valid_first_edges.append(edge1)
-            
-        random.shuffle(valid_first_edges)
-        
-        for edge1 in valid_first_edges:
-            node2 = edge1[1]
-            if node2 not in self.edge_groups:
-                continue
-                
-            valid_second_edges = []
-            for edge2 in self.edge_groups[node2]['out']:
-                if edge2 not in self.all_both_edges:
-                    continue
-                if edge2 in avoid_edges:
-                    continue
-                final_node = edge2[1]
-                if final_node == start_node or final_node in avoid_nodes:
-                    continue
-                
+        def dfs(current_node, current_path, visited_nodes):
+            # Base case: Path reached the desired length
+            if len(current_path) == self.objective_path_length:
                 # Should end at a node strictly less than breakpoint_dist from sink
-                if self.node_distances.get(final_node, float('inf')) >= breakpoint_dist:
+                if self.node_distances.get(current_node, float('inf')) < breakpoint_dist:
+                    return list(current_path)
+                return None
+                
+            if current_node not in self.edge_groups:
+                return None
+                
+            valid_edges = []
+            for edge in self.edge_groups[current_node]['out']:
+                if edge not in self.all_both_edges:
+                    continue
+                if edge in avoid_edges:
+                    continue
+                next_node = edge[1]
+                if next_node == start_node or next_node in avoid_nodes or next_node in visited_nodes:
                     continue
                     
-                valid_second_edges.append(edge2)
+                valid_edges.append(edge)
                 
-            if valid_second_edges:
-                edge2 = random.choice(valid_second_edges)
-                return [edge1, edge2]
+            random.shuffle(valid_edges)
+            
+            for edge in valid_edges:
+                next_node = edge[1]
+                visited_nodes.add(next_node)
+                current_path.append(edge)
                 
-        return None
+                result = dfs(next_node, current_path, visited_nodes)
+                if result:
+                    return result
+                    
+                # Backtrack
+                current_path.pop()
+                visited_nodes.remove(next_node)
+                
+            return None
+
+        return dfs(start_node, [], {start_node})
 
     def _extract_max_flow_path(self, flows):
         """Extract the path with maximum flow from flows dictionary."""
