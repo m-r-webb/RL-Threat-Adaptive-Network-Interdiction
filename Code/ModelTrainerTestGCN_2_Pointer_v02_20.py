@@ -1,14 +1,11 @@
 # Train an RL agent with a Pointer Network
 ##Inputs
-graphName = "UKR"
+graphName = "G5x5"
 
-# Type of agent to train (uncomment only one)
-#agent = "A2C"
-#agent = "DQN"
+# Type of agent to train 
 agent = "MaskablePPO"
-#agent = "PPO"
 
-version = "v04_07" #V[Month]_[Day] 
+version = "v04_22" #V[Month]_[Day] 
 
 # Initial Learning Rate
 initial_learning_rate = 0.0003  #0.0001
@@ -24,8 +21,8 @@ n_cpus = 100  # Number of environments
 
 env_params = {'deterministic_agent': False,
               'multiple_interdiction_attempts': False,
-              'attacker_strategy': 'divert',  # canalize   isolate   divert  zero_sum
-              'training_budget_range': (9, 17),  #G5x5: zero_sum/isolate: (5,15), canalize/divert: (12,24) G10x10: zero_sum/isolate: (15,30), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (18,30)
+              'attacker_strategy': 'zero_sum',  # canalize   isolate   divert  zero_sum
+              'training_budget_range': (12, 24),  #G5x5: zero_sum/isolate: (5,15), canalize/divert: (12,24) G10x10: zero_sum/isolate: (15,30), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (18,30)
               'max_path_length': 4,  #G5x5: 2,  G10x10: 3, UKR: 4
               'sample_size': None,
               'penalty_value': -0.01,  #-0.001
@@ -52,14 +49,10 @@ os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Disable oneDNN messages
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'   # Suppress most logs (including CUDA errors)
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True' # Handle memory fragmentation
 import numpy as np
-import pickle
 
-import tensorflow as tf
-tf.get_logger().setLevel('ERROR')
-
-from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback ,BaseCallback
+from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 
 from sb3_contrib.common.wrappers import ActionMasker
 from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback  # Replace EvalCallback
@@ -105,9 +98,6 @@ from sb3_contrib.common.maskable.policies import MaskableActorCriticPolicy
 from stable_baselines3.common.distributions import CategoricalDistribution
 from stable_baselines3.common.torch_layers import MlpExtractor
 from sb3_contrib.ppo_mask import MaskablePPO
-from sb3_contrib.common.wrappers import ActionMasker
-from typing import Dict, Any, Tuple
-from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 class MPNNLayer(nn.Module):
     """
@@ -470,12 +460,6 @@ class AttentionPointerNetwork(nn.Module):
             
             if len(action_masks.shape) == 1:
                 action_masks = action_masks.unsqueeze(0).expand(batch_size, -1)
-            
-            # Ensure shapes match now
-            if attention_logits.shape[1] != action_masks.shape[1]:
-                 # Should not happen after our fix, unless they really diverge
-                 # Just use the minimum size to be safe or raise error?
-                 pass 
 
             mask_value = th.finfo(attention_logits.dtype).min
             attention_logits = attention_logits.masked_fill(action_masks == 0, mask_value)
@@ -572,7 +556,7 @@ class MaskablePointerNetworkPolicy(MaskableActorCriticPolicy):
     
     def forward(self, obs, deterministic: bool = False, action_masks=None):
         """Forward pass using pointer network with action masking"""
-        features = self.extract_features(obs)
+        self.extract_features(obs)
         if self.features_extractor._last_edge_embeddings is None:
             raise ValueError("Edge embeddings not found")
     
@@ -595,7 +579,7 @@ class MaskablePointerNetworkPolicy(MaskableActorCriticPolicy):
 
     def evaluate_actions(self, obs, actions, action_masks=None):
         """Evaluate actions for training with action masking"""
-        features = self.extract_features(obs)
+        self.extract_features(obs)
         edge_embeddings = self.features_extractor._last_edge_embeddings
         budget = self.features_extractor._last_budget
         padding_mask = self.features_extractor._last_padding_mask
@@ -616,7 +600,7 @@ class MaskablePointerNetworkPolicy(MaskableActorCriticPolicy):
         """
         OVERRIDE: Get action distribution using pointer network
         """
-        features = self.extract_features(obs)
+        self.extract_features(obs)
         edge_embeddings = self.features_extractor._last_edge_embeddings
         budget = self.features_extractor._last_budget
         padding_mask = self.features_extractor._last_padding_mask
@@ -627,7 +611,7 @@ class MaskablePointerNetworkPolicy(MaskableActorCriticPolicy):
     
     def predict_values(self, obs):
         """OVERRIDE: Predict values using our custom value network"""
-        features = self.extract_features(obs)
+        self.extract_features(obs)
         edge_embeddings = self.features_extractor._last_edge_embeddings
         budget = self.features_extractor._last_budget
         padding_mask = self.features_extractor._last_padding_mask
@@ -652,7 +636,7 @@ policy_kwargs = dict(
         'edge_embedding_dim': 128, #128,
         'hidden_dim': 256, #256,
         'gcn_hidden_dim': 128,       # Hidden dimension for GCN layers
-        'num_gcn_layers': 3,         # Number of GCN message passing layers
+        'num_gcn_layers': 5,         # Number of GCN message passing layers
         'max_nodes': 500,            # Maximum number of nodes in graph (increased for safety)
         'multiple_interdiction_attempts': env_params['multiple_interdiction_attempts'],
         'attacker_strategy': env_params['attacker_strategy']
@@ -682,8 +666,6 @@ if __name__ == "__main__":
     ])
     
     # Use MaskableEvalCallback instead of regular EvalCallback
-    from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
-    
     eval_callback = MaskableEvalCallback(
         eval_env,
         best_model_save_path=f"{models_dir}/{model_name}",
@@ -703,7 +685,7 @@ if __name__ == "__main__":
         learning_rate=linear_schedule(initial_learning_rate, min_learning_rate),
         n_steps=50,  #128
         n_epochs=2,   #5
-        ent_coef=0.05,  # Increased entropy for Divert strategy!
+        ent_coef=0.02,  # Increased entropy for Divert strategy!
         batch_size=1000,  # Reduced from 2400 to fix CUDA OOM (Attention layer is memory hungry)
         gamma=0.999,
         #target_kl=0.03,
