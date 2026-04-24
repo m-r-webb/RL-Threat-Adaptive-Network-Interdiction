@@ -1,13 +1,10 @@
-import os
 import copy
 import logging
 import random
 import math
-import collections
 import itertools
 from collections import defaultdict, deque
 import pickle
-
 import numpy as np
 import gurobipy as grb
 from tqdm import tqdm
@@ -17,8 +14,7 @@ import threading
 import time
 import zlib
 
-# --- Ray Actors (Moved from env_TA.py) ---
-
+# --- Ray Actors ---
 @ray.remote
 class _ProgressActor:
     def __init__(self):
@@ -539,14 +535,12 @@ class _RemoteEnvWorker:
             results.append((n_id, val, children_data, is_terminal))
             
         return results
-
 # --- Mixin Class ---
 
 class InterdictionSolverMixin:
     """
     Mixin containing optimization and machine learning solver methods for Network Interdiction.
     """
-
     def solve_optimal_interdiction(self, method='monolithic', threads=None, time_limit=None):
         if self.deterministic_outcomes == True:
             # Deterministic: Solve using Model 1D
@@ -3331,8 +3325,7 @@ class InterdictionSolverMixin:
                         frontier.append(child)
 
             # 2. Execution Phase (Dynamic Load Balancing)
-            # tasks_to_solve contains the leaves of our expanded tree.
-            # We send these to workers.
+            # tasks_to_solve contains the leaves of our expanded tree. We send these to workers.
             
             # Prepare tasks
             # Format: (node_obj, budget, state, depth)
