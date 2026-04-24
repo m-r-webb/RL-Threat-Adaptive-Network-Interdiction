@@ -9,8 +9,8 @@ import ray
 graphName = "G5x5"
 env_params = {'deterministic_agent': False,
               'multiple_interdiction_attempts': False,
-              'attacker_strategy': 'zero_sum',  # canalize   isolate   divert  zero_sum
-              'training_budget_range': (5,15),  #G5x5: zero_sum/isolate: (5,15), canalize/divert: (12,24) G10x10: zero_sum/isolate: (10,20), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (18,30) G15x15: zero_sum/isolate: (25,45)
+              'attacker_strategy': 'canalize',  # canalize   isolate   divert  zero_sum
+              'training_budget_range': (12,24),  #G5x5: zero_sum/isolate: (5,15), canalize/divert: (12,24) G10x10: zero_sum/isolate: (10,20), canalize/divert: (20,40)   #UKR: zero_sum/isolate: (10,20), canalize/divert: (18,30) G15x15: zero_sum/isolate: (25,45)
               'max_path_length': 2,  #G5x5: 2,  G10x10: 3, UKR: 4
               'sample_size': None,
               'penalty_value': -0.01,
@@ -195,6 +195,7 @@ else:
                                                                                                    time_limit=time_limit_sec)
 
                 end_time = time.perf_counter()
+                solve_time = end_time - start_time # Calculate the duration here
             
                 #Save optimal solution value and interdiction set
                 optimal_obj_vals[episode] = optimal_obj_val
