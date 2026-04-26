@@ -1029,6 +1029,8 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             to_flow = self._calculate_target_path_flow(self.reference_flows_dict, 'divert_to_objective')
             self.reference_start_flows = (from_flow, to_flow)
 
+            self.strategy_objectives_setup = False
+
             self.max_divert_to_objective = self._calculate_max_objective_potential('divert_to_objective', to_flow)
             self.max_divert_objective = min(self.max_divert_to_objective, from_flow) 
 
@@ -1536,9 +1538,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
 
         # Determine if action was "do nothing"
         if action == self.max_num_edges:
-            self.state['budget'] = np.array([0])
-            reward = 0
-            return self.state, float(reward), True, False, {}
+            remaining_budget[0] = 0
 
         # Validate action
         action_mask = self.mask_fn()
