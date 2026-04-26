@@ -671,7 +671,7 @@ if __name__ == "__main__":
         best_model_save_path=f"{models_dir}/{model_name}",
         log_path=f"{models_dir}/{model_name}",
         eval_freq=500,
-        n_eval_episodes=100,
+        n_eval_episodes=250,
         deterministic=True,
         render=False,
         verbose=False
@@ -684,11 +684,11 @@ if __name__ == "__main__":
         verbose=1,
         learning_rate=linear_schedule(initial_learning_rate, min_learning_rate),
         n_steps=50,  #128
-        n_epochs=2,   #5
-        ent_coef=0.02,  # Increased entropy for Divert strategy!
+        n_epochs=5,   #5
+        ent_coef=0.01,  
         batch_size=1000,  # Reduced from 2400 to fix CUDA OOM (Attention layer is memory hungry)
         gamma=0.999,
-        #target_kl=0.03,
+        target_kl=0.05,
         policy_kwargs=policy_kwargs
     )
     
