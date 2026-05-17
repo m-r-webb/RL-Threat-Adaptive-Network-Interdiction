@@ -20,21 +20,27 @@ class _ProgressActor:
     def __init__(self):
         self.count = 0
         self.pruned_count = 0
-        self.invalid_count = 0
+        self.invalid_res_count = 0
+        self.invalid_flow_count = 0
+        self.invalid_mission_count = 0
         self.memo_count = 0
         self.base_count = 0
-    def increment(self, n: int = 1, pruned: int = 0, invalid: int = 0, memo: int = 0, base: int = 0):
+    def increment(self, n: int = 1, pruned: int = 0, invalid_res: int = 0, invalid_flow: int = 0, invalid_mission: int = 0, memo: int = 0, base: int = 0):
         self.count += int(n)
         self.pruned_count += int(pruned)
-        self.invalid_count += int(invalid)
+        self.invalid_res_count += int(invalid_res)
+        self.invalid_flow_count += int(invalid_flow)
+        self.invalid_mission_count += int(invalid_mission)
         self.memo_count += int(memo)
         self.base_count += int(base)
     def get_count(self):
-        return self.count, self.pruned_count, self.invalid_count, self.memo_count, self.base_count
+        return self.count, self.pruned_count, self.invalid_res_count, self.invalid_flow_count, self.invalid_mission_count, self.memo_count, self.base_count
     def reset(self):
         self.count = 0
         self.pruned_count = 0
-        self.invalid_count = 0
+        self.invalid_res_count = 0
+        self.invalid_flow_count = 0
+        self.invalid_mission_count = 0
         self.memo_count = 0
         self.base_count = 0
 
@@ -86,7 +92,7 @@ class _RemoteEnvWorker:
                  num_both_edges, deterministic_outcomes, multiple_interdiction_attempts,
                  progress_actor=None, memo_actors=None, budget_levels=1, progress_granularity=50,
                  max_depth_inner=100, outcome_memo_actor=None, outcome_memo_actors=None, alpha_actor=None,
-                 enable_outcome_caching=True, enable_alpha_pruning=True, sample_size=1000, reduce_flow=False, jitter=False, projection_uses_flow=False, env_references=None):
+                 enable_outcome_caching=True, enable_heuristic_bounding=True, sample_size=1000, reduce_flow=False, core_flow_extractor=False, env_references=None):
         """
         Worker now accepts a progress_actor handle, a shared memo_actor handle,
         and budget_levels so it can estimate progress for invalid actions.
@@ -110,8 +116,8 @@ class _RemoteEnvWorker:
         # Set config flag
         self.env.enable_outcome_caching = enable_outcome_caching
         self.env.reduce_flow = reduce_flow
-        self.jitter = jitter
-        self.projection_uses_flow = projection_uses_flow
+        self.env.core_flow_extractor = core_flow_extractor
+        self.core_flow_extractor = core_flow_extractor
 
         # Optimize serialization: Avoid deep copying the entire state.
         # We only copy the dynamic parts that change during the episode/search.
@@ -150,7 +156,7 @@ class _RemoteEnvWorker:
         self.max_depth_inner = max_depth_inner
         self.progress_actor = progress_actor
         self.alpha_actor = alpha_actor
-        self.enable_alpha_pruning = enable_alpha_pruning
+        self.enable_heuristic_bounding = enable_heuristic_bounding
         
         # Handle Sharded Memo Actors
         self.memo_actors = memo_actors
@@ -175,7 +181,9 @@ class _RemoteEnvWorker:
         memo_local = self.memo_local 
         local_counter = 0
         local_pruned_counter = 0
-        local_invalid_counter = 0
+        local_invalid_res_counter = 0
+        local_invalid_flow_counter = 0
+        local_invalid_mission_counter = 0
         local_memo_counter = 0
         local_base_counter = 0
         self.objective_tolerance = objective_tolerance
@@ -198,18 +206,20 @@ class _RemoteEnvWorker:
         report_interval = 0.5  # Max 2 reports per second per worker
 
         def maybe_flush_progress():
-            nonlocal local_counter, local_pruned_counter, local_invalid_counter, local_memo_counter, local_base_counter, last_report_time, local_alpha_cache, pending_alpha_ref
+            nonlocal local_counter, local_pruned_counter, local_invalid_res_counter, local_invalid_flow_counter, local_invalid_mission_counter, local_memo_counter, local_base_counter, last_report_time, local_alpha_cache, pending_alpha_ref
             # 1. Check if we have enough accumulated progress (batch size)
-            if self.progress_actor is not None and (local_counter >= self.progress_granularity or local_pruned_counter >= self.progress_granularity or local_invalid_counter >= self.progress_granularity or local_memo_counter >= self.progress_granularity or local_base_counter >= self.progress_granularity):
+            if self.progress_actor is not None and (local_counter >= self.progress_granularity or local_pruned_counter >= self.progress_granularity or local_invalid_res_counter >= self.progress_granularity or local_invalid_flow_counter >= self.progress_granularity or local_invalid_mission_counter >= self.progress_granularity or local_memo_counter >= self.progress_granularity or local_base_counter >= self.progress_granularity):
                 # 2. Check if enough time has passed (throttle)
                 now = time.time()
                 if (now - last_report_time) > report_interval:
                     try:
                         # report and reset local counter (best-effort)
-                        self.progress_actor.increment.remote(local_counter, local_pruned_counter, local_invalid_counter, local_memo_counter, local_base_counter)
+                        self.progress_actor.increment.remote(local_counter, local_pruned_counter, local_invalid_res_counter, local_invalid_flow_counter, local_invalid_mission_counter, local_memo_counter, local_base_counter)
                         local_counter = 0
                         local_pruned_counter = 0
-                        local_invalid_counter = 0
+                        local_invalid_res_counter = 0
+                        local_invalid_flow_counter = 0
+                        local_invalid_mission_counter = 0
                         local_memo_counter = 0
                         local_base_counter = 0
                         last_report_time = now
@@ -235,7 +245,7 @@ class _RemoteEnvWorker:
         self.env.state['edge_interdicted'][:] = interdicted_state
 
         def dp_local(d, alpha=-float('inf')):
-            nonlocal local_counter, local_pruned_counter, local_invalid_counter, local_memo_counter, local_base_counter, local_alpha_cache
+            nonlocal local_counter, local_pruned_counter, local_invalid_res_counter, local_invalid_flow_counter, local_invalid_mission_counter, local_memo_counter, local_base_counter, local_alpha_cache
             
             # Read current state directly from env (already synchronized)
             # Use slice for key generation
@@ -283,6 +293,9 @@ class _RemoteEnvWorker:
             # terminal objective
             # Capture flows to update environment state for mask_fn
             current_flows = None
+
+            if hasattr(self.env, 'flow_histories'):
+                del self.env.flow_histories
             
             if self.attacker_strategy == "zero_sum":
                 final_objective, current_flows = self.env._compute_objective_and_flows()
@@ -328,9 +341,18 @@ class _RemoteEnvWorker:
                 try:
                     # estimated states pruned by each invalid action
                     est_per_invalid = int(int(self.num_both_edges) ** max(0, self.budget_levels - (d + 1)))
-                    invalid_vol = num_invalid * est_per_invalid
+                    
+                    # Distribute by the exact mask stages
+                    stats = getattr(self.env, 'last_mask_stats', {'resource': 0, 'flow': 0, 'mission': num_invalid})
+                    res_vol = stats.get('resource', 0) * est_per_invalid
+                    flow_vol = stats.get('flow', 0) * est_per_invalid
+                    mission_vol = stats.get('mission', 0) * est_per_invalid
+                    
+                    invalid_vol = res_vol + flow_vol + mission_vol
                     local_counter += invalid_vol
-                    local_invalid_counter += invalid_vol
+                    local_invalid_res_counter += res_vol
+                    local_invalid_flow_counter += flow_vol
+                    local_invalid_mission_counter += mission_vol
                     maybe_flush_progress()
                 except Exception:
                     pass
@@ -353,12 +375,12 @@ class _RemoteEnvWorker:
             # Update alpha with current node value
             alpha = max(alpha, best_reward)
 
-            if self.enable_alpha_pruning:
+            if self.enable_heuristic_bounding:
                 # Heuristic sorting for pruning
                 # Optimization: State is already set correctly, just call heuristics
                 
                 # IMPORTANT: For zero_sum, we need to handle negative heuristics appropriately if calculate_action_heuristics returns positives
-                heuristics = self.env.calculate_action_heuristics(valid_actions, current_flows, rem_budget, jitter=getattr(self, 'jitter', False), projection_uses_flow=self.projection_uses_flow)
+                heuristics = self.env.calculate_action_heuristics(valid_actions, current_flows, rem_budget, core_flow_extractor=getattr(self, 'core_flow_extractor', False))
                 
                 # Optimization: Mass-prune actions that can't beat alpha using vectorized boolean masking
                 # This avoids expensive sorting (N log N) for actions that will be immediately pruned anyway
@@ -395,7 +417,7 @@ class _RemoteEnvWorker:
             
             for i, action in enumerate(valid_actions):
                 # Pruning
-                if self.enable_alpha_pruning:
+                if self.enable_heuristic_bounding:
                      # Pruning condition using the new consolidated heuristic
                      if final_objective + heuristics[i] < alpha - self.objective_tolerance:
                          skipped_actions = len(valid_actions) - i
@@ -452,9 +474,9 @@ class _RemoteEnvWorker:
 
         result = dp_local(depth)
         # flush any remaining progress
-        if self.progress_actor is not None and (local_counter > 0 or local_pruned_counter > 0 or local_invalid_counter > 0 or local_memo_counter > 0 or local_base_counter > 0):
+        if self.progress_actor is not None and (local_counter > 0 or local_pruned_counter > 0 or local_invalid_res_counter > 0 or local_invalid_flow_counter > 0 or local_invalid_mission_counter > 0 or local_memo_counter > 0 or local_base_counter > 0):
             try:
-                self.progress_actor.increment.remote(local_counter, local_pruned_counter, local_invalid_counter, local_memo_counter, local_base_counter)
+                self.progress_actor.increment.remote(local_counter, local_pruned_counter, local_invalid_res_counter, local_invalid_flow_counter, local_invalid_mission_counter, local_memo_counter, local_base_counter)
             except Exception:
                 pass
         return result
@@ -508,8 +530,14 @@ class _RemoteEnvWorker:
                 # remaining_depth = budget_levels - (current_depth + 1)
                 child_remaining_depth = max(0, self.budget_levels - (depth + 1))
                 child_volume = int(self.num_both_edges) ** child_remaining_depth
-                inv_vol = num_invalid * child_volume
-                self.progress_actor.increment.remote(inv_vol, 0, inv_vol, 0, 0)
+                
+                # Distribute by the exact mask stages
+                stats = getattr(env, 'last_mask_stats', {'resource': 0, 'flow': 0, 'mission': num_invalid})
+                res_vol = stats.get('resource', 0) * child_volume
+                flow_vol = stats.get('flow', 0) * child_volume
+                mission_vol = stats.get('mission', 0) * child_volume
+                
+                self.progress_actor.increment.remote(res_vol + flow_vol + mission_vol, 0, res_vol, flow_vol, mission_vol, 0, 0)
             
             # 5. Generate Children Data
             children_data = []
@@ -1886,115 +1914,64 @@ class InterdictionSolverMixin:
 
         return (self.optimal_stochastic_model_IM.objVal, interdicted_edges, interdicted_quantities)
 
-    def _calculate_projections(self, valid_actions, flows, remaining_budget, projection_uses_flow):
-        projected_values = np.zeros(len(valid_actions))
-
-        # --- OPTIMIZATION 1: Cache static structural masks ---
-        if not hasattr(self, '_static_proj_mask'):
-            has_prob = self.state['edge_interdiction_probability'][:self.num_interdictable] > 0
-            if self.attacker_strategy == 'canalize':
-                strategy_mask = self.state['canalize_objective'][:self.num_interdictable] != 1
-            elif self.attacker_strategy == 'divert':
-                strategy_mask = self.state['divert_to_objective'][:self.num_interdictable] != 1
-            else:
-                strategy_mask = np.ones(self.num_interdictable, dtype=bool)
-            self._static_proj_mask = has_prob & strategy_mask
-
-        costs = self.state['edge_costs'][:self.num_interdictable]
-        limit_ok = (self.state['edge_interdicted'][:self.num_interdictable] + 1) <= self.max_interdictions
-        affordable = costs <= remaining_budget
+    def _calculate_potential_impact(self, current_budget, current_y):
+        """
+        Calculates the admissible upper bound on future utility H(s_t, a_t) 
+        by solving the linear relaxation of the bounded knapsack problem.
+        Matches Equation 3.2 from the thesis.
+        """
+        E = self.num_interdictable
+        Q = self.max_interdictions
         
-        projection_mask = self._static_proj_mask & limit_ok & affordable
+        # Create a matrix of shape (E, Q) where each column represents an attempt index q
+        q_matrix = np.tile(np.arange(1, Q + 1), (E, 1))
         
-        # 2. Get Sorted Future Benefits
-        projection_indices = np.where(projection_mask)[0]
+        # Mask out attempts that have already been expended in the current state
+        # current_y is a 1D array of shape (E,) tracking strikes per edge
+        valid_attempts_mask = q_matrix > current_y[:, None]
         
-        if len(projection_indices) > 0:
-            # OPTIMIZATION: Use pre-computed base values if available
-            if not projection_uses_flow and hasattr(self, 'heuristic_base_values'):
-                benefits = self.heuristic_base_values[projection_indices]
-            elif projection_uses_flow:
-                probs_proj = self.state['edge_interdiction_probability'][projection_indices]
-                
-                if isinstance(flows, np.ndarray):
-                   proj_flow_vals = flows[projection_indices]
-                elif hasattr(self, 'cached_flow_array') and flows is getattr(self, 'reference_flows', None):
-                   proj_flow_vals = self.cached_flow_array[projection_indices].sum(axis=1)
-                else:
-                   proj_flow_vals = np.array([
-                       flows.get(self.both_edges[a], 0) + flows.get((self.both_edges[a][1], self.both_edges[a][0]), 0)
-                       for a in projection_indices
-                   ])
-                benefits = proj_flow_vals * probs_proj
-            else:
-                caps_proj = self.state['edge_capacity'][projection_indices]
-                probs_proj = self.state['edge_interdiction_probability'][projection_indices]
-                benefits = caps_proj * probs_proj
+        # Calculate expected marginal capacity reduction: c_uv * p_uv * (1 - p_uv)^(q-1)
+        c = self.state['edge_capacity'][:E, None]
+        p = self.state['edge_interdiction_probability'][:E, None]
+        
+        yields = c * p * ((1 - p) ** (q_matrix - 1))
+        costs = np.tile(self.state['edge_costs'][:E], (Q, 1)).T  
+        
+        # Flatten matrices and filter out invalid/past attempts
+        valid_yields = yields[valid_attempts_mask]
+        valid_costs = costs[valid_attempts_mask]
+        
+        if len(valid_costs) == 0:
+            return 0.0
             
-            # Optimization: Only sort the projection elements we might actually use
-            # --- OPTIMIZATION 3: Speedup Floor operation using int-division ---
-            max_required_k = int((remaining_budget + 1e-9) // self.min_edge_cost) + 1
-            max_available_k = min(max_required_k, len(benefits))
+        # Calculate efficiency (yield per unit of budget)
+        efficiencies = valid_yields / valid_costs
+        
+        # Sort strictly descending by efficiency (Greedy Knapsack approach)
+        sorted_indices = np.argsort(efficiencies)[::-1]
+        sorted_yields = valid_yields[sorted_indices]
+        sorted_costs = valid_costs[sorted_indices]
+        
+        # Take cumulative sum of costs to find where the remaining budget is exhausted
+        cum_costs = np.cumsum(sorted_costs)
+        affordable_mask = cum_costs <= current_budget
+        
+        # Sum the yields of all fully affordable future attacks
+        total_potential = np.sum(sorted_yields[affordable_mask])
+        
+        # --- The Fractional Relaxation ---
+        if not np.all(affordable_mask):
+            first_idx = np.where(~affordable_mask)[0][0]
+            budget_used_so_far = cum_costs[first_idx - 1] if first_idx > 0 else 0
+            leftover_budget = current_budget - budget_used_so_far
             
-            if max_available_k > 0 and max_available_k < len(benefits):
-                # Use argpartition to find the top max_available_k elements in O(N) time
-                part_idx = np.argpartition(-benefits, max_available_k - 1)[:max_available_k]
-                # Sort only the top partitioned elements
-                top_sort_idx = np.argsort(-benefits[part_idx])
-                sorted_idx = part_idx[top_sort_idx]
-            else:
-                # Fallback to full sort if k is near the array size
-                sorted_idx = np.argsort(-benefits)
-                
-            sorted_benefits = benefits[sorted_idx]
-            sorted_global_indices = projection_indices[sorted_idx]
+            fraction = leftover_budget / sorted_costs[first_idx]
+            total_potential += fraction * sorted_yields[first_idx]
             
-            # Rank Lookup (Map global edge index -> rank in sorted list)
-            # --- OPTIMIZATION 2: Direct mask evaluation & dropping redundant edge checks ---
-            rank_lookup = np.full(int(self.num_both_edges), -1, dtype=int)
-            rank_lookup[sorted_global_indices] = np.arange(len(sorted_global_indices))
-            
-            # Precompute cumulative sum (prefix sum) for fast range summation
-            # cumsum[k] = sum of top k items
-            cumsum_benefits = np.zeros(len(sorted_benefits) + 1)
-            np.cumsum(sorted_benefits, out=cumsum_benefits[1:])
-            
-            max_available = len(sorted_benefits)
-            
-            # 3. Calculate Projected Value per Action
-            action_costs = self.state['edge_costs'][valid_actions]
-            
-            # Fast Int Division:
-            future_moves_arr = ((remaining_budget - action_costs + 1e-9) // self.min_edge_cost).astype(int)
-            
-            # Fully Vectorized Logic replacing Python Loop
-            # Get ranks for all valid actions using the lookup table DIRECTLY!
-            action_ranks = rank_lookup[valid_actions]
+        return float(total_potential)
 
-            # Create logical mask: Is the action considered part of the "top n"?
-            # Condition: It has a valid rank (> -1) AND its rank (0-indexed) is less than n (count)
-            in_top_set_mask = (action_ranks != -1) & (action_ranks < future_moves_arr)
-            
-            # Case A: Action IS in the top N set.
-            # We sum the top (n+1) items, then subtract the specific action's value.
-            # np.clip to ensure we don't exceed available items
-            idxs_in = np.clip(future_moves_arr + 1, 0, max_available)
-            
-            # Use maximum(rank, 0) to avoid -1 indexing (safe because masked out later if rank is -1)
-            safe_ranks = np.maximum(action_ranks, 0)
-            vals_in = cumsum_benefits[idxs_in] - sorted_benefits[safe_ranks]
-            
-            # Case B: Action IS NOT in the top N set.
-            # We simply sum the top n items.
-            idxs_out = np.clip(future_moves_arr, 0, max_available)
-            vals_out = cumsum_benefits[idxs_out]
-            
-            # Select value based on mask
-            projected_values = np.where(in_top_set_mask, vals_in, vals_out)
-            
-        return projected_values
 
-    def calculate_action_heuristics(self, valid_actions, flows, remaining_budget, include_projection=True, jitter=False, projection_uses_flow=False):
+    def calculate_action_heuristics(self, valid_actions, flows, remaining_budget, include_projection=True, core_flow_extractor=False):
         """
         Calculate heuristic values for a batch of actions.
         Returns array of heuristic values aligned with valid_actions.
@@ -2004,45 +1981,17 @@ class InterdictionSolverMixin:
         projected_values = np.zeros(len(valid_actions))
         current_flow_vals = np.zeros(len(valid_actions))
         
-        # Jitter logic
-        if jitter and hasattr(self, 'flow_histories') and remaining_budget > 5:
-            flow_histories = self.flow_histories
-            
-            # Compute flow values across all histories for all valid actions
-            # Shape: (len(valid_actions), len(flow_histories))
-            all_flow_vals = np.zeros((len(valid_actions), len(flow_histories)))
-            
-            for i, hist_flows in enumerate(flow_histories):
-                if isinstance(hist_flows, np.ndarray):
-                    all_flow_vals[:, i] = hist_flows[valid_actions]
-                else:
-                    all_flow_vals[:, i] = np.array([
-                        hist_flows.get(self.both_edges[a], 0) + hist_flows.get((self.both_edges[a][1], self.both_edges[a][0]), 0)
-                        for a in valid_actions
-                    ])
-            
-            # Find the history index where each action's flow is minimized
-            min_indices = np.argmin(all_flow_vals, axis=1)
-            
-            # Extract the minimized flow values
-            current_flow_vals = all_flow_vals[np.arange(len(valid_actions)), min_indices]
-            
-            # Projections for jitter are based on capacity * probability (same as jitter=False, projection_uses_flow=False)
-            if include_projection:
-                projected_values = self._calculate_projections(
-                    valid_actions, flows, remaining_budget, projection_uses_flow=False
-                )
-                        
-        elif not projection_uses_flow:
-            current_flow_vals = self.state['edge_capacity'][valid_actions]
-            if include_projection:
-                projected_values = self._calculate_projections(
-                    valid_actions, flows, remaining_budget, projection_uses_flow
-                )
+        # 1. IMMEDIATE IMPACT (Core Flow Extraction / Expected Flow)
+        if core_flow_extractor and hasattr(self, '_current_core_flow_array') and remaining_budget > 5:
+            current_flow_vals = self._current_core_flow_array[valid_actions]
         else:
-            # Standard single-flow logic
+            # Fallback: Standard Expected Bidirectional Flow (E[f_{ij}])
             if isinstance(flows, np.ndarray):
-                current_flow_vals = flows[valid_actions]
+                # If flows is a 2D array (forward, reverse), sum across the directions
+                if flows.ndim == 2:
+                    current_flow_vals = flows[valid_actions].sum(axis=1)
+                else:
+                    current_flow_vals = flows[valid_actions]
             elif hasattr(self, 'cached_flow_array') and flows is getattr(self, 'reference_flows', None):
                 current_flow_vals = self.cached_flow_array[valid_actions].sum(axis=1)
             else:
@@ -2051,11 +2000,29 @@ class InterdictionSolverMixin:
                     for a in valid_actions
                 ])
                 
-            if include_projection:
-                projected_values = self._calculate_projections(
-                    valid_actions, flows, remaining_budget, projection_uses_flow
-                )
+        # 2. POTENTIAL IMPACT (Bounded Knapsack Relaxation)
+        if include_projection:
+            # Get a reference to the current interdiction vector (y)
+            current_y = self.state['edge_interdicted'][:self.num_interdictable]
+            
+            for i, action in enumerate(valid_actions):
+                action_cost = self.state['edge_costs'][action]
+                new_budget = remaining_budget - action_cost
+                
+                if new_budget >= self.min_edge_cost:   
+                    # Simulate taking the strike for the projection (y_uv + 1)
+                    current_y[action] += 1
+                    
+                    # Calculate potential impact utilizing the fractional knapsack relaxation
+                    projected_values[i] = self._calculate_potential_impact(new_budget, current_y)
+                    
+                    # Backtrack state for the next action in the batch
+                    current_y[action] -= 1
+                else:
+                    projected_values[i] = 0.0
         
+        # 3. COMBINED ADMISSIBLE BOUND
+        # H(s_t, a_t) = (p_ij * f_ij) + Potential Knapsack Relaxation
         heuristics = (probs * current_flow_vals) + projected_values
         
         return heuristics
@@ -2587,7 +2554,7 @@ class InterdictionSolverMixin:
 
     # --- Re-add solve_backward_induction_ray method to Mixin ---
     
-    def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=None, ray_address=None, enable_memoization=True, enable_outcome_caching=True, enable_alpha_pruning=True, rl_model_path=None, time_limit=3600, reduce_flow=False, parallel_expansion=False, jitter=False, projection_uses_flow=False, objective_tolerance=1e-5):
+    def solve_backward_induction_ray(self, verbose=False, n_workers=4, worker_depth=None, ray_address=None, enable_memoization=True, enable_outcome_caching=True, enable_heuristic_bounding=True, rl_model_path=None, time_limit=3600, reduce_flow=False, parallel_expansion=False, core_flow_extractor=False, objective_tolerance=1e-5, enable_flow_masking=True, enable_mission_masking=True):
         """
         Parallelized backward induction using Ray with Adaptive Frontier Expansion.
         """
@@ -2597,6 +2564,8 @@ class InterdictionSolverMixin:
         original_state = copy.deepcopy(self.state)
         original_enable_outcome_caching = getattr(self, 'enable_outcome_caching', True)
         original_reduce_flow = getattr(self, 'reduce_flow', False)
+        original_enable_flow_masking = getattr(self, 'enable_flow_masking', True)
+        original_enable_mission_masking = getattr(self, 'enable_mission_masking', True)
         original_local_outcome_cache = copy.deepcopy(getattr(self, 'local_outcome_cache', {}))
         original_outcome_memo_actors = getattr(self, 'outcome_memo_actors', None)
         original_reference_flows = copy.deepcopy(getattr(self, 'reference_flows', None))
@@ -2612,8 +2581,8 @@ class InterdictionSolverMixin:
 
         start_time = time.time()
         
-        if jitter:
-            enable_alpha_pruning = True
+        if core_flow_extractor:
+            enable_heuristic_bounding = True
             reduce_flow = True
 
         # init ray if not already
@@ -2626,6 +2595,8 @@ class InterdictionSolverMixin:
         # Propagate caching flag to driver for heuristic usage
         self.enable_outcome_caching = enable_outcome_caching
         self.reduce_flow = reduce_flow
+        self.enable_flow_masking = enable_flow_masking
+        self.enable_mission_masking = enable_mission_masking
         if self.enable_outcome_caching:
              self.local_outcome_cache = {}
 
@@ -2640,7 +2611,11 @@ class InterdictionSolverMixin:
         initial_alpha_actions = []
         original_initial_alpha = -float('inf')
 
-        if rl_model_path:
+        if rl_model_path is None:
+            if verbose:
+                print("No initial solution is used. Defaulting initial alpha to negative infinity.")
+
+        if rl_model_path and rl_model_path != "Heuristic":
             if verbose:
                 print(f"Loading RL model from {rl_model_path} for initial alpha...")
             try:
@@ -2708,13 +2683,13 @@ class InterdictionSolverMixin:
             except Exception as e:
                 if verbose:
                     print(f"RL Model execution failed: {e}. Falling back to heuristic.")
-                rl_model_path = None # Trigger fallback below if needed
+                rl_model_path = "Heuristic" # Trigger fallback below if needed
             finally:
                 # Restore state
                 self.state['budget'][0] = old_budget
                 self.state['edge_interdicted'][:] = old_interdicted
 
-        if enable_alpha_pruning and not rl_model_path:
+        if enable_heuristic_bounding and rl_model_path == "Heuristic":
             if verbose:
                 print("Running heuristic (Min-Cut) for initial alpha...")
             
@@ -2789,12 +2764,14 @@ class InterdictionSolverMixin:
             best_incumbent_reward = initial_alpha
             best_incumbent_seq = [self.edge_to_index[e] for e in initial_alpha_actions]
             serial_pruned_count = 0
-            serial_invalid_count = 0
+            serial_invalid_res_count = 0
+            serial_invalid_flow_count = 0
+            serial_invalid_mission_count = 0
             serial_memo_count = 0
             serial_base_count = 0
 
             def dp_serial(rem_budget, inter_state, d, alpha=-float('inf'), path_to_here=[]):
-                nonlocal best_incumbent_reward, best_incumbent_seq, serial_pruned_count, serial_invalid_count, serial_memo_count, serial_base_count
+                nonlocal best_incumbent_reward, best_incumbent_seq, serial_pruned_count, serial_invalid_res_count, serial_invalid_flow_count, serial_invalid_mission_count, serial_memo_count, serial_base_count
                 
                 if time.time() - start_time > time_limit:
                     raise TimeoutError("Time limit exceeded")
@@ -2870,9 +2847,18 @@ class InterdictionSolverMixin:
                 num_invalid = int(self.num_both_edges) - len(valid_actions)
                 if num_invalid > 0:
                     child_volume = int(int(self.num_both_edges) ** max(0, budget_levels - (d + 1)))
-                    inv_vol = num_invalid * child_volume
+                    
+                    # Distribute by exact mask stages
+                    stats = getattr(self, 'last_mask_stats', {'resource': 0, 'flow': 0, 'mission': num_invalid})
+                    res_vol = stats.get('resource', 0) * child_volume
+                    flow_vol = stats.get('flow', 0) * child_volume
+                    mission_vol = stats.get('mission', 0) * child_volume
+                    
+                    inv_vol = res_vol + flow_vol + mission_vol
                     pbar.update(inv_vol)
-                    serial_invalid_count += inv_vol
+                    serial_invalid_res_count += res_vol
+                    serial_invalid_flow_count += flow_vol
+                    serial_invalid_mission_count += mission_vol
 
                 if len(valid_actions) == 0:
                     if enable_memoization:
@@ -2885,12 +2871,12 @@ class InterdictionSolverMixin:
                 alpha = max(alpha, best_reward)
                 
                 # Apply Heuristics (Same as in Worker)
-                if enable_alpha_pruning:
+                if enable_heuristic_bounding:
                     # Set temporary state for accurate heuristic projection benefit calculation
                     self.state['budget'][0] = rem_budget
                     self.state['edge_interdicted'][:] = inter_state
                     
-                    heuristics = self.calculate_action_heuristics(valid_actions, flows, rem_budget, projection_uses_flow=projection_uses_flow)
+                    heuristics = self.calculate_action_heuristics(valid_actions, flows, rem_budget, core_flow_extractor=getattr(self, 'core_flow_extractor', False))
                     
                     # Restore state immediately
                     self.state['budget'][0] = old_budget
@@ -2902,7 +2888,7 @@ class InterdictionSolverMixin:
 
                 for i, action in enumerate(valid_actions):
                     # Pruning
-                    if enable_alpha_pruning:
+                    if enable_heuristic_bounding:
                          if val + heuristics[i] < alpha- objective_tolerance:
                              skipped_actions = len(valid_actions) - i
                              child_volume = int(int(self.num_both_edges) ** max(0, budget_levels - (d + 1)))
@@ -2953,13 +2939,17 @@ class InterdictionSolverMixin:
             total_states_evaluated = estimated_states
             if total_states_evaluated > 0:
                 pruned_pct = (serial_pruned_count / total_states_evaluated * 100)
-                invalid_pct = (serial_invalid_count / total_states_evaluated * 100)
+                invalid_res_pct = (serial_invalid_res_count / total_states_evaluated * 100)
+                invalid_flow_pct = (serial_invalid_flow_count / total_states_evaluated * 100)
+                invalid_mission_pct = (serial_invalid_mission_count / total_states_evaluated * 100)
                 memo_pct = (serial_memo_count / total_states_evaluated * 100)
                 base_pct = (serial_base_count / total_states_evaluated * 100)
                 
                 print(f"--- DP State Traversal Breakdown ---")
-                print(f"Alpha Pruning States Dropped:   {serial_pruned_count:,} ({pruned_pct:.2f}%)")
-                print(f"Invalid Actions States Dropped: {serial_invalid_count:,} ({invalid_pct:.2f}%)")
+                print(f"Heuristic-Guided Search States Dropped:   {serial_pruned_count:,} ({pruned_pct:.2f}%)")
+                print(f"Resource-Mask States Dropped:   {serial_invalid_res_count:,} ({invalid_res_pct:.2f}%)")
+                print(f"Flow-Mask States Dropped:       {serial_invalid_flow_count:,} ({invalid_flow_pct:.2f}%)")
+                print(f"Mission-Mask States Dropped:    {serial_invalid_mission_count:,} ({invalid_mission_pct:.2f}%)")
                 print(f"Memoization Cache Hits:         {serial_memo_count:,} ({memo_pct:.2f}%)")
                 print(f"Leaves Actually Visited:        {serial_base_count:,} ({base_pct:.2f}%)")
                 print(f"Total States (Estimated):       {total_states_evaluated:,}")
@@ -3024,7 +3014,7 @@ class InterdictionSolverMixin:
             state_ref = ray.put(state_snapshot)
 
             env_refs = {}
-            for attr in ['reference_flows_dict', 'reference_start_flow', 'reference_obj', 'reference_flows', 'max_canalize_objective', 'reference_start_flows', 'max_divert_objective']:
+            for attr in ['reference_flows_dict', 'reference_start_flow', 'reference_obj', 'reference_flows', 'max_canalize_objective', 'reference_start_flows', 'max_divert_objective', 'enable_flow_masking', 'enable_mission_masking', 'incumbent_zeta', 'enable_heuristic_bounding']:
                 if hasattr(self, attr):
                     env_refs[attr] = getattr(self, attr)
 
@@ -3043,15 +3033,14 @@ class InterdictionSolverMixin:
                     memo_actors=memo_actors, # Pass list of actors
                     budget_levels=budget_levels,
                     progress_granularity=2000,
-                    jitter=jitter,
+                    core_flow_extractor=core_flow_extractor,
                     max_depth_inner=100,
                     outcome_memo_actors=outcome_memo_actors,
                     alpha_actor=alpha_actor,
                     enable_outcome_caching=enable_outcome_caching,
-                    enable_alpha_pruning=enable_alpha_pruning,
+                    enable_heuristic_bounding=enable_heuristic_bounding,
                     sample_size=self.SAMPLE_SIZE,
                     reduce_flow=reduce_flow,
-                    projection_uses_flow=projection_uses_flow,
                     env_references=env_refs
                 )
                 for _ in range(n_workers)
@@ -3481,11 +3470,13 @@ class InterdictionSolverMixin:
             stop_event.set()
             poll_thread.join(timeout=2)
             final_pruned = 0
-            final_invalid = 0
+            final_invalid_res = 0
+            final_invalid_flow = 0
+            final_invalid_mission = 0
             final_memo = 0
             final_base = 0
             try:
-                final, final_pruned, final_invalid, final_memo, final_base = ray.get(progress_actor.get_count.remote())
+                final, final_pruned, final_invalid_res, final_invalid_flow, final_invalid_mission, final_memo, final_base = ray.get(progress_actor.get_count.remote())
                 pbar.update(final - last_reported)
             except Exception:
                 pass
@@ -3494,13 +3485,17 @@ class InterdictionSolverMixin:
             total_states_evaluated = estimated_states
             if total_states_evaluated > 0:
                 pruned_pct = (final_pruned / total_states_evaluated * 100)
-                invalid_pct = (final_invalid / total_states_evaluated * 100)
+                invalid_res_pct = (final_invalid_res / total_states_evaluated * 100)
+                invalid_flow_pct = (final_invalid_flow / total_states_evaluated * 100)
+                invalid_mission_pct = (final_invalid_mission / total_states_evaluated * 100)
                 memo_pct = (final_memo / total_states_evaluated * 100)
                 base_pct = (final_base / total_states_evaluated * 100)
                 
                 print(f"--- DP State Traversal Breakdown ---")
-                print(f"Alpha Pruning States Dropped:   {final_pruned:,} ({pruned_pct:.2f}%)")
-                print(f"Invalid Actions States Dropped: {final_invalid:,} ({invalid_pct:.2f}%)")
+                print(f"Heuristic-Guided Search States Dropped:   {final_pruned:,} ({pruned_pct:.2f}%)")
+                print(f"Resource-Mask States Dropped:   {final_invalid_res:,} ({invalid_res_pct:.2f}%)")
+                print(f"Flow-Mask States Dropped:       {final_invalid_flow:,} ({invalid_flow_pct:.2f}%)")
+                print(f"Mission-Mask States Dropped:    {final_invalid_mission:,} ({invalid_mission_pct:.2f}%)")
                 print(f"Memoization Cache Hits:         {final_memo:,} ({memo_pct:.2f}%)")
                 print(f"Leaves Actually Visited:        {final_base:,} ({base_pct:.2f}%)")
                 print(f"Total States (Estimated):       {total_states_evaluated:,}")
@@ -3523,6 +3518,8 @@ class InterdictionSolverMixin:
             self.state = copy.deepcopy(original_state)
             self.enable_outcome_caching = original_enable_outcome_caching
             self.reduce_flow = original_reduce_flow
+            self.enable_flow_masking = original_enable_flow_masking
+            self.enable_mission_masking = original_enable_mission_masking
             self.local_outcome_cache = copy.deepcopy(original_local_outcome_cache)
             self.outcome_memo_actors = original_outcome_memo_actors
             self.reference_flows = copy.deepcopy(original_reference_flows)

@@ -92,10 +92,15 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                  sample_size=1000, max_path_length = 6,
                  max_num_edges=500, max_num_nodes=250, 
                  objective_path_length=2,
-                 outcome_memo_actor=None, outcome_memo_actors=None):
+                 outcome_memo_actor=None, outcome_memo_actors=None,
+                 enable_flow_masking=True, enable_mission_masking=True):
         super(CustomEnv, self).__init__()
 
         #Setup core environment attributes
+        self.enable_flow_masking = enable_flow_masking
+        self.enable_mission_masking = enable_mission_masking
+        self.last_mask_stats = {'resource': 0, 'flow': 0, 'mission': 0}
+        
         self.nodes = nodes
         self.edges_reset = edges
         self.edges_episode = copy.deepcopy(self.edges_reset)
@@ -332,6 +337,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         # Update objectives if needed (e.g. start of new episode or model re-init)
         if (not getattr(self, 'strategy_objectives_setup', False)) or (self.old_routing_assumption!=routing_assumption):
             self._set_strategy_objectives(routing_assumption)
+            self.reduce_flow_idx = self.maxflow_model.NumObj # Save the index for reduce_flow
             self.strategy_objectives_setup = True
             self.old_routing_assumption = routing_assumption
             
@@ -352,9 +358,9 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         # Use robustness only if we have budget for another interdiction and depth is low
         use_reduce_flow = getattr(self, 'reduce_flow', False) and has_budget
 
-        # Apply Reduce Flow (Lowest Priority Objective: Minimize Edges Used)
-        # Minimize sum(edge_used) -> Maximize -sum(edge_used)
-        reduce_flow_idx = self.maxflow_model.NumObj # Assumes 0, 1, 2 are used by other strategies
+        # Keep a consistent index for the reduce flow objective so they do not stack endlessly
+        reduce_flow_idx = getattr(self, 'reduce_flow_idx', self.maxflow_model.NumObj)
+        
         if use_reduce_flow:
             reduce_flow_expr = grb.quicksum(self.flow_var[e] for e in self.both_edges)
             #reduce_flow_expr = grb.quicksum(self.edge_used[e] for e in self.both_edges)
@@ -393,13 +399,13 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             flow_results = {e: var.X for e, var in self.flow_var.items()}
             self.flow_histories = [flow_results.copy()]
 
-            # --- NEW INJECTED JITTER LOGIC ---
-            if getattr(self, 'jitter', False) and current_budget > 5:
+            # --- NEW INJECTED CORE FLOW EXTRACTOR LOGIC ---
+            if getattr(self, 'core_flow_extractor', False) and current_budget > 5:
                 action_mask = self.mask_fn()
                 valid_actions_indices = np.where(action_mask[:self.num_interdictable] == 1)[0]
                 valid_action_edges = {self.both_edges[idx] for idx in valid_actions_indices if idx < len(self.both_edges)}
 
-                active_edges = {e for e, f in flow_results.items() if f > 1e-4 and e in valid_action_edges}
+                active_edges = {e for e in valid_action_edges if flow_results.get(e, 0) + flow_results.get((e[1], e[0]), 0) > 1e-4}
                 prev_active_edges = None
                 
                 iteration = 0
@@ -407,13 +413,13 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                     prev_active_edges = active_edges.copy()
                     iteration += 1
 
-                    valid_active_edges = [e for e in active_edges if e in self.flow_var]
+                    valid_active_edges = [e for e in active_edges if e in self.flow_var and (e[1], e[0]) in self.flow_var]
                     if not valid_active_edges:
                         break
 
                     # Overwrite the reduce_flow objective (Index 3, Priority 1) to iteratively squeeze active elements
-                    squeeze_expr = grb.quicksum(self.flow_var[e] for e in valid_active_edges)
-                    self.maxflow_model.setObjectiveN(-squeeze_expr, index=reduce_flow_idx, priority=1, weight=1.0, name="jitter_min_flow")
+                    squeeze_expr = grb.quicksum(self.flow_var[e] + self.flow_var[(e[1], e[0])] for e in valid_active_edges)
+                    self.maxflow_model.setObjectiveN(-squeeze_expr, index=reduce_flow_idx, priority=1, weight=1.0, name="core_flow_extractor_min_flow")
                     
                     self.maxflow_model.optimize(callback)
                     
@@ -425,13 +431,25 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                     self.flow_histories.append(current_iter_flows)
 
                     # Next active edges
-                    active_edges = {e for e in valid_active_edges if current_iter_flows[e] > 1e-4}
+                    active_edges = {e for e in valid_active_edges if current_iter_flows.get(e, 0) + current_iter_flows.get((e[1], e[0]), 0) > 1e-4}
 
                 # Restore original reduce_flow objective state for future calls
                 if use_reduce_flow:
                     self.maxflow_model.setObjectiveN(reduce_flow_expr, index=reduce_flow_idx, priority=1, weight=-1.0, name="reduce_flow_min_edges")
                 else:
                     self.maxflow_model.setObjectiveN(0.0, index=reduce_flow_idx, priority=0, weight=0.0, name="reduce_flow_disabled")
+            
+            # --- CALCULATE 1D CORE FLOW ARRAY RIGHT HERE ---
+            if getattr(self, 'core_flow_extractor', False):
+                core_array = np.zeros(self.num_both_edges, dtype=np.float32)
+                for idx, e in enumerate(self.both_edges):
+                    min_f = float('inf')
+                    for hist in self.flow_histories:
+                        f = hist.get(e, 0) + hist.get((e[1], e[0]), 0)
+                        if f < min_f:
+                            min_f = f
+                    core_array[idx] = min_f
+                self._current_core_flow_array = core_array
             # ---------------------------------
             
         else:
@@ -1046,7 +1064,7 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         self.last_obj = self.reference_obj
         self._cache_flow_array()
 
-        self.num_interdictable = min(self.num_both_edges, self.action_space.n)
+        self.num_interdictable = min(self.num_both_edges, getattr(self.action_space, 'n', self.num_both_edges))
         self.has_probability = self.state['edge_interdiction_probability'][:self.num_interdictable] > 0
         self.has_capacity = self.state['edge_capacity'][:self.num_interdictable] > 0
         
@@ -1707,6 +1725,9 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
                     cached_item = self.local_outcome_cache[outcome_key]
                     if 'flow_array' not in cached_item and 'flows' not in cached_item:
                          is_valid_hit = False
+                    # Ensure cache hit has core flows if feature is active
+                    if getattr(self, 'core_flow_extractor', False) and 'core_flow_array' not in cached_item:
+                         is_valid_hit = False
                 
                 if not is_valid_hit:
                     outcomes_needed_from_central.append(outcome)
@@ -1781,6 +1802,8 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
             if return_full_flows:
                 # OPTIMIZATION: Convert dict to array immediately for storage
                 res['flow_array'] = self._flows_dict_to_array(flows)
+                if getattr(self, 'core_flow_extractor', False):  
+                    res['core_flow_array'] = getattr(self, '_current_core_flow_array', np.zeros(self.num_both_edges, dtype=np.float32))
             else:
                 if self.state['budget'][0] < self.min_edge_cost:
                     res['nonzero_flow_indices'] = []
@@ -1829,7 +1852,15 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         # Fast path: All items have flow_array, Efficient stacking
         all_flow_arrays = np.stack([working_cache[_cache_key(o)]['flow_array'] for o in ordered_outcomes])
         final_flow_array = np.average(all_flow_arrays, weights=weights, axis=0)
-            
+        
+        # ---> ADD THIS: Stack and average the core flows!
+        if getattr(self, 'core_flow_extractor', False):
+            if all('core_flow_array' in working_cache[_cache_key(o)] for o in ordered_outcomes):
+                all_core_arrays = np.stack([working_cache[_cache_key(o)]['core_flow_array'] for o in ordered_outcomes])
+                self.core_flows = np.average(all_core_arrays, weights=weights, axis=0)
+            else:
+                self.core_flows = np.zeros(self.num_both_edges, dtype=np.float32)
+
         # Return array directly instead of dict
         return weighted_objective, final_flow_array
     
@@ -1860,10 +1891,10 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         
         if deterministic_mode:
             objective, flows = self.solve_max_flow()
-            # Consistent API: Convert to array
+            if getattr(self, 'core_flow_extractor', False):
+                self.core_flows = getattr(self, '_current_core_flow_array', np.zeros(self.num_both_edges, dtype=np.float32))
             return objective, self._flows_dict_to_array(flows)
         else:
-            # Stochastic outcome calculation
             objective, flows_array = self._calculate_stochastic_objective_and_flow('zero_sum', return_full_flows=True)
             return objective, flows_array
 
@@ -1872,6 +1903,8 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         if self.deterministic_outcomes:
             _, flows = self.solve_max_flow(routing_assumption='canalize')
             obj = self._compute_raw_objective('canalize', flows, for_potential)
+            if getattr(self, 'core_flow_extractor', False):
+                self.core_flows = getattr(self, '_current_core_flow_array', np.zeros(self.num_both_edges, dtype=np.float32))
             return obj, self._flows_dict_to_array(flows)
         return self._calculate_stochastic_objective_and_flow('canalize', return_full_flows=True, for_potential=for_potential)
         
@@ -1880,6 +1913,8 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         if self.deterministic_outcomes:
             _, flows = self.solve_max_flow(routing_assumption='isolate')
             obj = self._compute_raw_objective('isolate', flows)
+            if getattr(self, 'core_flow_extractor', False):
+                self.core_flows = getattr(self, '_current_core_flow_array', np.zeros(self.num_both_edges, dtype=np.float32))
             return obj, self._flows_dict_to_array(flows)
         return self._calculate_stochastic_objective_and_flow('isolate', return_full_flows=True)
 
@@ -1889,6 +1924,8 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         if mode:
             _, flows = self.solve_max_flow(routing_assumption='divert')
             obj = self._compute_raw_objective('divert', flows, for_potential)
+            if getattr(self, 'core_flow_extractor', False):
+                self.core_flows = getattr(self, '_current_core_flow_array', np.zeros(self.num_both_edges, dtype=np.float32))
             return obj, self._flows_dict_to_array(flows)
         return self._calculate_stochastic_objective_and_flow('divert', return_full_flows=True, for_potential=for_potential)
 
@@ -2138,10 +2175,17 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
 
         self.state = state
 
-        if self.attacker_strategy == 'canalize':
-            self._cache_objective_path('canalize_objective')
-        elif self.attacker_strategy == 'divert':
-            self._cache_objective_paths(('divert_from_objective', 'divert_to_objective'))
+        # We must set this early before it gets used via mask_fn or solve_max_flow
+        num_actions = getattr(self.action_space, 'n', self.num_both_edges)
+        self.num_interdictable = min(self.num_both_edges, np.array(num_actions).item() if not isinstance(num_actions, int) else num_actions)
+
+        if self.attacker_strategy in ['canalize', 'divert']:
+            self.solve_max_flow(routing_assumption='zero_sum')
+
+            if self.attacker_strategy == 'canalize':
+                self._cache_objective_path('canalize_objective')
+            elif self.attacker_strategy == 'divert':
+                self._cache_objective_paths(('divert_from_objective', 'divert_to_objective'))
 
         # Calculate reference objective value for the attacker's strategy
         self._initialize_strategy_references(is_reset_loop=False)
@@ -2164,7 +2208,10 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
         incoming_edge_indices = set()
         
         # Precompute the boolean map of edges with flow for O(1) lookup
-        has_flow_array = self.cached_flow_array[:self.num_both_edges] > 1e-6
+        if getattr(self, 'cached_flow_array', None) is not None:
+            has_flow_array = self.cached_flow_array[:self.num_both_edges] > 1e-6
+        else:
+            has_flow_array = np.zeros((self.num_both_edges, 2), dtype=bool)
 
         # Standard queue-based BFS using the pre-computed edge_groups adjacency dictionary
         queue = list(target_nodes)
@@ -2203,60 +2250,56 @@ class CustomEnv(InterdictionSolverMixin, gym.Env):
     def mask_fn(self):
         """
         Fully vectorized function using cached flow information.
-        Maximum speed optimization.
+        Separates masking into Resource-Based, Flow-Based, and Mission-Specific stages.
         """
         remaining_budget = self.state['budget'][0]
         edge_interdicted = self.state['edge_interdicted']
     
         action_mask = np.ones(self.action_space.n, dtype=np.float32)
     
-        # All vectorized checks
+        # --- Stage 1: Resource-Based Masking ---
         sufficient_budget = (remaining_budget - self.state['edge_costs'][:self.num_interdictable]) >= -0.1
-        #has_capacity = self.state['edge_capacity'][:self.num_interdictable] > 0
         has_probability = self.state['edge_interdiction_probability'][:self.num_interdictable] > 0
-    
         within_limit = (edge_interdicted[:self.num_interdictable] + 1) <= self.max_interdictions
         
-        # Strategy-specific checks
-        if self.attacker_strategy == 'isolate':
-            # Get edges on paths from isolate objectives to sources
-            on_path_to_source = self.get_edges_on_paths_to_source(start_nodes = self.state['isolate_objective'])
-            valid_actions = (sufficient_budget &  
-                             has_probability & 
-                             on_path_to_source &
-                             within_limit)
-        elif self.attacker_strategy == 'canalize':
-             has_flow = self.cached_flow_array[:self.num_interdictable].sum(axis=1) > 0
-             not_target = self.state['canalize_objective'][:self.num_interdictable] != 1
-             
-             valid_actions = (sufficient_budget &
-                              has_probability &
-                              within_limit & has_flow & not_target)
+        resource_mask = sufficient_budget & has_probability & within_limit
         
-        elif self.attacker_strategy == 'divert':
+        # --- Stage 2: Flow-Based Masking ---
+        if self.enable_flow_masking and hasattr(self, 'cached_flow_array'):
             has_flow = self.cached_flow_array[:self.num_interdictable].sum(axis=1) > 0
-            not_target = self.state['divert_to_objective'][:self.num_interdictable] != 1
-            
-            # APPROXIMATION: Check if any edges on the divert_from path have been interdicted
-            #from_path_interdicted = np.any((self.state['edge_interdicted'][:self.num_interdictable] > 0) & 
-            #                             (self.state['divert_from_objective'][:self.num_interdictable] == 1))
-
-            #if not from_path_interdicted:
-            #    is_target = self.state['divert_from_objective'][:self.num_interdictable] == 1
-            #else:
-            #    is_target = True
-
-            valid_actions = (sufficient_budget & #has_capacity & 
-                             has_probability & #is_target &
-                             within_limit & has_flow & 
-                             not_target)
+            flow_mask = resource_mask & has_flow
         else:
-            has_flow = self.cached_flow_array[:self.num_interdictable].sum(axis=1) > 0
-            valid_actions = (has_flow & 
-                             sufficient_budget & #self.has_capacity & 
-                             self.has_probability & 
-                             within_limit)
+            flow_mask = resource_mask.copy()
+            
+        # --- Stage 3: Mission-Specific Masking ---
+        if self.enable_mission_masking:
+            if self.attacker_strategy == 'isolate':
+                # Get edges on paths from isolate objectives to sources
+                on_path_to_source = self.get_edges_on_paths_to_source(start_nodes=self.state['isolate_objective'])
+                mission_mask = flow_mask & on_path_to_source[:self.num_interdictable]
+            elif self.attacker_strategy == 'canalize':
+                not_target = self.state['canalize_objective'][:self.num_interdictable] != 1
+                mission_mask = flow_mask & not_target
+            elif self.attacker_strategy == 'divert':
+                not_target = self.state['divert_to_objective'][:self.num_interdictable] != 1
+                mission_mask = flow_mask & not_target
+            else:
+                mission_mask = flow_mask.copy()
+        else:
+            mission_mask = flow_mask.copy()
+            
+        # --- Collect Statistics ---
+        total_candidates = self.num_interdictable
+        res_valid = resource_mask.sum()
+        flow_valid = flow_mask.sum()
+        mission_valid = mission_mask.sum()
+        
+        self.last_mask_stats = {
+            'resource': int(total_candidates - res_valid),
+            'flow': int(res_valid - flow_valid),
+            'mission': int(flow_valid - mission_valid)
+        }
     
-        action_mask[:self.num_interdictable] = valid_actions.astype(np.float32)
+        action_mask[:self.num_interdictable] = mission_mask.astype(np.float32)
     
         return action_mask
